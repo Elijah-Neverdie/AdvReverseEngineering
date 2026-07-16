@@ -1,0 +1,16 @@
+===== _where_git.txt =====  
+C:\Program Files\Git\cmd\git.exe
+===== _git_ver.txt =====  
+git version 2.53.0.windows.3
+===== _where_gh.txt =====  
+信息: 用提供的模式无法找到文件。
+===== _gh_auth.txt =====  
+'gh' 不是内部或外部命令，也不是可运行的程序
+或批处理文件。
+===== _gh_user.txt =====  
+'gh' 不是内部或外部命令，也不是可运行的程序
+或批处理文件。
+===== _status_addon.txt =====  
+fatal: cannot change to '"': Invalid argument
+===== _status_ws.txt =====  
+fatal: cannot change to '\d:\Code\cursor_projects\reverse_engineering\': Invalid argument
