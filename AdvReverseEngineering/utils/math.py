@@ -37,7 +37,7 @@ def rotation_align_vector_to_axis(
         if np.linalg.norm(axis) < 1e-6:
             axis = np.cross(src, np.array([0.0, 1.0, 0.0], dtype=np.float64))
         axis = normalize(axis)
-        # 180° 旋转
+        # 180° 旋转：R = 2 ûûᵀ - I 的等价反对称形式
         cross = np.array(
             [
                 [0.0, -axis[2], axis[1]],
@@ -48,7 +48,8 @@ def rotation_align_vector_to_axis(
         )
         return np.eye(3, dtype=np.float64) + 2.0 * cross @ cross
 
-    axis = normalize(np.cross(src, tgt))
+    # 注意：此公式要求反对称矩阵使用未归一化叉积 src×tgt
+    axis = np.cross(src, tgt)
     cross = np.array(
         [
             [0.0, -axis[2], axis[1]],
@@ -57,7 +58,11 @@ def rotation_align_vector_to_axis(
         ],
         dtype=np.float64,
     )
-    return np.eye(3, dtype=np.float64) + cross + cross @ cross * (1.0 / (1.0 + dot))
+    return (
+        np.eye(3, dtype=np.float64)
+        + cross
+        + cross @ cross * (1.0 / (1.0 + dot))
+    )
 
 
 def rotation_align_to_negative_z(direction: np.ndarray) -> np.ndarray:

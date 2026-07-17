@@ -13,12 +13,13 @@ from ..utils.mesh import MeshData
 def detect_bottom_face_indices(
     mesh_data: MeshData,
     z_tolerance_ratio: float = 0.02,
-    normal_threshold: float = 0.75,
+    normal_threshold: float = 0.85,
 ) -> list[int]:
     """
-    检测当前作为底面的三角面索引。
+    检测当前作为底面的面索引。
 
-    摆正后底面应朝下（法线接近 -Z），且位于最低 Z 区域。
+    摆正后底面应近似水平（法线接近 ±Z），且位于最低 Z 区域。
+    不强制法线朝下，兼容对象模式与编辑模式两种轴向约定。
     """
     vertices = mesh_data["vertices"]
     normals = mesh_data["normals"]
@@ -32,15 +33,25 @@ def detect_bottom_face_indices(
     z_tolerance = max(z_range * z_tolerance_ratio, 1e-5)
 
     center_z = centers[:, 2]
-    down_alignment = -normals[:, 2]
+    horizontal = np.abs(normals[:, 2]) >= normal_threshold
 
-    # 批量筛选：最低高度带内的近水平面，或略高但法线明确朝下的面。
-    lowest_band = (
+    # 优先：最低高度带内的近水平面
+    lowest_horizontal = (
         (center_z <= min_z + z_tolerance)
-        & (down_alignment >= 0.25)
+        & horizontal
     )
-    downward_band = (
+    indices = np.flatnonzero(lowest_horizontal)
+    if len(indices) > 0:
+        return indices.tolist()
+
+    # 回退：略放宽高度，但仍要求近似水平
+    relaxed = (
         (center_z <= min_z + z_tolerance * 3.0)
-        & (down_alignment >= normal_threshold)
+        & horizontal
     )
-    return np.flatnonzero(lowest_band | downward_band).tolist()
+    indices = np.flatnonzero(relaxed)
+    if len(indices) > 0:
+        return indices.tolist()
+
+    # 最终回退：最低高度带内的所有面
+    return np.flatnonzero(center_z <= min_z + z_tolerance).tolist()

@@ -9,6 +9,7 @@ import bpy
 from mathutils import Matrix
 
 from ..algorithms.bottom_faces import detect_bottom_face_indices
+from ..algorithms.ground_snap import snap_bottom_to_xy_plane
 from ..algorithms.orientation import (
     ORIENTATION_STRATEGIES,
     compute_up_axis,
@@ -28,7 +29,11 @@ SEQUENCE_ICONS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
 
 def _matrix_to_flat(matrix: Matrix) -> list[float]:
     """将 4x4 Matrix 展平，便于保存到对象自定义属性。"""
-    return [float(matrix[row][column]) for row in range(4) for column in range(4)]
+    return [
+        float(matrix[row][column])
+        for row in range(4)
+        for column in range(4)
+    ]
 
 
 def _flat_to_matrix(values) -> Matrix:
@@ -58,6 +63,26 @@ def _restore_or_store_baseline(
     obj.matrix_world = _flat_to_matrix(obj[BASE_MATRIX_KEY])
 
 
+def _bottom_center_world(
+    obj: bpy.types.Object,
+    mesh_data,
+    face_indices: list[int],
+):
+    """计算底面中心世界坐标，用于编辑模式设置原点。"""
+    import numpy as np
+
+    from ..algorithms.ground_snap import collect_face_world_vertices
+
+    points = collect_face_world_vertices(
+        mesh_data,
+        face_indices,
+        obj.data.polygons,
+    )
+    if len(points) == 0:
+        return mesh_data["centroid"]
+    return points.mean(axis=0)
+
+
 class ARE_OT_auto_orient(bpy.types.Operator):
     """
     一键自动摆正，重复点击循环切换摆正策略。
@@ -83,7 +108,7 @@ class ARE_OT_auto_orient(bpy.types.Operator):
         bottom_faces: list[int] = []
 
         try:
-            with progress_scope(context, "自动摆正", 6) as step:
+            with progress_scope(context, "自动摆正", 7) as step:
                 step("读取编辑模式选区")
                 selected_points = extract_selected_world_points(obj)
 
@@ -132,22 +157,27 @@ class ARE_OT_auto_orient(bpy.types.Operator):
                     sequence_icon = SEQUENCE_ICONS[strategy_index]
 
                 step("应用旋转")
-                apply_rotation_to_object(
-                    obj,
-                    rotation,
-                    pivot,
-                )
-                if edit_mode:
-                    set_object_origin_world(obj, pivot)
+                apply_rotation_to_object(obj, rotation, pivot)
 
                 step("检测底面")
                 mesh_data = extract_mesh_data(obj)
-                bottom_faces = detect_bottom_face_indices(
-                    mesh_data,
-                )
-                set_bottom_face_highlight(context, obj, bottom_faces)
+                bottom_faces = detect_bottom_face_indices(mesh_data)
 
-                step("更新状态")
+                step("精对齐并落地到 XOY")
+                snap_bottom_to_xy_plane(obj, mesh_data, bottom_faces)
+                mesh_data = extract_mesh_data(obj)
+                bottom_faces = detect_bottom_face_indices(mesh_data)
+
+                if edit_mode:
+                    origin = _bottom_center_world(
+                        obj,
+                        mesh_data,
+                        bottom_faces,
+                    )
+                    set_object_origin_world(obj, origin)
+
+                step("更新高亮与状态")
+                set_bottom_face_highlight(context, obj, bottom_faces)
                 up_axis = compute_up_axis(rotation)
                 scene_props.estimated_up_axis = tuple(up_axis.tolist())
                 scene_props.last_orientation_method = method_label
@@ -156,7 +186,7 @@ class ARE_OT_auto_orient(bpy.types.Operator):
                     f"{sequence_icon} 已使用「{method_label}」摆正"
                 )
                 scene_props.orientation_status_detail = (
-                    f"底面 {len(bottom_faces)} 个面已紫色高亮"
+                    f"底面 {len(bottom_faces)} 个面已贴合 XOY 并紫色高亮"
                 )
                 scene_props.orientation_status_next = (
                     f"再次点击将切换为「{next_label}」"

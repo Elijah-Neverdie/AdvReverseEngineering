@@ -8,10 +8,14 @@ from unittest.mock import patch
 import numpy as np
 
 from AdvReverseEngineering.algorithms import orientation
+from AdvReverseEngineering.algorithms.ground_snap import fit_plane_svd
 from AdvReverseEngineering.algorithms.normal_cluster import (
     cluster_dominant_normal,
 )
-from AdvReverseEngineering.utils.math import euler_xyz_to_matrix
+from AdvReverseEngineering.utils.math import (
+    euler_xyz_to_matrix,
+    rotation_align_vector_to_axis,
+)
 
 
 class NormalClusterTests(unittest.TestCase):
@@ -92,6 +96,35 @@ class CombinedOrientationTests(unittest.TestCase):
             result = orientation._strategy_combined(mesh_data, settings)
 
         np.testing.assert_allclose(result, expected, atol=1e-12)
+
+
+class GroundSnapTests(unittest.TestCase):
+    """底面精对齐数学测试。"""
+
+    def test_tilted_plane_aligns_to_xy(self) -> None:
+        points = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.1],
+                [1.0, 1.0, 0.1],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        center, normal = fit_plane_svd(points)
+        if normal[2] < 0.0:
+            normal = -normal
+        correction = rotation_align_vector_to_axis(
+            normal,
+            np.array([0.0, 0.0, 1.0], dtype=np.float64),
+        )
+        np.testing.assert_allclose(
+            correction @ normal,
+            np.array([0.0, 0.0, 1.0]),
+            atol=1e-10,
+        )
+        aligned = (points - center) @ correction.T + center
+        self.assertLess(float(np.ptp(aligned[:, 2])), 1e-10)
 
 
 if __name__ == "__main__":
