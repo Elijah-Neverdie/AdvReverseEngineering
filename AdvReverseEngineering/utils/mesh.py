@@ -56,6 +56,10 @@ def extract_mesh_data(obj: "bpy.types.Object") -> MeshData:
 
     matrix = np.array(obj.matrix_world, dtype=np.float64)
     rotation = matrix[:3, :3]
+    try:
+        normal_matrix = np.linalg.inv(rotation).T
+    except np.linalg.LinAlgError:
+        normal_matrix = np.linalg.pinv(rotation).T
 
     vert_count = len(mesh.vertices)
     coords = np.empty(vert_count * 3, dtype=np.float64)
@@ -75,7 +79,7 @@ def extract_mesh_data(obj: "bpy.types.Object") -> MeshData:
     mesh.polygons.foreach_get("center", face_centers)
     normals = normals.reshape(face_count, 3)
     face_centers = face_centers.reshape(face_count, 3)
-    normals = (rotation @ normals.T).T
+    normals = (normal_matrix @ normals.T).T
     center_ones = np.ones((face_count, 1), dtype=np.float64)
     homogeneous_centers = np.hstack((face_centers, center_ones))
     face_centers = (matrix @ homogeneous_centers.T).T[:, :3]
@@ -111,6 +115,7 @@ def extract_selected_world_points(
     bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
     bm = bmesh.from_edit_mesh(mesh)
     bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
 
     selected_indices: set[int] = {
         vertex.index for vertex in bm.verts if vertex.select
