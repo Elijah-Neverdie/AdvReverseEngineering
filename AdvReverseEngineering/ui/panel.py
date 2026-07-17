@@ -123,24 +123,6 @@ class ARE_PT_main(bpy.types.Panel):
         if obj is None or obj.type != "MESH":
             layout.label(text="请选中网格对象", icon="INFO")
 
-        row = layout.row()
-        row.scale_y = 1.4
-        row.enabled = obj is not None and obj.type == "MESH"
-        row.operator(
-            "are.auto_orient",
-            text="自动摆正",
-            icon="ORIENTATION_GLOBAL",
-        )
-
-        if scene_props is not None and scene_props.orientation_status:
-            status_box = layout.box()
-            status_box.label(
-                text=scene_props.orientation_status,
-                icon="INFO",
-            )
-            status_box.label(text=scene_props.orientation_status_detail)
-            status_box.label(text=scene_props.orientation_status_next)
-
         if scene_props is None:
             return
 
@@ -260,8 +242,6 @@ class ARE_PT_main(bpy.types.Panel):
             if merging:
                 tip = region_box.box()
                 tip.label(text="合并模式", icon="INFO")
-                tip.label(text="首击设锚点，续击立即合并")
-                tip.label(text="Ctrl+Z 撤销上次合并 · Enter 确认 · Esc 取消")
                 if scene_props.merge_status:
                     tip.label(text=scene_props.merge_status)
                 confirm_row = tip.row()
@@ -271,14 +251,21 @@ class ARE_PT_main(bpy.types.Panel):
                     text="确认",
                     icon="CHECKMARK",
                 )
+                if _draw_foldout(
+                    tip,
+                    scene_props,
+                    "show_merge_help",
+                    "操作说明",
+                ):
+                    help_box = tip.box()
+                    help_box.label(text="首击设锚点，续击立即合并")
+                    help_box.label(text="Ctrl+Z 撤销上次合并")
+                    help_box.label(text="点击确认或 Enter 写入并退出")
+                    help_box.label(text="Esc 取消")
 
             if splitting:
                 tip = region_box.box()
                 tip.label(text="拆分模式", icon="INFO")
-                tip.label(text="1. 点击编号选择要拆分的领域")
-                tip.label(text="2. [ ] 调节圆形笔刷粗细并涂红")
-                tip.label(text="3. 松开 0.5 秒后自动分色预览")
-                tip.label(text="Ctrl+Z 清除涂绘 · Enter/确认写入 · Esc 取消")
                 tip.prop(
                     scene_props,
                     "split_brush_radius",
@@ -294,6 +281,19 @@ class ARE_PT_main(bpy.types.Panel):
                     text="确认拆分",
                     icon="CHECKMARK",
                 )
+                if _draw_foldout(
+                    tip,
+                    scene_props,
+                    "show_split_help",
+                    "操作说明",
+                ):
+                    help_box = tip.box()
+                    help_box.label(text="1. 点击编号选择要拆分的领域")
+                    help_box.label(text="2. [ ] 调节圆形笔刷粗细并涂红")
+                    help_box.label(text="3. 松开 0.5 秒后自动分色预览")
+                    help_box.label(text="Ctrl+Z 清除涂绘")
+                    help_box.label(text="点击确认拆分或 Enter 写入并退出")
+                    help_box.label(text="Esc 取消")
 
             if scene_props.region_status:
                 region_box.label(

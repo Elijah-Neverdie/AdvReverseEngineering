@@ -71,30 +71,83 @@ def _remove_modal_timer(operator, context: bpy.types.Context) -> None:
 
 # 当前活跃的模态实例，供侧栏确认/取消按钮直接调用，
 # 不依赖 TIMER 事件的派发时机。
-_ACTIVE_MERGE_OP = None
-_ACTIVE_SPLIT_OP = None
+# 存放在 driver_namespace 中，插件热重载后按钮仍能取到旧模态实例。
+_MERGE_OP_KEY = "are_active_merge_op"
+_SPLIT_OP_KEY = "are_active_split_op"
 
 
 def _set_active_merge_op(operator) -> None:
-    global _ACTIVE_MERGE_OP
-    _ACTIVE_MERGE_OP = operator
+    bpy.app.driver_namespace[_MERGE_OP_KEY] = operator
+
+
+def _get_active_merge_op():
+    return bpy.app.driver_namespace.get(_MERGE_OP_KEY)
 
 
 def _clear_active_merge_op(operator) -> None:
-    global _ACTIVE_MERGE_OP
-    if _ACTIVE_MERGE_OP is operator:
-        _ACTIVE_MERGE_OP = None
+    if bpy.app.driver_namespace.get(_MERGE_OP_KEY) is operator:
+        bpy.app.driver_namespace[_MERGE_OP_KEY] = None
 
 
 def _set_active_split_op(operator) -> None:
-    global _ACTIVE_SPLIT_OP
-    _ACTIVE_SPLIT_OP = operator
+    bpy.app.driver_namespace[_SPLIT_OP_KEY] = operator
+
+
+def _get_active_split_op():
+    return bpy.app.driver_namespace.get(_SPLIT_OP_KEY)
 
 
 def _clear_active_split_op(operator) -> None:
-    global _ACTIVE_SPLIT_OP
-    if _ACTIVE_SPLIT_OP is operator:
-        _ACTIVE_SPLIT_OP = None
+    if bpy.app.driver_namespace.get(_SPLIT_OP_KEY) is operator:
+        bpy.app.driver_namespace[_SPLIT_OP_KEY] = None
+
+
+def _schedule_force_exit_check(kind: str) -> None:
+    """
+    确认标志置位后若迟迟无人消费（模态实例已丢失），
+    超时强制清理模式标志与覆盖层，避免面板永远卡在模态提示。
+    """
+
+    def _callback():
+        scene = getattr(bpy.context, "scene", None)
+        scene_props = getattr(scene, SCENE_PROP_NAME, None) if scene else None
+        if scene_props is None:
+            return None
+        if kind == "merge":
+            stuck = (
+                scene_props.merge_mode_active
+                and scene_props.merge_confirm_requested
+            )
+            if stuck:
+                scene_props.merge_confirm_requested = False
+                scene_props.merge_mode_active = False
+                scene_props.merge_anchor_id = -1
+                scene_props.merge_hover_id = -1
+                scene_props.merge_status = "合并模态已失联，已强制退出"
+                unregister_label_draw_handler()
+                set_merge_label_session(None)
+        else:
+            stuck = (
+                scene_props.split_mode_active
+                and scene_props.split_confirm_requested
+            )
+            if stuck:
+                scene_props.split_confirm_requested = False
+                scene_props.split_mode_active = False
+                scene_props.split_target_id = -1
+                scene_props.split_hover_id = -1
+                scene_props.split_phase = "IDLE"
+                scene_props.split_status = "拆分模态已失联，已强制退出"
+                unregister_split_draw_handler()
+                unregister_label_draw_handler()
+                set_split_stroke_session(None)
+                set_merge_label_session(None)
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+        return None
+
+    bpy.app.timers.register(_callback, first_interval=0.6)
 
 
 def _ensure_region_attribute(mesh: bpy.types.Mesh):
@@ -412,15 +465,26 @@ class ARE_OT_confirm_merge_regions(bpy.types.Operator):
     def execute(self, context: bpy.types.Context):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         # 优先直接驱动活跃模态实例，确保立即提交并退出。
-        op = _ACTIVE_MERGE_OP
+        op = _get_active_merge_op()
         if op is not None:
             try:
                 op.confirm_from_panel(context)
-                return {"FINISHED"}
             except Exception as exc:
                 self.report({"ERROR"}, f"确认合并失败: {exc}")
-        # 后备：置位标志，等待模态在下一次事件消费。
+                scene_props.merge_confirm_requested = True
+                _schedule_force_exit_check("merge")
+                return {"FINISHED"}
+            # 按钮点击应等效于回车：提交后立即退出模式显示。
+            if scene_props.merge_mode_active:
+                scene_props.merge_mode_active = False
+                scene_props.merge_confirm_requested = False
+                unregister_label_draw_handler()
+                set_merge_label_session(None)
+            return {"FINISHED"}
+        # 后备：置位标志，等待模态在下一次事件消费；
+        # 若无人消费（模态已丢失），超时后强制清理残留状态。
         scene_props.merge_confirm_requested = True
+        _schedule_force_exit_check("merge")
         return {"FINISHED"}
 
 
@@ -811,15 +875,29 @@ class ARE_OT_confirm_split_regions(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        op = _ACTIVE_SPLIT_OP
+        op = _get_active_split_op()
         if op is not None:
             try:
-                if op.confirm_from_panel(context):
-                    return {"FINISHED"}
-                return {"CANCELLED"}
+                ok = op.confirm_from_panel(context)
             except Exception as exc:
                 self.report({"ERROR"}, f"确认拆分失败: {exc}")
+                scene_props.split_confirm_requested = True
+                _schedule_force_exit_check("split")
+                return {"FINISHED"}
+            if not ok:
+                return {"CANCELLED"}
+            # 按钮点击应等效于回车：提交后立即退出模式显示。
+            if scene_props.split_mode_active:
+                scene_props.split_mode_active = False
+                scene_props.split_confirm_requested = False
+                scene_props.split_phase = "IDLE"
+                unregister_split_draw_handler()
+                unregister_label_draw_handler()
+                set_split_stroke_session(None)
+                set_merge_label_session(None)
+            return {"FINISHED"}
         scene_props.split_confirm_requested = True
+        _schedule_force_exit_check("split")
         return {"FINISHED"}
 
 

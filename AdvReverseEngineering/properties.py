@@ -358,6 +358,11 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         description="合并模式提示文案",
         default="",
     )
+    show_merge_help: BoolProperty(
+        name="合并说明",
+        description="展开/收起合并模式操作说明",
+        default=False,
+    )
 
     # ------------------------------------------------------------------
     # 领域拆分模态
@@ -400,6 +405,11 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         default=40.0,
         min=8.0,
         max=200.0,
+    )
+    show_split_help: BoolProperty(
+        name="拆分说明",
+        description="展开/收起拆分模式操作说明",
+        default=False,
     )
 
     # ------------------------------------------------------------------

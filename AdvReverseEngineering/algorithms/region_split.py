@@ -540,34 +540,133 @@ def cut_edges_from_paint_corridor(
         return np.empty(0, dtype=np.int32), "涂绘区域未形成可切走廊"
 
     corridor_arr = np.asarray(corridor_edges, dtype=np.int32)
+    edge_vert_a = np.asarray(edge_vert_a, dtype=np.int32)
+    edge_vert_b = np.asarray(edge_vert_b, dtype=np.int32)
 
-    # 走廊边评分：硬边优先 + 贴近笔迹中心线。
-    scores = []
-    for edge_index in corridor_arr.tolist():
-        mid = edge_mids[edge_index]
-        dists = np.sum((stroke_worlds - mid) ** 2, axis=1)
-        nearest = float(np.sqrt(dists.min()))
-        hardness = max(0.0, 1.0 - float(edge_costs[edge_index]))
-        # 高分更好
-        score = hardness * 2.0 - nearest / max(float(max_radius), 1e-6)
-        scores.append((score, int(edge_index)))
-    scores.sort(reverse=True)
+    # ------------------------------------------------------------------
+    # 在走廊子图内求一条贯穿走廊的最小代价路径（硬边优先），
+    # 得到单一连续切线，避免碎片化切割。
+    # ------------------------------------------------------------------
+    if len(corridor_arr) == 1:
+        seed_edges = corridor_arr.copy()
+    else:
+        # 优先用笔迹起止点定走廊两端；否则退回 PCA 主轴。
+        if len(stroke_worlds) >= 2:
+            start_pt = stroke_worlds[0]
+            end_pt = stroke_worlds[-1]
+            d_start = np.sum((edge_mids[corridor_arr] - start_pt) ** 2, axis=1)
+            d_end = np.sum((edge_mids[corridor_arr] - end_pt) ** 2, axis=1)
+            edge_start = int(corridor_arr[int(np.argmin(d_start))])
+            edge_goal = int(corridor_arr[int(np.argmin(d_end))])
+            if edge_start == edge_goal and len(corridor_arr) > 1:
+                # 起止落在同一边时，改用 PCA 拉开两端。
+                mids_c = edge_mids[corridor_arr]
+                center = mids_c.mean(axis=0)
+                deviation = mids_c - center
+                try:
+                    _u, _s, vt = np.linalg.svd(deviation, full_matrices=False)
+                    axis = vt[0]
+                except np.linalg.LinAlgError:
+                    axis = np.array([1.0, 0.0, 0.0])
+                proj = deviation @ axis
+                edge_start = int(corridor_arr[int(np.argmin(proj))])
+                edge_goal = int(corridor_arr[int(np.argmax(proj))])
+        else:
+            mids_c = edge_mids[corridor_arr]
+            center = mids_c.mean(axis=0)
+            deviation = mids_c - center
+            try:
+                _u, _s, vt = np.linalg.svd(deviation, full_matrices=False)
+                axis = vt[0]
+            except np.linalg.LinAlgError:
+                axis = np.array([1.0, 0.0, 0.0])
+            proj = deviation @ axis
+            edge_start = int(corridor_arr[int(np.argmin(proj))])
+            edge_goal = int(corridor_arr[int(np.argmax(proj))])
 
-    # 取评分最高的若干边作为种子骨架（至少 1 条，最多走廊 35%）。
-    seed_count = max(1, min(len(scores), max(3, len(scores) // 3)))
-    seed_edges = np.asarray(
-        [edge for _score, edge in scores[:seed_count]],
-        dtype=np.int32,
-    )
+        def corridor_bias(edge_index: int) -> float:
+            mid = edge_mids[edge_index]
+            dists = np.sum((stroke_worlds - mid) ** 2, axis=1)
+            nearest = float(np.sqrt(dists.min()))
+            return 0.3 * nearest / max(float(max_radius), 1e-6)
 
-    # 在种子中优先保留真正硬边；若全平坦也继续，靠笔迹约束。
-    hard_seeds = [
-        edge
-        for edge in seed_edges.tolist()
-        if float(edge_costs[edge]) < 0.45
-    ]
-    if hard_seeds:
-        seed_edges = np.asarray(hard_seeds, dtype=np.int32)
+        # 走廊内顶点 → 走廊边 邻接
+        corridor_set = set(int(e) for e in corridor_arr.tolist())
+        vert_to_edges: dict[int, list[int]] = {}
+        for edge_index in corridor_arr.tolist():
+            va = int(edge_vert_a[edge_index])
+            vb = int(edge_vert_b[edge_index])
+            vert_to_edges.setdefault(va, []).append(int(edge_index))
+            vert_to_edges.setdefault(vb, []).append(int(edge_index))
+
+        sources = {
+            int(edge_vert_a[edge_start]),
+            int(edge_vert_b[edge_start]),
+        }
+        targets = {
+            int(edge_vert_a[edge_goal]),
+            int(edge_vert_b[edge_goal]),
+        }
+        # 避免起止共享顶点时立刻“到达”导致空路径。
+        if sources & targets and edge_start != edge_goal:
+            targets = targets - sources
+        if not targets:
+            targets = {
+                int(edge_vert_a[edge_goal]),
+                int(edge_vert_b[edge_goal]),
+            }
+
+        dist: dict[int, float] = {v: 0.0 for v in sources}
+        prev_edge: dict[int, int | None] = {v: None for v in sources}
+        prev_vert: dict[int, int | None] = {v: None for v in sources}
+        heap = [(0.0, v) for v in sources]
+        heapq.heapify(heap)
+        reached: int | None = None
+        while heap:
+            cost_u, u = heapq.heappop(heap)
+            if cost_u > dist.get(u, float("inf")) + 1e-12:
+                continue
+            if u in targets and prev_edge.get(u) is not None:
+                reached = u
+                break
+            if u in targets and edge_start == edge_goal:
+                reached = u
+                break
+            for edge_index in vert_to_edges.get(u, ()):
+                if edge_index not in corridor_set:
+                    continue
+                va = int(edge_vert_a[edge_index])
+                vb = int(edge_vert_b[edge_index])
+                v_other = vb if va == u else va
+                step = float(edge_costs[edge_index]) + corridor_bias(edge_index)
+                new_cost = cost_u + step
+                if new_cost >= dist.get(v_other, float("inf")):
+                    continue
+                dist[v_other] = new_cost
+                prev_edge[v_other] = int(edge_index)
+                prev_vert[v_other] = u
+                heapq.heappush(heap, (new_cost, v_other))
+
+        if reached is None:
+            # 尝试任意已访问的目标，或退回起止边。
+            for t in targets:
+                if t in dist and prev_edge.get(t) is not None:
+                    reached = t
+                    break
+        if reached is None:
+            return (
+                np.empty(0, dtype=np.int32),
+                "涂绘区域不连续，请一笔连贯涂过要拆分的位置",
+            )
+
+        path_edges: list[int] = []
+        cursor: int | None = reached
+        while cursor is not None and prev_edge.get(cursor) is not None:
+            path_edges.append(int(prev_edge[cursor]))
+            cursor = prev_vert.get(cursor)
+        if not path_edges:
+            path_edges = sorted({edge_start, edge_goal})
+        seed_edges = np.unique(np.asarray(path_edges, dtype=np.int32))
 
     completed = complete_cut_edges_dijkstra(
         topology,

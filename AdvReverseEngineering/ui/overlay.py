@@ -474,9 +474,15 @@ def draw_split_stroke_preview() -> None:
     if obj is None or obj.type != "MESH":
         return
 
-    # 若已有内存分色预览，由 draw_overlays 绘制；此处只画涂红与切边。
+    # 若已有内存分色预览，由 draw_overlays 绘制对比色；
+    # 此时隐藏涂红面，避免盖住分色结果。
     paint_faces = session.get("paint_faces")
-    if paint_faces is not None and len(paint_faces) > 0:
+    has_preview = session.get("preview_ids") is not None
+    if (
+        not has_preview
+        and paint_faces is not None
+        and len(paint_faces) > 0
+    ):
         paint_key = (
             obj.as_pointer(),
             session.get("preview_version", 0),
