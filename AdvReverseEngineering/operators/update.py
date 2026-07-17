@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 AdvReverseEngineering Contributors
 
-"""从 GitHub 下载并更新插件。"""
+"""GitHub 版本自检与插件更新。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import io
 import os
 import shutil
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 import zipfile
@@ -16,8 +17,19 @@ from pathlib import Path
 
 import bpy
 
+from .. import bl_info
+from ..utils.versioning import format_version, parse_bl_info_version
+
 
 ADDON_MODULE = "AdvReverseEngineering"
+DEFAULT_GITHUB_OWNER = "Elijah-Neverdie"
+DEFAULT_GITHUB_REPO = "AdvReverseEngineering"
+DEFAULT_GITHUB_BRANCH = "main"
+CURRENT_VERSION = tuple(bl_info["version"])
+
+_CHECK_LOCK = threading.Lock()
+_CHECK_RESULT: dict | None = None
+_CHECK_THREAD: threading.Thread | None = None
 
 
 def _addon_root() -> Path:
@@ -30,6 +42,33 @@ def _prefs(context: bpy.types.Context):
     return context.preferences.addons[ADDON_MODULE].preferences
 
 
+def _global_prefs():
+    """从当前 Blender 上下文读取插件偏好。"""
+    addon = bpy.context.preferences.addons.get(ADDON_MODULE)
+    return addon.preferences if addon is not None else None
+
+
+def _normalize_repository_preferences(prefs) -> None:
+    """迁移早期错误用户名，并补齐官方仓库默认值。"""
+    owner = (prefs.github_owner or "").strip()
+    if not owner or owner == "Elijah_Neverdie":
+        prefs.github_owner = DEFAULT_GITHUB_OWNER
+    if not (prefs.github_repo or "").strip():
+        prefs.github_repo = DEFAULT_GITHUB_REPO
+    if not (prefs.github_branch or "").strip():
+        prefs.github_branch = DEFAULT_GITHUB_BRANCH
+
+
+def _repository_values(prefs) -> tuple[str, str, str]:
+    """返回清理后的 GitHub owner/repo/branch。"""
+    _normalize_repository_preferences(prefs)
+    return (
+        prefs.github_owner.strip(),
+        prefs.github_repo.strip(),
+        prefs.github_branch.strip(),
+    )
+
+
 def _download_zip(url: str, timeout: float = 60.0) -> bytes:
     """下载 ZIP 字节流。"""
     request = urllib.request.Request(
@@ -38,6 +77,149 @@ def _download_zip(url: str, timeout: float = 60.0) -> bytes:
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read()
+
+
+def _remote_init_url(owner: str, repo: str, branch: str) -> str:
+    """构建仓库内插件 __init__.py 的 raw URL。"""
+    return (
+        f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/"
+        "AdvReverseEngineering/__init__.py"
+    )
+
+
+def _fetch_remote_version(
+    owner: str,
+    repo: str,
+    branch: str,
+    timeout: float = 12.0,
+) -> tuple[int, int, int]:
+    """下载远端 __init__.py 并解析版本。"""
+    request = urllib.request.Request(
+        _remote_init_url(owner, repo, branch),
+        headers={"User-Agent": "AdvReverseEngineering-VersionCheck/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        source = response.read().decode("utf-8", errors="replace")
+    return parse_bl_info_version(source)
+
+
+def _check_worker(owner: str, repo: str, branch: str) -> None:
+    """后台线程执行网络请求，不访问 Blender RNA。"""
+    global _CHECK_RESULT
+    try:
+        version = _fetch_remote_version(owner, repo, branch)
+        result = {"version": version, "error": ""}
+    except Exception as exc:
+        result = {"version": None, "error": str(exc)}
+
+    with _CHECK_LOCK:
+        _CHECK_RESULT = result
+
+
+def _tag_preferences_redraw() -> None:
+    """版本状态变化后刷新界面。"""
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is None:
+        return
+    for window in window_manager.windows:
+        for area in window.screen.areas:
+            area.tag_redraw()
+
+
+def _poll_check_result() -> float | None:
+    """主线程轮询后台结果并安全写入 AddonPreferences。"""
+    global _CHECK_RESULT, _CHECK_THREAD
+
+    with _CHECK_LOCK:
+        result = _CHECK_RESULT
+        if result is not None:
+            _CHECK_RESULT = None
+
+    if result is None:
+        if _CHECK_THREAD is not None and _CHECK_THREAD.is_alive():
+            return 0.25
+        return None
+
+    prefs = _global_prefs()
+    if prefs is None:
+        return None
+
+    error = result["error"]
+    if error:
+        prefs.update_check_state = "ERROR"
+        prefs.update_available = False
+        prefs.update_check_message = f"检查失败: {error}"
+    else:
+        remote_version = tuple(result["version"])
+        prefs.latest_version = format_version(remote_version)
+        prefs.update_available = remote_version > CURRENT_VERSION
+        if prefs.update_available:
+            prefs.update_check_state = "AVAILABLE"
+            prefs.update_check_message = (
+                f"发现新版本 v{prefs.latest_version}"
+            )
+        else:
+            prefs.update_check_state = "CURRENT"
+            prefs.update_check_message = "当前为最新版"
+
+    _CHECK_THREAD = None
+    _tag_preferences_redraw()
+    return None
+
+
+def start_update_check() -> bool:
+    """启动一次非阻塞版本检查；正在检查时不重复创建线程。"""
+    global _CHECK_RESULT, _CHECK_THREAD
+
+    prefs = _global_prefs()
+    if prefs is None:
+        return False
+    if _CHECK_THREAD is not None and _CHECK_THREAD.is_alive():
+        return False
+
+    owner, repo, branch = _repository_values(prefs)
+    prefs.update_check_state = "CHECKING"
+    prefs.update_available = False
+    prefs.update_check_message = "正在检查 GitHub 版本…"
+
+    with _CHECK_LOCK:
+        _CHECK_RESULT = None
+    _CHECK_THREAD = threading.Thread(
+        target=_check_worker,
+        args=(owner, repo, branch),
+        name="ARE-GitHub-VersionCheck",
+        daemon=True,
+    )
+    _CHECK_THREAD.start()
+
+    if not bpy.app.timers.is_registered(_poll_check_result):
+        bpy.app.timers.register(
+            _poll_check_result,
+            first_interval=0.25,
+        )
+    return True
+
+
+def _startup_update_check() -> None:
+    """插件注册完成后延迟启动版本自检。"""
+    start_update_check()
+    return None
+
+
+def schedule_startup_update_check() -> None:
+    """安排启动自检，避免阻塞插件注册阶段。"""
+    if not bpy.app.timers.is_registered(_startup_update_check):
+        bpy.app.timers.register(
+            _startup_update_check,
+            first_interval=1.0,
+        )
+
+
+def cancel_update_check_timers() -> None:
+    """插件注销时移除尚未执行的计时器。"""
+    for callback in (_startup_update_check, _poll_check_result):
+        if bpy.app.timers.is_registered(callback):
+            bpy.app.timers.unregister(callback)
 
 
 def _find_addon_in_extract(extract_dir: Path) -> Path | None:
@@ -102,13 +284,11 @@ class ARE_OT_update_from_github(bpy.types.Operator):
             self.report({"ERROR"}, "无法读取插件偏好设置")
             return {"CANCELLED"}
 
-        owner = (prefs.github_owner or "").strip()
-        repo = (prefs.github_repo or "").strip()
-        branch = (prefs.github_branch or "main").strip() or "main"
-
-        if not owner or not repo:
-            self.report({"ERROR"}, "请先填写 GitHub 用户名与仓库名")
+        if not prefs.update_available:
+            self.report({"INFO"}, "当前没有可用更新")
             return {"CANCELLED"}
+
+        owner, repo, branch = _repository_values(prefs)
 
         zip_url = (
             f"https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip"
@@ -150,10 +330,31 @@ class ARE_OT_update_from_github(bpy.types.Operator):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+        prefs.update_available = False
+        prefs.update_check_state = "UPDATED"
+        prefs.update_check_message = (
+            f"已更新到 v{prefs.latest_version}，请重启 Blender"
+        )
         self.report(
             {"INFO"},
             "已从 GitHub 更新，请重启 Blender 或重新启用插件",
         )
+        return {"FINISHED"}
+
+
+class ARE_OT_check_github_update(bpy.types.Operator):
+    """手动重新检查 GitHub 版本。"""
+
+    bl_idname = "are.check_github_update"
+    bl_label = "重新检查更新"
+    bl_description = "立即检查 GitHub 上是否有新版本"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context: bpy.types.Context):
+        if start_update_check():
+            self.report({"INFO"}, "正在后台检查 GitHub 版本")
+        else:
+            self.report({"INFO"}, "版本检查已在进行中")
         return {"FINISHED"}
 
 
@@ -165,17 +366,38 @@ class ARE_AddonPreferences(bpy.types.AddonPreferences):
     github_owner: bpy.props.StringProperty(
         name="GitHub 用户名",
         description="例如 your-name",
-        default="",
+        default=DEFAULT_GITHUB_OWNER,
     )
     github_repo: bpy.props.StringProperty(
         name="仓库名",
         description="例如 AdvReverseEngineering",
-        default="AdvReverseEngineering",
+        default=DEFAULT_GITHUB_REPO,
     )
     github_branch: bpy.props.StringProperty(
         name="分支",
         description="通常为 main 或 master",
-        default="main",
+        default=DEFAULT_GITHUB_BRANCH,
+    )
+    show_github_sync: bpy.props.BoolProperty(
+        name="GitHub 同步",
+        description="展开或收起 GitHub 同步设置",
+        default=False,
+    )
+    update_check_state: bpy.props.StringProperty(
+        name="更新检查状态",
+        default="NOT_CHECKED",
+    )
+    latest_version: bpy.props.StringProperty(
+        name="最新版本",
+        default="",
+    )
+    update_available: bpy.props.BoolProperty(
+        name="有可用更新",
+        default=False,
+    )
+    update_check_message: bpy.props.StringProperty(
+        name="更新提示",
+        default="尚未检查更新",
     )
 
     def draw(self, context: bpy.types.Context) -> None:
@@ -186,10 +408,12 @@ class ARE_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "github_owner")
         layout.prop(self, "github_repo")
         layout.prop(self, "github_branch")
-        layout.operator("are.update_from_github", icon="FILE_REFRESH")
+        layout.label(text=self.update_check_message)
+        layout.operator("are.check_github_update", icon="FILE_REFRESH")
 
 
 classes = (
     ARE_AddonPreferences,
+    ARE_OT_check_github_update,
     ARE_OT_update_from_github,
 )

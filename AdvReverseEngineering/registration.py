@@ -103,6 +103,7 @@ def _unregister_scene_properties() -> None:
 
 def register() -> None:
     """注册插件全部 Blender 类型。"""
+    from .operators.update import schedule_startup_update_check
     from .ui.overlay import register_draw_handler
 
     property_classes = _get_property_classes()
@@ -120,16 +121,19 @@ def register() -> None:
         register_draw_handler()
     except Exception as exc:
         print(f"AdvReverseEngineering: 视口高亮注册失败（插件其余功能仍可用）: {exc}")
+    schedule_startup_update_check()
 
 
 def unregister() -> None:
     """按相反顺序注销插件全部 Blender 类型。"""
+    from .operators.update import cancel_update_check_timers
     from .ui.overlay import unregister_draw_handler
 
     property_classes = _get_property_classes()
     operator_classes = _get_operator_classes()
     panel_classes = _get_panel_classes()
 
+    cancel_update_check_timers()
     unregister_draw_handler()
     _unregister_classes(panel_classes, "Panel")
     _unregister_classes(operator_classes, "Operator")

@@ -16,6 +16,10 @@ from AdvReverseEngineering.utils.math import (
     euler_xyz_to_matrix,
     rotation_align_vector_to_axis,
 )
+from AdvReverseEngineering.utils.versioning import (
+    format_version,
+    parse_bl_info_version,
+)
 
 
 class NormalClusterTests(unittest.TestCase):
@@ -125,6 +129,16 @@ class GroundSnapTests(unittest.TestCase):
         )
         aligned = (points - center) @ correction.T + center
         self.assertLess(float(np.ptp(aligned[:, 2])), 1e-10)
+
+
+class VersioningTests(unittest.TestCase):
+    """GitHub 远端版本解析测试。"""
+
+    def test_parse_bl_info_version(self) -> None:
+        source = 'bl_info = {"version": (1, 12, 3), "blender": (4, 2, 0)}'
+        version = parse_bl_info_version(source)
+        self.assertEqual(version, (1, 12, 3))
+        self.assertEqual(format_version(version), "1.12.3")
 
 
 if __name__ == "__main__":
