@@ -202,13 +202,13 @@ class ARE_PT_main(bpy.types.Panel):
             region_box.prop(
                 scene_props,
                 "region_ignore_discrete",
-                text="忽略离散面",
+                text="合并碎屑领域",
             )
             if scene_props.region_ignore_discrete:
                 region_box.prop(
                     scene_props,
                     "region_min_area_ratio",
-                    text="最小面积占比 (%)",
+                    text="碎屑面积占比 (%)",
                 )
 
             button_row = region_box.row(align=True)

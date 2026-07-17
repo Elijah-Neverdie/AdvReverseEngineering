@@ -352,6 +352,94 @@ def generate_region_colors(
     return colors
 
 
+def _absorb_small_regions(
+    region_ids: np.ndarray,
+    areas: np.ndarray,
+    topology: FaceTopology,
+    min_area: float,
+) -> tuple[np.ndarray, int]:
+    """
+    将面积低于阈值的碎屑领域并入相邻面积更大的领域。
+
+    不再把碎屑标成「忽略」：用户期望分散小块仍属于连续大面，
+    按共享边界长度选最佳邻居并入，多轮直到稳定。
+    返回 (新标签, 被吸收的碎屑领域数)。
+    """
+    ids = np.asarray(region_ids, dtype=np.int32).copy()
+    face_count = len(ids)
+    if face_count == 0 or min_area <= 0.0:
+        return ids, 0
+
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    absorbed_total = 0
+    max_rounds = 32
+
+    for _ in range(max_rounds):
+        region_total = int(ids.max()) + 1 if np.any(ids >= 0) else 0
+        if region_total <= 1:
+            break
+        region_areas = np.bincount(
+            ids,
+            weights=areas,
+            minlength=region_total,
+        )
+        small = [
+            rid
+            for rid in range(region_total)
+            if float(region_areas[rid]) > 0.0
+            and float(region_areas[rid]) < float(min_area)
+        ]
+        if not small:
+            break
+
+        small_set = set(small)
+        # 碎屑 rid → {邻居 rid: 共享边数}
+        border: dict[int, dict[int, int]] = {rid: {} for rid in small}
+        for edge_index in range(len(face_a)):
+            fa = int(face_a[edge_index])
+            fb = int(face_b[edge_index])
+            ra = int(ids[fa])
+            rb = int(ids[fb])
+            if ra == rb:
+                continue
+            if ra in small_set and rb not in small_set:
+                border[ra][rb] = border[ra].get(rb, 0) + 1
+            elif rb in small_set and ra not in small_set:
+                border[rb][ra] = border[rb].get(ra, 0) + 1
+            elif ra in small_set and rb in small_set:
+                # 两个碎屑相邻：先记下来，后面若无大邻居再互相并
+                border[ra][rb] = border[ra].get(rb, 0) + 1
+                border[rb][ra] = border[rb].get(ra, 0) + 1
+
+        changed = 0
+        for rid in small:
+            neighbors = border.get(rid) or {}
+            if not neighbors:
+                continue
+            # 优先并入「大领域」邻居；若只有碎屑邻居，并入面积更大者。
+            best_rid = None
+            best_key = None
+            for nbr, shared in neighbors.items():
+                nbr_area = float(region_areas[nbr]) if nbr < len(region_areas) else 0.0
+                is_large = nbr not in small_set
+                # 排序键：大邻居优先，再比共享边数，再比邻居面积
+                key = (1 if is_large else 0, shared, nbr_area)
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_rid = int(nbr)
+            if best_rid is None or best_rid == rid:
+                continue
+            ids[ids == rid] = best_rid
+            changed += 1
+
+        if changed == 0:
+            break
+        absorbed_total += changed
+
+    return ids, absorbed_total
+
+
 def segment_regions_by_normal(
     normals: np.ndarray,
     areas: np.ndarray,
@@ -371,8 +459,9 @@ def segment_regions_by_normal(
         topology: 共享边邻接拓扑
         angle_threshold_deg: 旧版角度阈值（度）；仅当
             wireframe_threshold 为 None 时生效
-        ignore_discrete: 是否按面积占比忽略小领域
-        min_area_ratio: 相对网格总面积的最小占比阈值
+        ignore_discrete: 是否将碎屑小领域并入相邻大领域
+            （不再标成忽略；保持几何连续）
+        min_area_ratio: 相对网格总面积的碎屑判定阈值
         smooth_iterations: 边保护法线平滑迭代次数，
             细碎扫描网格建议 1~3，规则网格可为 0
         wireframe_threshold: 对齐视图叠加层线框滑条（0~1），
@@ -428,34 +517,25 @@ def segment_regions_by_normal(
     else:
         temp_ids = _grow_regions(normals, areas, topology, cos_limit)
 
-    region_total = int(temp_ids.max()) + 1 if face_count else 0
-    region_areas = np.bincount(
-        temp_ids,
-        weights=areas,
-        minlength=region_total,
-    )
-
-    keep_mask = np.ones(region_total, dtype=bool)
-    ignored_region_count = 0
+    absorbed_region_count = 0
     if ignore_discrete and min_area_ratio > 0.0:
         area_limit = total_area * float(min_area_ratio)
-        keep_mask = region_areas >= area_limit
-        ignored_region_count = int((~keep_mask).sum())
+        temp_ids, absorbed_region_count = _absorb_small_regions(
+            temp_ids,
+            areas,
+            topology,
+            area_limit,
+        )
 
-    remap = np.full(region_total, REGION_IGNORED_ID, dtype=np.int32)
-    kept_indices = np.flatnonzero(keep_mask)
-    remap[kept_indices] = np.arange(len(kept_indices), dtype=np.int32)
-    region_ids = remap[temp_ids]
-
-    ignored_face_count = int(np.count_nonzero(region_ids < 0))
-    region_count = int(len(kept_indices))
+    # 压缩为稠密 0..K-1（碎屑已并入，不再产生忽略面）
+    compacted, _remap, region_count = compact_region_ids(temp_ids)
     colors = generate_region_colors(region_count)
 
     return RegionSegmentationResult(
-        region_ids=region_ids,
+        region_ids=compacted,
         region_count=region_count,
-        ignored_face_count=ignored_face_count,
-        ignored_region_count=ignored_region_count,
+        ignored_face_count=0,
+        ignored_region_count=absorbed_region_count,
         colors=colors,
         total_area=total_area,
     )

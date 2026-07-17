@@ -186,7 +186,36 @@ class RegionSegmentationTests(unittest.TestCase):
             int(result["region_ids"][1]),
         )
 
-    def test_small_area_regions_are_ignored(self) -> None:
+    def test_small_area_regions_are_absorbed(self) -> None:
+        # 大平面 + 邻接的硬边小侧面：碎屑应并入大领域，而不是标成忽略。
+        normals = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        areas = np.array([10.0, 10.0, 0.01], dtype=np.float64)
+        topology = _topology_from_pairs(3, [(0, 1), (1, 2)])
+
+        result = segment_regions_by_normal(
+            normals,
+            areas,
+            topology,
+            wireframe_threshold=0.1,
+            ignore_discrete=True,
+            min_area_ratio=0.01,
+        )
+
+        self.assertEqual(result["region_count"], 1)
+        self.assertEqual(int(result["ignored_face_count"]), 0)
+        self.assertGreaterEqual(int(result["ignored_region_count"]), 1)
+        self.assertTrue(np.all(result["region_ids"] == 0))
+        self.assertTrue(np.all(result["region_ids"] >= 0))
+
+    def test_small_isolated_without_neighbor_kept(self) -> None:
+        # 无共享边的孤立小块无法并入，仍保留为独立领域（不标忽略）。
         normals = np.array(
             [
                 [0.0, 0.0, 1.0],
@@ -207,12 +236,9 @@ class RegionSegmentationTests(unittest.TestCase):
             min_area_ratio=0.01,
         )
 
-        self.assertEqual(result["region_count"], 1)
-        self.assertEqual(int(result["ignored_region_count"]), 1)
-        self.assertEqual(int(result["ignored_face_count"]), 1)
-        self.assertEqual(int(result["region_ids"][0]), 0)
-        self.assertEqual(int(result["region_ids"][1]), 0)
-        self.assertEqual(int(result["region_ids"][2]), REGION_IGNORED_ID)
+        self.assertEqual(result["region_count"], 2)
+        self.assertEqual(int(result["ignored_face_count"]), 0)
+        self.assertTrue(np.all(result["region_ids"] >= 0))
 
     def test_gradual_curve_does_not_leak(self) -> None:
         # 相邻面两两差 10°：线框下每条边 fac=0，不应链式合成一块

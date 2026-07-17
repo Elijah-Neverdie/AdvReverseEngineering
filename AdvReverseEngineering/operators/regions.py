@@ -379,12 +379,15 @@ class ARE_OT_segment_regions(bpy.types.Operator):
                     f"已识别 {result['region_count']} 个领域"
                 )
                 if scene_props.region_ignore_discrete:
-                    scene_props.region_status_detail = (
-                        f"忽略 {result['ignored_region_count']} 个离散领域"
-                        f"（{result['ignored_face_count']} 个面）"
-                    )
+                    absorbed = int(result["ignored_region_count"])
+                    if absorbed:
+                        scene_props.region_status_detail = (
+                            f"已并入 {absorbed} 个碎屑领域"
+                        )
+                    else:
+                        scene_props.region_status_detail = "无碎屑需要合并"
                 else:
-                    scene_props.region_status_detail = "未启用忽略离散面"
+                    scene_props.region_status_detail = "未启用碎屑合并"
 
                 set_region_highlight(
                     context,

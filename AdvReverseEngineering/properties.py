@@ -207,13 +207,13 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         soft_max=5,
     )
     region_ignore_discrete: BoolProperty(
-        name="忽略离散面",
-        description="忽略面积过小的领域（相对网格总面积）",
+        name="合并碎屑领域",
+        description="将面积过小的碎屑并入相邻大领域，保持连续而不标成忽略",
         default=True,
     )
     region_min_area_ratio: FloatProperty(
-        name="最小面积占比",
-        description="领域面积低于网格总面积该比例时视为离散并忽略（百分比）",
+        name="碎屑面积占比",
+        description="领域面积低于网格总面积该比例时并入邻居（百分比）",
         default=0.1,
         min=0.001,
         max=50.0,
