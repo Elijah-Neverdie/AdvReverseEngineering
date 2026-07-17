@@ -289,7 +289,7 @@ def detect_corner_indices(
     angle_threshold_deg: float = DEFAULT_CORNER_ANGLE_DEG,
     window: int | None = None,
     max_corners: int = 4,
-    min_separation_frac: float = 0.05,
+    min_separation_frac: float = 0.025,
     convex_only: bool = True,
 ) -> list[int]:
     """
@@ -416,7 +416,11 @@ def classify_tri_or_quad(
     triangle_ratio: float = DEFAULT_TRIANGLE_RATIO,
 ) -> tuple[str, list[np.ndarray]]:
     """
-    保留最多四条主边；第四边短于最长边 * ratio 时视为三边。
+    保留最多四条主边；第四边（最短边）远短于第二短边时视为三边。
+
+    以第二短边为基准而非最长边：扁长四边域（如弯曲条带）的两条
+    短边长度接近，不会被误判成三边；真三角域的第四边是远小于
+    其余三条边的碎边，仍会正确触发三边判定。
     """
     if len(sides) < 3:
         raise RegionFitError("边数不足，无法拟合")
@@ -427,10 +431,10 @@ def classify_tri_or_quad(
     if len(working) == 3:
         return "TRI", working
     order = sorted(range(len(working)), key=lambda i: lengths[i], reverse=True)
-    longest = lengths[order[0]]
+    second_shortest = lengths[order[2]]
     fourth = lengths[order[3]]
     ratio = max(float(triangle_ratio), 0.0)
-    if longest > 1e-12 and fourth < longest * ratio:
+    if second_shortest > 1e-12 and fourth < second_shortest * ratio:
         short_index = order[3]
         # 丢弃最短边后，把其两端并入相邻边，保持环序三边
         left = (short_index - 1) % 4

@@ -449,7 +449,8 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     region_fit_triangle_ratio: FloatProperty(
         name="三边判定阈值",
         description=(
-            "第四边长度低于最长边该比例时视为三边曲面（百分比）"
+            "最短边长度低于第二短边该比例时视为三边曲面（百分比）；"
+            "扁长条带的两条短边长度接近，不会被误判为三边"
         ),
         default=15.0,
         min=1.0,

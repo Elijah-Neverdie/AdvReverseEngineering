@@ -218,6 +218,19 @@ class TopologyClassificationTests(unittest.TestCase):
         self.assertEqual(topology, "QUAD")
         self.assertEqual(len(result), 4)
 
+    def test_elongated_band_stays_quad(self) -> None:
+        # 扁长条带：短边远小于长边的 15%，但两条短边长度接近，
+        # 必须保持四边拓扑（回归：曾被误判为三边形成五边形轮廓）
+        sides = [
+            np.array([[0.0, 0.0], [10.0, 0.0]], dtype=np.float64),
+            np.array([[10.0, 0.0], [10.0, 1.0]], dtype=np.float64),
+            np.array([[10.0, 1.0], [0.0, 1.2]], dtype=np.float64),
+            np.array([[0.0, 1.2], [0.0, 0.0]], dtype=np.float64),
+        ]
+        topology, result = classify_tri_or_quad(sides, triangle_ratio=0.15)
+        self.assertEqual(topology, "QUAD")
+        self.assertEqual(len(result), 4)
+
 
 class ConcaveNotchBridgeTests(unittest.TestCase):
     def test_inward_step_notch_is_bridged(self) -> None:
