@@ -1,1 +1,0 @@
-fatal: cannot change to '\d:\Code\cursor_projects\reverse_engineering\': Invalid argument

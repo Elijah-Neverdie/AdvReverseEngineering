@@ -17,8 +17,9 @@ _DRAW_HANDLE = None
 DRAW_HANDLE_KEY = "AdvReverseEngineering.bottom_draw_handle"
 OVERLAY_UI_KEY = "AdvReverseEngineering.overlay_ui_callback"
 
-# 缓存对象本地坐标三角面，绘制时再乘 matrix_world，确保跟随物体变换
-_OVERLAY_CACHE: dict[int, np.ndarray] = {}
+# 世界坐标缓存：signature 记录矩阵与网格状态，任一变化立即重建，
+# 避免撤销/重做、数据更新后绘制陈旧坐标。
+_OVERLAY_CACHE: dict[int, dict] = {}
 
 # 紫色半透明 (R, G, B, A)
 HIGHLIGHT_COLOR = (0.78, 0.22, 1.0, 0.55)
@@ -41,10 +42,7 @@ def set_bottom_face_highlight(
         _OVERLAY_CACHE.pop(old_obj.as_pointer(), None)
 
     obj[BOTTOM_FACES_ATTR] = list(face_indices)
-    _OVERLAY_CACHE[obj.as_pointer()] = np.asarray(
-        _collect_bottom_face_local_coords(obj, face_indices),
-        dtype=np.float32,
-    )
+    _OVERLAY_CACHE.pop(obj.as_pointer(), None)
     scene_props.highlight_object = obj
     _tag_view3d_redraw(context)
 
@@ -68,34 +66,6 @@ def _tag_view3d_redraw(context: bpy.types.Context) -> None:
                 area.tag_redraw()
 
 
-def _collect_bottom_face_local_coords(
-    obj: bpy.types.Object,
-    face_indices: list[int],
-) -> list[tuple[float, float, float]]:
-    """将底面多边形三角化，缓存本地空间坐标。"""
-    mesh = obj.data
-    coords: list[tuple[float, float, float]] = []
-    polygon_count = len(mesh.polygons)
-
-    for face_index in face_indices:
-        if face_index < 0 or face_index >= polygon_count:
-            continue
-        polygon = mesh.polygons[face_index]
-        vert_indices = polygon.vertices
-        if len(vert_indices) < 3:
-            continue
-
-        v0 = mesh.vertices[vert_indices[0]].co
-        for tri in range(1, len(vert_indices) - 1):
-            v1 = mesh.vertices[vert_indices[tri]].co
-            v2 = mesh.vertices[vert_indices[tri + 1]].co
-            coords.append((v0.x, v0.y, v0.z))
-            coords.append((v1.x, v1.y, v1.z))
-            coords.append((v2.x, v2.y, v2.z))
-
-    return coords
-
-
 def _is_object_selected(context: bpy.types.Context, obj: bpy.types.Object) -> bool:
     """仅当对象被选中时显示高亮。"""
     try:
@@ -104,16 +74,90 @@ def _is_object_selected(context: bpy.types.Context, obj: bpy.types.Object) -> bo
         return False
 
 
-def _local_to_world(
+def _overlay_signature(obj: bpy.types.Object) -> tuple:
+    """对象矩阵 + 网格状态签名，任一变化都需重建世界坐标。"""
+    mesh = obj.data
+    matrix = obj.matrix_world
+    return (
+        tuple(
+            round(float(matrix[row][column]), 9)
+            for row in range(4)
+            for column in range(4)
+        ),
+        mesh.as_pointer(),
+        len(mesh.vertices),
+        len(mesh.polygons),
+    )
+
+
+def _build_world_coords(
     obj: bpy.types.Object,
-    local_coords: np.ndarray,
+    face_indices: list[int],
 ) -> np.ndarray:
-    """按对象当前 matrix_world 将缓存本地坐标转换为世界坐标。"""
+    """
+    用当前网格数据即时构建底面三角形世界坐标。
+
+    顶点通过 foreach_get 一次性读取，再按三角扇索引取值，
+    避免逐顶点访问 Blender API。
+    """
+    mesh = obj.data
+    vert_count = len(mesh.vertices)
+    polygon_count = len(mesh.polygons)
+    if vert_count == 0 or polygon_count == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    triangle_indices: list[int] = []
+    for face_index in face_indices:
+        if face_index < 0 or face_index >= polygon_count:
+            continue
+        vert_indices = mesh.polygons[face_index].vertices
+        if len(vert_indices) < 3:
+            continue
+        anchor = vert_indices[0]
+        for tri in range(1, len(vert_indices) - 1):
+            triangle_indices.append(anchor)
+            triangle_indices.append(vert_indices[tri])
+            triangle_indices.append(vert_indices[tri + 1])
+
+    if not triangle_indices:
+        return np.empty((0, 3), dtype=np.float32)
+
+    local_all = np.empty(vert_count * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", local_all)
+    local_all = local_all.reshape(vert_count, 3)
+
+    index_array = np.asarray(triangle_indices, dtype=np.int64)
+    valid = index_array < vert_count
+    if not np.all(valid):
+        index_array = index_array[valid]
+        remainder = len(index_array) - len(index_array) % 3
+        index_array = index_array[:remainder]
+        if len(index_array) == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+    local = local_all[index_array]
     matrix = np.asarray(obj.matrix_world, dtype=np.float64)
-    local = np.asarray(local_coords, dtype=np.float64)
-    ones = np.ones((len(local), 1), dtype=np.float64)
-    homogeneous = np.hstack((local, ones))
-    return (matrix @ homogeneous.T).T[:, :3].astype(np.float32)
+    world = local @ matrix[:3, :3].T + matrix[:3, 3]
+    return world.astype(np.float32)
+
+
+def _cached_world_coords(
+    obj: bpy.types.Object,
+    face_indices: list[int],
+) -> np.ndarray:
+    """按签名获取或重建世界坐标缓存。"""
+    pointer = obj.as_pointer()
+    signature = _overlay_signature(obj)
+    entry = _OVERLAY_CACHE.get(pointer)
+    if entry is not None and entry["signature"] == signature:
+        return entry["coords"]
+
+    coords = _build_world_coords(obj, face_indices)
+    _OVERLAY_CACHE[pointer] = {
+        "signature": signature,
+        "coords": coords,
+    }
+    return coords
 
 
 def draw_bottom_faces_overlay() -> None:
@@ -142,18 +186,14 @@ def draw_bottom_faces_overlay() -> None:
     if not face_indices:
         return
 
-    pointer = obj.as_pointer()
-    coords = _OVERLAY_CACHE.get(pointer)
-    if coords is None:
-        coords = np.asarray(
-            _collect_bottom_face_local_coords(obj, face_indices),
-            dtype=np.float32,
-        )
-        _OVERLAY_CACHE[pointer] = coords
-    if len(coords) == 0:
+    # 编辑模式下 obj.data 尚未同步 bmesh 修改，暂不绘制以免坐标错位。
+    if obj.mode == "EDIT":
         return
 
-    world_coords = _local_to_world(obj, coords)
+    world_coords = _cached_world_coords(obj, face_indices)
+    if len(world_coords) == 0:
+        return
+
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     batch = batch_for_shader(shader, "TRIS", {"pos": world_coords})
 
