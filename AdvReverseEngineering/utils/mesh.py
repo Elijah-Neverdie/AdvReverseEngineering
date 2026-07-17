@@ -21,7 +21,7 @@ class MeshData(TypedDict):
 
 
 class FaceTopology(TypedDict):
-    """面拓扑：loop 索引与按共享边的 CSR 邻接表。"""
+    """面拓扑：loop 索引、共享边邻接与边顶点。"""
 
     loop_start: np.ndarray
     loop_total: np.ndarray
@@ -30,6 +30,10 @@ class FaceTopology(TypedDict):
     adjacency_indices: np.ndarray
     edge_face_a: np.ndarray
     edge_face_b: np.ndarray
+    edge_vert_a: np.ndarray
+    edge_vert_b: np.ndarray
+    vert_edge_offsets: np.ndarray
+    vert_edge_indices: np.ndarray
 
 
 def subsample_array(
@@ -127,6 +131,10 @@ def extract_face_topology(mesh: "bpy.types.Mesh") -> FaceTopology:
             adjacency_indices=empty_i32.copy(),
             edge_face_a=empty_i32.copy(),
             edge_face_b=empty_i32.copy(),
+            edge_vert_a=empty_i32.copy(),
+            edge_vert_b=empty_i32.copy(),
+            vert_edge_offsets=np.zeros(1, dtype=np.int32),
+            vert_edge_indices=empty_i32.copy(),
         )
 
     loop_start = np.empty(face_count, dtype=np.int32)
@@ -162,10 +170,15 @@ def extract_face_topology(mesh: "bpy.types.Mesh") -> FaceTopology:
     )
     face_a = face_s[:-1][same_edge]
     face_b = face_s[1:][same_edge]
+    vert_a = edge_lo_s[:-1][same_edge]
+    vert_b = edge_hi_s[:-1][same_edge]
     valid = face_a != face_b
     face_a = face_a[valid]
     face_b = face_b[valid]
+    vert_a = vert_a[valid]
+    vert_b = vert_b[valid]
 
+    vert_count = int(loop_verts.max()) + 1 if len(loop_verts) else 0
     if len(face_a) == 0:
         return FaceTopology(
             loop_start=loop_start,
@@ -175,14 +188,21 @@ def extract_face_topology(mesh: "bpy.types.Mesh") -> FaceTopology:
             adjacency_indices=np.empty(0, dtype=np.int32),
             edge_face_a=np.empty(0, dtype=np.int32),
             edge_face_b=np.empty(0, dtype=np.int32),
+            edge_vert_a=np.empty(0, dtype=np.int32),
+            edge_vert_b=np.empty(0, dtype=np.int32),
+            vert_edge_offsets=np.zeros(vert_count + 1, dtype=np.int32),
+            vert_edge_indices=np.empty(0, dtype=np.int32),
         )
 
+    # 以 (min_face, max_face, min_vert, max_vert) 去重，保留顶点。
     pair_lo = np.minimum(face_a, face_b)
     pair_hi = np.maximum(face_a, face_b)
-    packed = np.stack((pair_lo, pair_hi), axis=1)
+    packed = np.stack((pair_lo, pair_hi, vert_a, vert_b), axis=1)
     unique_pairs = np.unique(packed, axis=0)
     edge_face_a = unique_pairs[:, 0].astype(np.int32, copy=False)
     edge_face_b = unique_pairs[:, 1].astype(np.int32, copy=False)
+    edge_vert_a = unique_pairs[:, 2].astype(np.int32, copy=False)
+    edge_vert_b = unique_pairs[:, 3].astype(np.int32, copy=False)
 
     # 无向边展开为双向邻接，再按起点排序构建 CSR。
     both_a = np.concatenate((edge_face_a, edge_face_b))
@@ -195,6 +215,19 @@ def extract_face_topology(mesh: "bpy.types.Mesh") -> FaceTopology:
     counts = np.bincount(both_a, minlength=face_count)
     adjacency_offsets[1:] = np.cumsum(counts, dtype=np.int32)
 
+    # 顶点 → 边 CSR，供硬边路径搜索。
+    edge_count = len(edge_face_a)
+    edge_ids = np.arange(edge_count, dtype=np.int32)
+    vert_from = np.concatenate((edge_vert_a, edge_vert_b))
+    edge_from = np.concatenate((edge_ids, edge_ids))
+    vert_order = np.argsort(vert_from, kind="stable")
+    vert_from = vert_from[vert_order]
+    edge_from = edge_from[vert_order]
+    vert_edge_offsets = np.zeros(vert_count + 1, dtype=np.int32)
+    if len(vert_from):
+        vert_counts = np.bincount(vert_from, minlength=vert_count)
+        vert_edge_offsets[1:] = np.cumsum(vert_counts, dtype=np.int32)
+
     return FaceTopology(
         loop_start=loop_start,
         loop_total=loop_total,
@@ -203,6 +236,10 @@ def extract_face_topology(mesh: "bpy.types.Mesh") -> FaceTopology:
         adjacency_indices=both_b.astype(np.int32, copy=False),
         edge_face_a=edge_face_a,
         edge_face_b=edge_face_b,
+        edge_vert_a=edge_vert_a,
+        edge_vert_b=edge_vert_b,
+        vert_edge_offsets=vert_edge_offsets,
+        vert_edge_indices=edge_from.astype(np.int32, copy=False),
     )
 
 

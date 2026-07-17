@@ -360,6 +360,25 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
 
     # ------------------------------------------------------------------
+    # 领域拆分模态
+    # ------------------------------------------------------------------
+    split_mode_active: BoolProperty(
+        name="拆分模式",
+        description="是否正在进行领域智能拆分",
+        default=False,
+    )
+    split_confirm_requested: BoolProperty(
+        name="请求确认拆分",
+        description="面板确认按钮通知模态算子提交拆分",
+        default=False,
+    )
+    split_status: StringProperty(
+        name="拆分状态",
+        description="拆分模式提示文案",
+        default="",
+    )
+
+    # ------------------------------------------------------------------
     # 原点设置
     # ------------------------------------------------------------------
     origin_mode: EnumProperty(

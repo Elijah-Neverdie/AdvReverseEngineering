@@ -4,8 +4,10 @@ from .orient import ARE_OT_auto_orient
 from .regions import (
     ARE_OT_clear_regions,
     ARE_OT_confirm_merge_regions,
+    ARE_OT_confirm_split_regions,
     ARE_OT_merge_regions,
     ARE_OT_segment_regions,
+    ARE_OT_split_regions,
 )
 from .simplify import ARE_OT_simplify_apply, ARE_OT_simplify_rebuild
 from .update import (
@@ -23,6 +25,8 @@ classes = (
     ARE_OT_clear_regions,
     ARE_OT_merge_regions,
     ARE_OT_confirm_merge_regions,
+    ARE_OT_split_regions,
+    ARE_OT_confirm_split_regions,
     ARE_OT_check_github_update,
     ARE_OT_update_from_github,
 )

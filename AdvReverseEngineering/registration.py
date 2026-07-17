@@ -136,6 +136,7 @@ def unregister() -> None:
         unregister_draw_handler,
         unregister_label_draw_handler,
         unregister_overlay_ui,
+        unregister_split_draw_handler,
     )
 
     property_classes = _get_property_classes()
@@ -145,6 +146,7 @@ def unregister() -> None:
     cancel_update_check_timers()
     cancel_simplify_timers()
     unregister_overlay_ui()
+    unregister_split_draw_handler()
     unregister_label_draw_handler()
     unregister_draw_handler()
     _unregister_classes(panel_classes, "Panel")

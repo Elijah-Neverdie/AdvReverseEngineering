@@ -148,6 +148,10 @@ class ARE_PT_main(bpy.types.Panel):
         if _draw_foldout(layout, scene_props, "show_simplify_section", "简化"):
             simplify_box = layout.box()
             mesh_ready = obj is not None and obj.type == "MESH"
+            modal_busy = bool(
+                scene_props.merge_mode_active or scene_props.split_mode_active
+            )
+            simplify_box.enabled = not modal_busy
             simplify_box.prop(
                 scene_props,
                 "viewport_simplify_percent",
@@ -191,6 +195,8 @@ class ARE_PT_main(bpy.types.Panel):
             region_box = layout.box()
             mesh_ready = obj is not None and obj.type == "MESH"
             merging = bool(scene_props.merge_mode_active)
+            splitting = bool(scene_props.split_mode_active)
+            modal_busy = merging or splitting
 
             region_box.prop(
                 scene_props,
@@ -218,7 +224,7 @@ class ARE_PT_main(bpy.types.Panel):
             button_row.scale_y = 1.2
             button_row.enabled = (
                 mesh_ready
-                and not merging
+                and not modal_busy
                 and (obj is None or obj.mode != "EDIT")
             )
             button_row.operator(
@@ -228,15 +234,23 @@ class ARE_PT_main(bpy.types.Panel):
             )
 
             merge_row = region_box.row(align=True)
-            merge_row.enabled = mesh_ready and not merging
+            merge_row.enabled = mesh_ready and not modal_busy
             merge_row.operator(
                 "are.merge_regions",
                 text="合并领域",
                 icon="AUTOMERGE_ON",
             )
 
+            split_row = region_box.row(align=True)
+            split_row.enabled = mesh_ready and not modal_busy
+            split_row.operator(
+                "are.split_regions",
+                text="拆分领域",
+                icon="MOD_BOOLEAN",
+            )
+
             clear_row = region_box.row(align=True)
-            clear_row.enabled = mesh_ready and not merging
+            clear_row.enabled = mesh_ready and not modal_busy
             clear_row.operator(
                 "are.clear_regions",
                 text="清除领域",
@@ -247,7 +261,7 @@ class ARE_PT_main(bpy.types.Panel):
                 tip = region_box.box()
                 tip.label(text="合并模式", icon="INFO")
                 tip.label(text="首击设锚点，续击立即合并")
-                tip.label(text="点击空白换组 · Enter 确认 · Esc 取消")
+                tip.label(text="Ctrl+Z 撤销上次合并 · Enter 确认 · Esc 取消")
                 if scene_props.merge_status:
                     tip.label(text=scene_props.merge_status)
                 confirm_row = tip.row()
@@ -255,6 +269,21 @@ class ARE_PT_main(bpy.types.Panel):
                 confirm_row.operator(
                     "are.confirm_merge_regions",
                     text="确认",
+                    icon="CHECKMARK",
+                )
+
+            if splitting:
+                tip = region_box.box()
+                tip.label(text="拆分模式", icon="INFO")
+                tip.label(text="按住左键沿硬边绘制，松开自动补全")
+                tip.label(text="可多笔 · Ctrl+Z 撤销笔迹 · Esc 取消")
+                if scene_props.split_status:
+                    tip.label(text=scene_props.split_status)
+                confirm_row = tip.row()
+                confirm_row.scale_y = 1.2
+                confirm_row.operator(
+                    "are.confirm_split_regions",
+                    text="确认拆分",
                     icon="CHECKMARK",
                 )
 

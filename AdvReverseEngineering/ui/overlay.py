@@ -15,8 +15,10 @@ from ..registration import SCENE_PROP_NAME
 # 视口绘制句柄
 _DRAW_HANDLE = None
 _LABEL_DRAW_HANDLE = None
+_SPLIT_DRAW_HANDLE = None
 DRAW_HANDLE_KEY = "AdvReverseEngineering.bottom_draw_handle"
 LABEL_DRAW_HANDLE_KEY = "AdvReverseEngineering.region_label_draw_handle"
+SPLIT_DRAW_HANDLE_KEY = "AdvReverseEngineering.split_stroke_draw_handle"
 OVERLAY_UI_KEY = "AdvReverseEngineering.overlay_ui_callback"
 
 # 世界坐标 / 颜色缓存：signature 记录矩阵、网格与领域版本。
@@ -25,11 +27,16 @@ _REGION_CACHE: dict[int, dict] = {}
 
 # 合并模式标签会话（由 merge operator 写入）
 _MERGE_LABEL_SESSION: dict | None = None
+# 拆分模式笔迹会话
+_SPLIT_STROKE_SESSION: dict | None = None
 
 # 紫色半透明 (R, G, B, A)
 HIGHLIGHT_COLOR = (0.78, 0.22, 1.0, 0.55)
+ANCHOR_HIGHLIGHT_COLOR = (1.0, 0.55, 0.12, 0.42)
+HOVER_HIGHLIGHT_COLOR = (0.35, 0.75, 1.0, 0.28)
 LABEL_RADIUS_PX = 16.0
 LABEL_OFFSET_Y = 28.0
+LEADER_ENDPOINT_RADIUS_PX = 3.5
 
 # 对象自定义属性键
 BOTTOM_FACES_ATTR = "are_bottom_faces"
@@ -163,12 +170,14 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
         if world is None or normal is None:
             label["visible"] = False
             label["screen_xy"] = None
+            label["face_screen_xy"] = None
             continue
 
         view_dir = view_direction_to_point(rv3d, world)
         if not is_label_facing_camera(normal, view_dir):
             label["visible"] = False
             label["screen_xy"] = None
+            label["face_screen_xy"] = None
             continue
 
         if view_origin is None:
@@ -185,16 +194,25 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
         ):
             label["visible"] = False
             label["screen_xy"] = None
+            label["face_screen_xy"] = None
             continue
 
         screen = project_world_to_region(region, rv3d, world)
         if screen is None:
             label["visible"] = False
             label["screen_xy"] = None
+            label["face_screen_xy"] = None
             continue
 
         label["screen_xy"] = screen
         label["visible"] = True
+
+        face_center = label.get("face_center")
+        if face_center is None:
+            label["face_screen_xy"] = screen
+        else:
+            face_screen = project_world_to_region(region, rv3d, face_center)
+            label["face_screen_xy"] = face_screen if face_screen is not None else screen
 
 
 def _draw_circle_2d(center_x: float, center_y: float, radius: float, color) -> None:
@@ -218,8 +236,34 @@ def _draw_circle_2d(center_x: float, center_y: float, radius: float, color) -> N
     batch.draw(shader)
 
 
+def _draw_polyline_2d(points, color, width: float = 1.0) -> None:
+    """屏幕空间折线。"""
+    if len(points) < 2:
+        return
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "LINE_STRIP", {"pos": points})
+    shader.bind()
+    shader.uniform_float("color", color)
+    gpu.state.line_width_set(width)
+    try:
+        batch.draw(shader)
+    finally:
+        gpu.state.line_width_set(1.0)
+
+
+def _leader_edge_point(cx: float, cy: float, fx: float, fy: float, radius: float):
+    """从圆中心指向中心面的圆边缘点。"""
+    dx = fx - cx
+    dy = fy - cy
+    length = (dx * dx + dy * dy) ** 0.5
+    if length < 1e-6:
+        return cx, cy - radius
+    scale = radius / length
+    return cx + dx * scale, cy + dy * scale
+
+
 def draw_region_merge_labels() -> None:
-    """POST_PIXEL：绘制当前可见的领域编号按钮（已过滤遮挡）。"""
+    """POST_PIXEL：编号圆、引线与中心面端点（已过滤遮挡）。"""
     import blf
 
     context = bpy.context
@@ -247,10 +291,33 @@ def draw_region_merge_labels() -> None:
             region_id = int(label["id"])
             if region_id == anchor_id:
                 fill = (1.0, 0.55, 0.12, 0.92)
+                leader = (1.0, 0.65, 0.25, 0.95)
             elif region_id == hover_id:
                 fill = (0.35, 0.75, 1.0, 0.90)
+                leader = (0.45, 0.82, 1.0, 0.90)
             else:
                 fill = (0.12, 0.12, 0.14, 0.82)
+                leader = (0.85, 0.85, 0.88, 0.75)
+
+            face_screen = label.get("face_screen_xy") or screen
+            edge_x, edge_y = _leader_edge_point(
+                screen.x,
+                screen.y,
+                face_screen.x,
+                face_screen.y,
+                LABEL_RADIUS_PX,
+            )
+            _draw_polyline_2d(
+                [(edge_x, edge_y), (face_screen.x, face_screen.y)],
+                leader,
+                width=1.5,
+            )
+            _draw_circle_2d(
+                face_screen.x,
+                face_screen.y,
+                LEADER_ENDPOINT_RADIUS_PX,
+                leader,
+            )
 
             _draw_circle_2d(screen.x, screen.y, LABEL_RADIUS_PX, fill)
             _draw_circle_2d(
@@ -275,6 +342,121 @@ def draw_region_merge_labels() -> None:
             blf.draw(font_id, text)
     finally:
         gpu.state.blend_set("NONE")
+
+
+def set_split_stroke_session(session: dict | None) -> None:
+    """设置或清除拆分笔迹预览会话。"""
+    global _SPLIT_STROKE_SESSION
+    _SPLIT_STROKE_SESSION = session
+
+
+def get_split_stroke_session() -> dict | None:
+    """读取拆分笔迹预览会话。"""
+    return _SPLIT_STROKE_SESSION
+
+
+def draw_split_stroke_preview() -> None:
+    """POST_VIEW：深度感知红色笔迹与智能补全边。"""
+    context = bpy.context
+    if context is None or context.scene is None:
+        return
+    scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+    if scene_props is None or not scene_props.split_mode_active:
+        return
+    session = _SPLIT_STROKE_SESSION
+    if session is None:
+        return
+
+    strokes = session.get("strokes") or []
+    if not strokes:
+        return
+
+    gpu.state.blend_set("ALPHA")
+    gpu.state.depth_test_set("LESS_EQUAL")
+    try:
+        live_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        for stroke in strokes:
+            poly = stroke.get("polyline_world")
+            if poly is not None and len(poly) >= 2:
+                coords = [tuple(map(float, p)) for p in np.asarray(poly)]
+                batch = batch_for_shader(
+                    live_shader,
+                    "LINE_STRIP",
+                    {"pos": coords},
+                )
+                live_shader.bind()
+                if stroke.get("live"):
+                    live_shader.uniform_float(
+                        "color",
+                        (1.0, 0.25, 0.2, 0.85),
+                    )
+                    gpu.state.line_width_set(1.5)
+                else:
+                    live_shader.uniform_float(
+                        "color",
+                        (1.0, 0.2, 0.15, 0.70),
+                    )
+                    gpu.state.line_width_set(1.5)
+                batch.draw(live_shader)
+
+            completed = stroke.get("completed_edges_world")
+            if completed is not None and len(completed) > 0:
+                segments = []
+                for edge in np.asarray(completed):
+                    if len(edge) < 2:
+                        continue
+                    segments.append(tuple(map(float, edge[0])))
+                    segments.append(tuple(map(float, edge[1])))
+                if segments:
+                    batch = batch_for_shader(
+                        live_shader,
+                        "LINES",
+                        {"pos": segments},
+                    )
+                    live_shader.bind()
+                    live_shader.uniform_float(
+                        "color",
+                        (1.0, 0.05, 0.05, 0.95),
+                    )
+                    gpu.state.line_width_set(3.0)
+                    batch.draw(live_shader)
+    finally:
+        gpu.state.line_width_set(1.0)
+        gpu.state.depth_test_set("NONE")
+        gpu.state.blend_set("NONE")
+
+
+def register_split_draw_handler() -> None:
+    """注册拆分笔迹 POST_VIEW 绘制。"""
+    global _SPLIT_DRAW_HANDLE
+    namespace = bpy.app.driver_namespace
+    old = namespace.get(SPLIT_DRAW_HANDLE_KEY)
+    if old is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(old, "WINDOW")
+        except (ReferenceError, ValueError):
+            pass
+    _SPLIT_DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+        draw_split_stroke_preview,
+        (),
+        "WINDOW",
+        "POST_VIEW",
+    )
+    namespace[SPLIT_DRAW_HANDLE_KEY] = _SPLIT_DRAW_HANDLE
+
+
+def unregister_split_draw_handler() -> None:
+    """注销拆分笔迹绘制句柄。"""
+    global _SPLIT_DRAW_HANDLE, _SPLIT_STROKE_SESSION
+    namespace = bpy.app.driver_namespace
+    handle = namespace.pop(SPLIT_DRAW_HANDLE_KEY, None) or _SPLIT_DRAW_HANDLE
+    if handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+        except (ReferenceError, ValueError):
+            pass
+    _SPLIT_DRAW_HANDLE = None
+    _SPLIT_STROKE_SESSION = None
 
 
 def register_label_draw_handler() -> None:
@@ -472,14 +654,21 @@ def _read_region_colors(obj: bpy.types.Object, region_count: int) -> np.ndarray:
 
 def _build_region_draw_arrays(
     obj: bpy.types.Object,
+    region_ids: np.ndarray | None = None,
+    palette: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     构建领域绘制用世界坐标与逐顶点颜色。
 
     忽略标签（<0）的面不进入绘制缓冲。
+    可传入内存中的 region_ids/palette（合并预览）。
     """
     mesh = obj.data
-    region_ids = _read_region_ids(mesh)
+    if region_ids is None:
+        region_ids = _read_region_ids(mesh)
+    else:
+        region_ids = np.asarray(region_ids, dtype=np.int32)
+
     if region_ids is None or len(region_ids) == 0:
         empty_pos = np.empty((0, 3), dtype=np.float32)
         empty_col = np.empty((0, 4), dtype=np.float32)
@@ -492,7 +681,15 @@ def _build_region_draw_arrays(
         return empty_pos, empty_col
 
     region_count = int(region_ids.max()) + 1
-    palette = _read_region_colors(obj, region_count)
+    if palette is None:
+        palette = _read_region_colors(obj, region_count)
+    else:
+        palette = np.asarray(palette, dtype=np.float32)
+        if len(palette) < region_count:
+            from ..algorithms.regions import generate_region_colors
+
+            extra = generate_region_colors(region_count - len(palette))
+            palette = np.vstack((palette, extra))
 
     # 按面展开三角扇，并为每个三角形顶点写入对应领域颜色。
     positions_local: list[np.ndarray] = []
@@ -527,6 +724,38 @@ def _build_region_draw_arrays(
     world = _local_to_world(obj, local)
     color_array = np.vstack(colors).astype(np.float32)
     return world, color_array
+
+
+def _build_selection_highlight_coords(
+    obj: bpy.types.Object,
+    region_ids: np.ndarray,
+    highlight_id: int,
+) -> np.ndarray:
+    """构建指定领域的三角面世界坐标，用于选中/悬停高亮。"""
+    if highlight_id < 0:
+        return np.empty((0, 3), dtype=np.float32)
+    mesh = obj.data
+    faces = np.flatnonzero(np.asarray(region_ids, dtype=np.int32) == highlight_id)
+    if len(faces) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    local_all = _read_local_vertices(mesh)
+    positions_local: list[np.ndarray] = []
+    polygon_count = len(mesh.polygons)
+    for face_index in faces.tolist():
+        if face_index < 0 or face_index >= polygon_count:
+            continue
+        vert_indices = mesh.polygons[face_index].vertices
+        if len(vert_indices) < 3:
+            continue
+        anchor = int(vert_indices[0])
+        for tri in range(1, len(vert_indices) - 1):
+            i1 = int(vert_indices[tri])
+            i2 = int(vert_indices[tri + 1])
+            positions_local.append(local_all[[anchor, i1, i2]])
+    if not positions_local:
+        return np.empty((0, 3), dtype=np.float32)
+    return _local_to_world(obj, np.vstack(positions_local))
 
 
 def _cached_region_draw_arrays(
@@ -606,6 +835,13 @@ def draw_overlays() -> None:
 
     # 先画普通领域，再画底面紫色（底面是固定前置领域，不参与编号）。
     region_obj = scene_props.region_object
+    merge_session = _MERGE_LABEL_SESSION
+    use_merge_preview = (
+        bool(scene_props.merge_mode_active)
+        and merge_session is not None
+        and merge_session.get("region_ids") is not None
+    )
+
     if (
         region_obj is not None
         and region_obj.type == "MESH"
@@ -613,10 +849,40 @@ def draw_overlays() -> None:
         and not region_obj.hide_get()
         and not region_obj.hide_viewport
         and region_obj.mode != "EDIT"
-        and region_obj.data.attributes.get(REGION_ID_ATTR) is not None
+        and (
+            use_merge_preview
+            or region_obj.data.attributes.get(REGION_ID_ATTR) is not None
+        )
     ):
-        coords, colors = _cached_region_draw_arrays(region_obj)
-        _draw_colored_tris(coords, colors)
+        if use_merge_preview:
+            live_ids = np.asarray(merge_session["region_ids"], dtype=np.int32)
+            live_colors = merge_session.get("colors")
+            coords, colors = _build_region_draw_arrays(
+                region_obj,
+                region_ids=live_ids,
+                palette=live_colors,
+            )
+            _draw_colored_tris(coords, colors)
+
+            anchor_id = int(scene_props.merge_anchor_id)
+            hover_id = int(scene_props.merge_hover_id)
+            if hover_id >= 0 and hover_id != anchor_id:
+                hover_coords = _build_selection_highlight_coords(
+                    region_obj,
+                    live_ids,
+                    hover_id,
+                )
+                _draw_uniform_tris(hover_coords, HOVER_HIGHLIGHT_COLOR)
+            if anchor_id >= 0:
+                anchor_coords = _build_selection_highlight_coords(
+                    region_obj,
+                    live_ids,
+                    anchor_id,
+                )
+                _draw_uniform_tris(anchor_coords, ANCHOR_HIGHLIGHT_COLOR)
+        else:
+            coords, colors = _cached_region_draw_arrays(region_obj)
+            _draw_colored_tris(coords, colors)
 
     obj = scene_props.highlight_object
     if (
@@ -693,6 +959,7 @@ def unregister_draw_handler() -> None:
     """注销视口绘制句柄。"""
     global _DRAW_HANDLE
     unregister_label_draw_handler()
+    unregister_split_draw_handler()
     namespace = bpy.app.driver_namespace
     handle = namespace.pop(DRAW_HANDLE_KEY, None) or _DRAW_HANDLE
     if handle is not None:

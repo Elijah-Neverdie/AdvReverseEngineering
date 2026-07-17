@@ -409,6 +409,10 @@ class ARE_OT_simplify_apply(bpy.types.Operator):
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        if scene_props is not None and (
+            scene_props.merge_mode_active or scene_props.split_mode_active
+        ):
+            return False
         return (
             scene_props is not None
             and scene_props.simplify_active
@@ -443,6 +447,10 @@ class ARE_OT_simplify_rebuild(bpy.types.Operator):
     def poll(cls, context: bpy.types.Context) -> bool:
         obj = context.active_object
         scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        if scene_props is not None and (
+            scene_props.merge_mode_active or scene_props.split_mode_active
+        ):
+            return False
         if scene_props is not None and scene_props.simplify_active:
             return scene_props.simplify_backup is not None
         return obj is not None and obj.type == "MESH" and obj.mode == "OBJECT"
