@@ -242,6 +242,112 @@ def select_primary_boundary_loop(
     return best_loop
 
 
+def combine_boundary_islands(
+    loops: Sequence[Sequence[int]],
+    vertices: np.ndarray,
+) -> np.ndarray:
+    """
+    将同一领域内互不连通的 island 边界合成为一个连续外包络。
+
+    所有环先投影到其共同 PCA 平面，再沿第一主轴提取上下包络；
+    island 之间无采样的区间用两侧包络线性连接。返回一个有序 3D
+    闭环（不重复首点），供后续四角检测和 Coons 拟合使用。
+    """
+    if not loops:
+        raise RegionFitError("没有边界环可合并")
+    verts = _as_float_array(vertices)
+    if len(loops) == 1:
+        return verts[np.asarray(loops[0], dtype=np.int32)].copy()
+
+    loop_points = [
+        verts[np.asarray(loop, dtype=np.int32)]
+        for loop in loops
+        if len(loop) >= 3
+    ]
+    if not loop_points:
+        raise RegionFitError("所有 island 边界均无效")
+
+    all_points = np.vstack(loop_points)
+    centroid = all_points.mean(axis=0)
+    _, _, vh = np.linalg.svd(all_points - centroid, full_matrices=False)
+    axis_u = _normalize(vh[0])
+    axis_v = _normalize(vh[1])
+
+    # 每个 island 独立按弧长加密，避免原扫描边密度差异造成包络空洞。
+    samples_3d: list[np.ndarray] = []
+    samples_2d: list[np.ndarray] = []
+    for points in loop_points:
+        sample_count = int(
+            np.clip(len(points) * 2, 64, _BOUNDARY_SAMPLES_MAX)
+        )
+        sampled = resample_closed_polyline(points, sample_count)
+        samples_3d.append(sampled)
+        samples_2d.append(
+            project_points_to_plane(sampled, centroid, axis_u, axis_v)
+        )
+
+    points_3d = np.vstack(samples_3d)
+    points_2d = np.vstack(samples_2d)
+    u_values = points_2d[:, 0]
+    v_values = points_2d[:, 1]
+    u_min = float(u_values.min())
+    u_max = float(u_values.max())
+    u_span = u_max - u_min
+    if u_span < 1e-12:
+        raise RegionFitError("多个 island 沿主方向跨度过小，无法合并")
+
+    bin_count = int(
+        np.clip(len(points_3d) // 4, 48, _BOUNDARY_SAMPLES_MAX // 2)
+    )
+    bin_ids = np.floor(
+        (u_values - u_min) / u_span * (bin_count - 1)
+    ).astype(np.int32)
+    bin_ids = np.clip(bin_ids, 0, bin_count - 1)
+
+    lower = np.full((bin_count, 3), np.nan, dtype=np.float64)
+    upper = np.full((bin_count, 3), np.nan, dtype=np.float64)
+    for bin_index in range(bin_count):
+        members = np.flatnonzero(bin_ids == bin_index)
+        if len(members) == 0:
+            continue
+        member_v = v_values[members]
+        lower[bin_index] = points_3d[members[int(np.argmin(member_v))]]
+        upper[bin_index] = points_3d[members[int(np.argmax(member_v))]]
+
+    valid = np.flatnonzero(np.isfinite(lower[:, 0]))
+    if len(valid) < 2:
+        raise RegionFitError("多个 island 无法形成连续包络")
+    first = int(valid[0])
+    last = int(valid[-1])
+    grid = np.arange(first, last + 1, dtype=np.float64)
+    for axis in range(3):
+        lower[first : last + 1, axis] = np.interp(
+            grid,
+            valid.astype(np.float64),
+            lower[valid, axis],
+        )
+        upper[first : last + 1, axis] = np.interp(
+            grid,
+            valid.astype(np.float64),
+            upper[valid, axis],
+        )
+
+    lower_chain = lower[first : last + 1]
+    upper_chain = upper[first : last + 1][::-1]
+    envelope = np.vstack((lower_chain, upper_chain))
+
+    # 去除相邻重复点，避免极端 bin 产生零长度边。
+    keep = np.ones(len(envelope), dtype=bool)
+    if len(envelope) > 1:
+        keep[1:] = (
+            np.linalg.norm(np.diff(envelope, axis=0), axis=1) > 1e-10
+        )
+    envelope = envelope[keep]
+    if len(envelope) < 4:
+        raise RegionFitError("合并后的 island 包络点数不足")
+    return envelope
+
+
 def compute_region_frame(
     face_normals: np.ndarray,
     face_areas: np.ndarray,
@@ -830,7 +936,7 @@ def analyze_region_fit_topology(
         loop_total,
         loop_vertex_indices,
     )
-    primary = select_primary_boundary_loop(loops, vertices)
+    loop_pts = combine_boundary_islands(loops, vertices)
     _, normal, _, _ = compute_region_frame(
         face_normals,
         face_areas,
@@ -838,7 +944,6 @@ def analyze_region_fit_topology(
         target_id,
         face_centers,
     )
-    loop_pts = _as_float_array(vertices)[np.asarray(primary, dtype=np.int32)]
     # 2D 分析基底用边界点 PCA 平面，避免弯曲条带投影折叠
     origin, axis_u, axis_v = _loop_pca_basis(loop_pts)
     pts_2d_raw = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
@@ -918,7 +1023,10 @@ def fit_region_surface(
     normal = analysis["normal"]
     warnings: list[str] = []
     if int(analysis["loop_count"]) > 1:
-        warnings.append("检测到多个边界环，已使用最长外环")
+        warnings.append(
+            f"检测到 {int(analysis['loop_count'])} 个 island，"
+            "已连接为完整拟合域"
+        )
 
     seg_u = int(np.clip(segments_u, MIN_SEGMENTS, MAX_SEGMENTS))
     seg_v = int(np.clip(segments_v, MIN_SEGMENTS, MAX_SEGMENTS))
@@ -961,6 +1069,7 @@ __all__ = (
     "build_quad_patch",
     "build_triangular_patch",
     "classify_tri_or_quad",
+    "combine_boundary_islands",
     "coons_patch",
     "detect_corner_indices",
     "extract_region_boundary_loops",

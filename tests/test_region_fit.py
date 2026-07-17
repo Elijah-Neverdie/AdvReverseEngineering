@@ -12,6 +12,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     build_quad_patch,
     build_triangular_patch,
     classify_tri_or_quad,
+    combine_boundary_islands,
     coons_patch,
     detect_corner_indices,
     extract_region_boundary_loops,
@@ -141,6 +142,48 @@ def _triangle_like_quad_region():
     }
 
 
+def _disconnected_same_region_strip():
+    """
+    同一 region_id 的两个不连通矩形 island，中间有 0.5 宽断口：
+
+      0--1   4--5
+      |A |   |B |
+      3--2   7--6
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.5, 0.0, 0.0],
+            [2.5, 0.0, 0.0],
+            [2.5, 1.0, 0.0],
+            [1.5, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    return {
+        "vertices": vertices,
+        "loop_start": np.array([0, 4], dtype=np.int32),
+        "loop_total": np.array([4, 4], dtype=np.int32),
+        "loop_vertex_indices": np.array(
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            dtype=np.int32,
+        ),
+        "region_ids": np.array([0, 0], dtype=np.int32),
+        "normals": np.array(
+            [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        ),
+        "areas": np.array([1.0, 1.0], dtype=np.float64),
+        "centers": np.array(
+            [[0.5, 0.5, 0.0], [2.0, 0.5, 0.0]],
+            dtype=np.float64,
+        ),
+    }
+
+
 class BoundaryExtractionTests(unittest.TestCase):
     def test_square_outer_boundary_loop(self) -> None:
         mesh = _square_mesh()
@@ -193,6 +236,23 @@ class BoundaryExtractionTests(unittest.TestCase):
         )
         self.assertEqual(len(loops), 1)
         self.assertEqual(len(loops[0]), 6)
+
+    def test_same_region_islands_combined_to_full_envelope(self) -> None:
+        mesh = _disconnected_same_region_strip()
+        loops = extract_region_boundary_loops(
+            mesh["region_ids"],
+            0,
+            mesh["loop_start"],
+            mesh["loop_total"],
+            mesh["loop_vertex_indices"],
+        )
+        self.assertEqual(len(loops), 2)
+        envelope = combine_boundary_islands(loops, mesh["vertices"])
+        self.assertGreaterEqual(len(envelope), 4)
+        self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=6)
+        self.assertAlmostEqual(float(envelope[:, 0].max()), 2.5, places=6)
+        self.assertAlmostEqual(float(envelope[:, 1].min()), 0.0, places=6)
+        self.assertAlmostEqual(float(envelope[:, 1].max()), 1.0, places=6)
 
 
 class TopologyClassificationTests(unittest.TestCase):
@@ -479,6 +539,29 @@ class FitRegionSurfaceTests(unittest.TestCase):
         # 拟合面应覆盖 2x1 全域
         self.assertAlmostEqual(float(result.vertices[:, 0].min()), 0.0, places=6)
         self.assertAlmostEqual(float(result.vertices[:, 0].max()), 2.0, places=6)
+
+    def test_fit_disconnected_islands_of_one_region_as_full_quad(self) -> None:
+        mesh = _disconnected_same_region_strip()
+        result = fit_region_surface(
+            region_ids=mesh["region_ids"],
+            target_id=0,
+            vertices=mesh["vertices"],
+            loop_start=mesh["loop_start"],
+            loop_total=mesh["loop_total"],
+            loop_vertex_indices=mesh["loop_vertex_indices"],
+            face_normals=mesh["normals"],
+            face_areas=mesh["areas"],
+            face_centers=mesh["centers"],
+            segments_u=5,
+            segments_v=2,
+        )
+        self.assertEqual(result.topology, "QUAD")
+        self.assertEqual(len(result.vertices), 6 * 3)
+        self.assertAlmostEqual(float(result.vertices[:, 0].min()), 0.0, places=6)
+        self.assertAlmostEqual(float(result.vertices[:, 0].max()), 2.5, places=6)
+        self.assertTrue(
+            any("island" in warning for warning in result.warnings)
+        )
 
     def test_polyline_length(self) -> None:
         pts = np.array(
