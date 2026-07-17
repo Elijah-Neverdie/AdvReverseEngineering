@@ -18,7 +18,9 @@ DEFAULT_SEG_U = 4
 DEFAULT_SEG_V = 4
 MIN_SEGMENTS = 1
 MAX_SEGMENTS = 64
-_EXTEND_LENGTH_FACTOR = 8.0
+# 边界闭环重采样数量范围：角点检测在均匀弧长采样上进行
+_BOUNDARY_SAMPLES_MIN = 96
+_BOUNDARY_SAMPLES_MAX = 384
 
 
 class RegionFitError(ValueError):
@@ -90,6 +92,16 @@ def resample_polyline(points: np.ndarray, count: int) -> np.ndarray:
     for axis in range(pts.shape[1]):
         result[:, axis] = np.interp(sample_t, params, pts[:, axis])
     return result
+
+
+def resample_closed_polyline(points: np.ndarray, count: int) -> np.ndarray:
+    """闭环折线按弧长均匀重采样，返回不含重复终点的 count 个点。"""
+    pts = _as_float_array(points)
+    if len(pts) < 3:
+        raise RegionFitError("闭环点数不足，无法重采样")
+    closed = np.vstack((pts, pts[:1]))
+    sampled = resample_polyline(closed, int(count) + 1)
+    return sampled[:-1]
 
 
 def extract_region_boundary_loops(
@@ -275,30 +287,67 @@ def unproject_points_from_plane(
 def detect_corner_indices(
     points_2d: np.ndarray,
     angle_threshold_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+    window: int | None = None,
+    max_corners: int = 4,
+    min_separation_frac: float = 0.05,
+    convex_only: bool = True,
 ) -> list[int]:
-    """按转角检测闭环折线角点索引。"""
+    """
+    在均匀采样的闭环折线上按窗口化转角检测角点。
+
+    使用 ±window 采样点的弦向量计算转角，抑制扫描噪声；
+    按转角强度做非极大值抑制，最多保留 max_corners 个凸角点。
+    要求闭环为逆时针方向（convex_only 依赖叉积符号）。
+    """
     pts = _as_float_array(points_2d)
     count = len(pts)
     if count < 3:
         return []
-    cos_limit = float(np.cos(np.radians(max(angle_threshold_deg, 1.0))))
-    corners: list[int] = []
-    for index in range(count):
-        prev_pt = pts[(index - 1) % count]
-        curr_pt = pts[index]
-        next_pt = pts[(index + 1) % count]
-        incoming = curr_pt - prev_pt
-        outgoing = next_pt - curr_pt
-        in_len = float(np.linalg.norm(incoming))
-        out_len = float(np.linalg.norm(outgoing))
-        if in_len < 1e-12 or out_len < 1e-12:
-            continue
-        incoming /= in_len
-        outgoing /= out_len
-        # 转角越大，点积越小
-        if float(incoming.dot(outgoing)) <= cos_limit:
-            corners.append(index)
-    return corners
+    w = int(window) if window else max(1, count // 32)
+    w = min(w, max((count - 1) // 2, 1))
+
+    indices = np.arange(count)
+    prev_pts = pts[(indices - w) % count]
+    next_pts = pts[(indices + w) % count]
+    incoming = pts - prev_pts
+    outgoing = next_pts - pts
+    in_len = np.linalg.norm(incoming, axis=1)
+    out_len = np.linalg.norm(outgoing, axis=1)
+    valid = (in_len > 1e-12) & (out_len > 1e-12)
+
+    cos_angle = np.zeros(count, dtype=np.float64)
+    cos_angle[valid] = np.clip(
+        np.einsum("ij,ij->i", incoming[valid], outgoing[valid])
+        / (in_len[valid] * out_len[valid]),
+        -1.0,
+        1.0,
+    )
+    angles = np.degrees(np.arccos(cos_angle))
+    angles[~valid] = 0.0
+    cross = incoming[:, 0] * outgoing[:, 1] - incoming[:, 1] * outgoing[:, 0]
+
+    candidates = angles >= float(max(angle_threshold_deg, 1.0))
+    if convex_only:
+        candidates &= cross > 0.0
+    candidate_idx = np.flatnonzero(candidates)
+    if len(candidate_idx) == 0:
+        return []
+
+    order = candidate_idx[np.argsort(angles[candidate_idx])[::-1]]
+    min_sep = max(1, int(round(count * float(min_separation_frac))))
+    kept: list[int] = []
+    for index in order.tolist():
+        conflict = False
+        for existing in kept:
+            distance = abs(index - existing)
+            if min(distance, count - distance) < min_sep:
+                conflict = True
+                break
+        if not conflict:
+            kept.append(int(index))
+        if len(kept) >= int(max_corners):
+            break
+    return sorted(kept)
 
 
 def _side_from_loop(
@@ -401,157 +450,92 @@ def classify_tri_or_quad(
     return "QUAD", working
 
 
-def _line_intersection_2d(
-    p0: np.ndarray,
-    d0: np.ndarray,
-    p1: np.ndarray,
-    d1: np.ndarray,
-) -> tuple[np.ndarray, float, float] | None:
-    """二维射线求交，返回 (点, t0, t1)；平行则 None。"""
-    matrix = np.array(
-        [[d0[0], -d1[0]], [d0[1], -d1[1]]],
-        dtype=np.float64,
-    )
-    det = float(np.linalg.det(matrix))
-    if abs(det) < 1e-10:
-        return None
-    delta = p1 - p0
-    params = np.linalg.solve(matrix, delta)
-    t0 = float(params[0])
-    t1 = float(params[1])
-    return p0 + d0 * t0, t0, t1
-
-
-def _convex_hull_2d(points: np.ndarray) -> np.ndarray:
-    """单调链凸包，返回逆时针顶点（不含重复终点）。"""
-    pts = _as_float_array(points)
-    if len(pts) <= 1:
-        return pts.copy()
-    order = np.lexsort((pts[:, 1], pts[:, 0]))
-    ordered = pts[order]
-
-    def cross(o, a, b) -> float:
-        return float((a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
-
-    lower: list[np.ndarray] = []
-    for point in ordered:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0.0:
-            lower.pop()
-        lower.append(point)
-    upper: list[np.ndarray] = []
-    for point in reversed(ordered):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0.0:
-            upper.pop()
-        upper.append(point)
-    hull = lower[:-1] + upper[:-1]
-    if not hull:
-        return pts[:1].copy()
-    return np.asarray(hull, dtype=np.float64)
-
-
-def extend_concave_corners(
-    sides: Sequence[np.ndarray],
-    reference_normal_2d_sign: float = 1.0,
-) -> list[np.ndarray]:
+def bridge_concave_notches(
+    sides_2d: Sequence[np.ndarray],
+    sides_3d: Sequence[np.ndarray] | None = None,
+    angle_threshold_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+) -> tuple[list[np.ndarray], list[np.ndarray] | None]:
     """
-    对凹轮廓避免沿凹口收缩：
+    对边链内部的凹口「沿拟合线」桥接。
 
-    1. 若角点集非凸，改用凸包角点并重建直边（拟合域外扩）；
-    2. 对仍存在的局部凹折线，用相邻主边端部切线外延求交替换凹点。
+    仅当边链内部存在明显折角、且该子链整体偏向领域内侧时，
+    才用直线段桥接；平缓的整体弧形（如弯曲条带的内弧边）保持不变。
+    要求闭环为逆时针方向：行进方向左侧为领域内侧。
     """
-    if len(sides) < 3:
-        return [np.asarray(side, dtype=np.float64).copy() for side in sides]
+    out_2d: list[np.ndarray] = []
+    out_3d: list[np.ndarray] | None = [] if sides_3d is not None else None
+    threshold = float(max(angle_threshold_deg, 1.0))
 
-    result = [np.asarray(side, dtype=np.float64).copy() for side in sides]
-    corners = np.asarray([side[0] for side in result], dtype=np.float64)
-    hull = _convex_hull_2d(corners)
-    if len(hull) >= 3 and len(hull) < len(corners):
-        # 凹多边形：用凸包外扩角点，避免拟合线陷入凹口
-        rebuilt: list[np.ndarray] = []
-        for index in range(len(hull)):
-            rebuilt.append(
-                np.asarray(
-                    [hull[index], hull[(index + 1) % len(hull)]],
-                    dtype=np.float64,
-                )
-            )
-        return rebuilt
-
-    median_len = float(
-        np.median([max(polyline_length(side), 1e-12) for side in result])
-    )
-    max_extend = median_len * _EXTEND_LENGTH_FACTOR
-
-    for index in range(len(result)):
-        prev_side = result[index]
-        next_index = (index + 1) % len(result)
-        next_side = result[next_index]
-        if len(prev_side) < 2 or len(next_side) < 2:
-            continue
-        corner = prev_side[-1]
-        d_prev = corner - prev_side[-2]
-        d_next = next_side[1] - corner
-        cross = float(d_prev[0] * d_next[1] - d_prev[1] * d_next[0])
-        is_concave = cross * float(reference_normal_2d_sign) < 0.0
-        if not is_concave:
-            continue
-
-        # 取两侧「主边」：跳过紧贴凹点的短折，用更靠外的点定义切线
-        prev_anchor = prev_side[0] if len(prev_side) >= 2 else prev_side[-2]
-        next_anchor = next_side[-1] if len(next_side) >= 2 else next_side[1]
-        prev_dir = _normalize(
-            np.array(
-                [
-                    corner[0] - prev_anchor[0],
-                    corner[1] - prev_anchor[1],
-                    0.0,
-                ],
-                dtype=np.float64,
-            )
-        )[:2]
-        next_dir = _normalize(
-            np.array(
-                [
-                    next_anchor[0] - corner[0],
-                    next_anchor[1] - corner[1],
-                    0.0,
-                ],
-                dtype=np.float64,
-            )
-        )[:2]
-        if float(np.linalg.norm(prev_dir)) < 1e-8:
-            continue
-        if float(np.linalg.norm(next_dir)) < 1e-8:
-            continue
-
-        # 从两侧锚点所在直线外延求交
-        hit = _line_intersection_2d(
-            prev_anchor,
-            prev_dir,
-            next_anchor,
-            -next_dir,
+    for index, raw_side in enumerate(sides_2d):
+        side_2d = _as_float_array(raw_side).copy()
+        side_3d = (
+            _as_float_array(sides_3d[index]).copy()
+            if sides_3d is not None
+            else None
         )
-        if hit is None:
+
+        def _push() -> None:
+            out_2d.append(side_2d)
+            if out_3d is not None:
+                out_3d.append(side_3d)
+
+        count = len(side_2d)
+        if count < 5:
+            _push()
             continue
-        point, t0, t1 = hit
-        if t0 < -1e-6 or t1 < -1e-6:
+
+        w = max(1, count // 16)
+        sharp: list[int] = []
+        for i in range(1, count - 1):
+            a = side_2d[max(i - w, 0)]
+            b = side_2d[i]
+            c = side_2d[min(i + w, count - 1)]
+            vin = b - a
+            vout = c - b
+            in_len = float(np.linalg.norm(vin))
+            out_len = float(np.linalg.norm(vout))
+            if in_len < 1e-12 or out_len < 1e-12:
+                continue
+            cos_angle = float(
+                np.clip(vin.dot(vout) / (in_len * out_len), -1.0, 1.0)
+            )
+            if float(np.degrees(np.arccos(cos_angle))) >= threshold:
+                sharp.append(i)
+        if not sharp:
+            _push()
             continue
-        dist = float(np.linalg.norm(point - corner))
-        if dist > max_extend:
+
+        i0 = max(sharp[0] - w, 1)
+        i1 = min(sharp[-1] + w, count - 2)
+        if i1 - i0 < 1:
+            _push()
             continue
-        # 仅当新交点相对凹点更靠外（远离多边形质心）时采用
-        centroid = corners.mean(axis=0)
-        if float(np.linalg.norm(point - centroid)) <= float(
-            np.linalg.norm(corner - centroid)
-        ) + 1e-9:
+
+        anchor_a = side_2d[i0]
+        anchor_b = side_2d[i1]
+        chord = anchor_b - anchor_a
+        chord_len = float(np.linalg.norm(chord))
+        if chord_len < 1e-12:
+            _push()
             continue
-        prev_side = prev_side.copy()
-        next_side = next_side.copy()
-        prev_side[-1] = point
-        next_side[0] = point
-        result[index] = prev_side
-        result[next_index] = next_side
-    return result
+        # 逆时针环行进方向左侧为领域内侧
+        left = np.array([-chord[1], chord[0]], dtype=np.float64) / chord_len
+        segment = side_2d[i0 : i1 + 1]
+        deviation = float(np.mean((segment - anchor_a) @ left))
+        if deviation <= chord_len * 0.01:
+            # 子链向外凸出（属于领域本体），保留原边界
+            _push()
+            continue
+
+        t = np.linspace(0.0, 1.0, i1 - i0 + 1, dtype=np.float64)[:, None]
+        side_2d[i0 : i1 + 1] = anchor_a + t * chord
+        if side_3d is not None:
+            a3 = side_3d[i0]
+            b3 = side_3d[i1]
+            side_3d[i0 : i1 + 1] = a3 + t * (b3 - a3)
+        _push()
+
+    return out_2d, out_3d
 
 
 def _signed_area_2d(points: np.ndarray) -> float:
@@ -811,38 +795,37 @@ def analyze_region_fit_topology(
         face_centers,
     )
     loop_pts = _as_float_array(vertices)[np.asarray(primary, dtype=np.int32)]
-    pts_2d = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
-    # 统一为逆时针
-    if _signed_area_2d(pts_2d) < 0.0:
-        pts_2d = pts_2d[::-1]
+    pts_2d_raw = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
+    # 统一为逆时针（角点检测与凹口桥接依赖此方向约定）
+    if _signed_area_2d(pts_2d_raw) < 0.0:
         loop_pts = loop_pts[::-1]
 
-    corners = detect_corner_indices(pts_2d, corner_angle_deg)
+    # 闭环按弧长均匀重采样：3D 边链直接来自采样点，保留扫描起伏
+    sample_count = int(
+        np.clip(len(loop_pts) * 2, _BOUNDARY_SAMPLES_MIN, _BOUNDARY_SAMPLES_MAX)
+    )
+    loop_rs = resample_closed_polyline(loop_pts, sample_count)
+    pts_2d = project_points_to_plane(loop_rs, origin, axis_u, axis_v)
+
+    corners = detect_corner_indices(
+        pts_2d,
+        corner_angle_deg,
+        max_corners=4,
+    )
     if len(corners) < 3:
-        # 回退：按累计弧长均匀取 4 个角点
-        params = polyline_parameters(
-            np.vstack((pts_2d, pts_2d[:1]))
-        )[:-1]
-        corners = [
-            int(np.argmin(np.abs(params - target)))
-            for target in (0.0, 0.25, 0.5, 0.75)
-        ]
-        corners = sorted(set(corners))
-        if len(corners) < 3:
-            raise RegionFitError("无法检测足够角点")
+        # 无明显角点（近圆/椭圆域）：按弧长均匀取 4 个角点
+        quarter = max(sample_count // 4, 1)
+        corners = [0, quarter, 2 * quarter, 3 * quarter]
 
+    sides_3d = split_loop_into_sides(loop_rs, corners)
     sides_2d = split_loop_into_sides(pts_2d, corners)
-    sides_2d = extend_concave_corners(sides_2d, reference_normal_2d_sign=1.0)
-    topology, sides_2d = classify_tri_or_quad(sides_2d, triangle_ratio)
+    sides_2d, sides_3d = bridge_concave_notches(
+        sides_2d,
+        sides_3d,
+        corner_angle_deg,
+    )
+    topology, sides_3d = classify_tri_or_quad(sides_3d, triangle_ratio)
 
-    sides_3d = [
-        unproject_points_from_plane(side, origin, axis_u, axis_v)
-        for side in sides_2d
-    ]
-    # 把高度抬回：用原边界最近点替换平面点，保留 3D 起伏
-    sides_3d = [
-        _lift_side_to_original(side, loop_pts) for side in sides_3d
-    ]
     lengths = tuple(polyline_length(side) for side in sides_3d)
     return {
         "topology": topology,
@@ -853,27 +836,6 @@ def analyze_region_fit_topology(
         "loop_count": len(loops),
         "corner_count": len(corners),
     }
-
-
-def _lift_side_to_original(
-    side_planar: np.ndarray,
-    original_loop: np.ndarray,
-) -> np.ndarray:
-    """将平面边采样点吸附到最近的原边界点，保留扫描起伏。"""
-    side = _as_float_array(side_planar).copy()
-    loop = _as_float_array(original_loop)
-    if len(side) == 0 or len(loop) == 0:
-        return side
-    for index, point in enumerate(side):
-        distances = np.linalg.norm(loop - point, axis=1)
-        nearest = int(np.argmin(distances))
-        # 仅对非外延角点做吸附；外延点距环较远则保留
-        if float(distances[nearest]) <= max(
-            polyline_length(loop) * 0.02,
-            1e-4,
-        ):
-            side[index] = loop[nearest]
-    return side
 
 
 def fit_region_surface(
@@ -949,16 +911,17 @@ __all__ = (
     "RegionFitError",
     "RegionFitResult",
     "analyze_region_fit_topology",
+    "bridge_concave_notches",
     "build_quad_patch",
     "build_triangular_patch",
     "classify_tri_or_quad",
     "coons_patch",
     "detect_corner_indices",
-    "extend_concave_corners",
     "extract_region_boundary_loops",
     "fit_region_surface",
     "polyline_length",
     "polyline_parameters",
+    "resample_closed_polyline",
     "resample_polyline",
     "select_primary_boundary_loop",
 )

@@ -371,6 +371,8 @@ class ARE_OT_fit_region(bpy.types.Operator):
                 pass
         preview.hide_select = True
         preview.display_type = "WIRE"
+        # 预览网格始终显示在扫描面之前，避免被遮挡
+        preview.show_in_front = True
         self._preview_object = preview
         scene_props.fit_status = self._status_text(scene_props)
         if result.warnings:
@@ -400,6 +402,8 @@ class ARE_OT_fit_region(bpy.types.Operator):
             preview.data.name = final_name
         preview.hide_select = False
         preview.display_type = "TEXTURED"
+        # 拟合面与扫描面重合，保持前置显示避免被埋没
+        preview.show_in_front = True
         preview["are_fit_source"] = self._object.name
         preview["are_fit_region_id"] = target
         preview["are_fit_topology"] = self._topology

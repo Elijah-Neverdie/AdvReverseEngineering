@@ -8,15 +8,16 @@ import numpy as np
 
 from AdvReverseEngineering.algorithms.region_fit import (
     RegionFitError,
+    bridge_concave_notches,
     build_quad_patch,
     build_triangular_patch,
     classify_tri_or_quad,
     coons_patch,
     detect_corner_indices,
-    extend_concave_corners,
     extract_region_boundary_loops,
     fit_region_surface,
     polyline_length,
+    resample_closed_polyline,
     resample_polyline,
     select_primary_boundary_loop,
 )
@@ -218,24 +219,79 @@ class TopologyClassificationTests(unittest.TestCase):
         self.assertEqual(len(result), 4)
 
 
-class ConcaveExtendTests(unittest.TestCase):
-    def test_extend_concave_corner_moves_outward(self) -> None:
-        # 凹四边形：一角内凹于 (1.2, 0.8)
-        sides = [
-            np.array([[0.0, 0.0], [3.0, 0.0]], dtype=np.float64),
-            np.array([[3.0, 0.0], [1.2, 0.8]], dtype=np.float64),
-            np.array([[1.2, 0.8], [0.0, 2.0]], dtype=np.float64),
-            np.array([[0.0, 2.0], [0.0, 0.0]], dtype=np.float64),
-        ]
-        extended = extend_concave_corners(sides, reference_normal_2d_sign=1.0)
-        corners = np.asarray([side[0] for side in extended], dtype=np.float64)
-        # 凹点应被凸包剔除或外推，不再作为角点保留
-        dent = np.array([1.2, 0.8], dtype=np.float64)
-        keep_dent = any(
-            float(np.linalg.norm(corner - dent)) < 1e-8 for corner in corners
+class ConcaveNotchBridgeTests(unittest.TestCase):
+    def test_inward_step_notch_is_bridged(self) -> None:
+        # 沿 +x 的边链中部有向内（+y，即领域内侧）的台阶凹口
+        side = np.array(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [2.0, 0.0],
+                [2.2, 0.6],
+                [2.6, 0.6],
+                [2.8, 0.0],
+                [4.0, 0.0],
+                [5.0, 0.0],
+            ],
+            dtype=np.float64,
         )
-        self.assertFalse(keep_dent)
-        self.assertGreaterEqual(len(extended), 3)
+        bridged_2d, bridged_3d = bridge_concave_notches([side])
+        self.assertIsNone(bridged_3d)
+        result = bridged_2d[0]
+        # 凹口被拉直：所有点回到 y≈0 的拟合线上
+        self.assertTrue(np.all(np.abs(result[:, 1]) < 1e-9))
+        # 端点保持不变
+        np.testing.assert_allclose(result[0], side[0])
+        np.testing.assert_allclose(result[-1], side[-1])
+
+    def test_outward_bulge_is_preserved(self) -> None:
+        # 向外（-y）凸出的边链应保留，不被桥接
+        side = np.array(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [2.0, 0.0],
+                [2.2, -0.6],
+                [2.6, -0.6],
+                [2.8, 0.0],
+                [4.0, 0.0],
+                [5.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        bridged_2d, _ = bridge_concave_notches([side])
+        result = bridged_2d[0]
+        np.testing.assert_allclose(result, side)
+
+    def test_smooth_arc_untouched(self) -> None:
+        # 平缓弧形（模拟弯曲条带内弧边）没有锐折角，保持原样
+        t = np.linspace(0.0, np.pi, 40)
+        side = np.column_stack((t * 2.0, np.sin(t) * 0.4))
+        bridged_2d, _ = bridge_concave_notches([side])
+        np.testing.assert_allclose(bridged_2d[0], side)
+
+
+class ClosedResampleTests(unittest.TestCase):
+    def test_closed_resample_count_and_range(self) -> None:
+        square = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        sampled = resample_closed_polyline(square, 16)
+        self.assertEqual(len(sampled), 16)
+        # 所有采样点应落在单位正方形边界上
+        on_boundary = (
+            np.isclose(sampled[:, 0], 0.0)
+            | np.isclose(sampled[:, 0], 1.0)
+            | np.isclose(sampled[:, 1], 0.0)
+            | np.isclose(sampled[:, 1], 1.0)
+        )
+        self.assertTrue(bool(np.all(on_boundary)))
 
 
 class ResampleAndCoonsTests(unittest.TestCase):
