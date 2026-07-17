@@ -294,7 +294,9 @@ def draw_region_merge_labels() -> None:
     if scene_props is None:
         return
     if not (
-        scene_props.merge_mode_active or scene_props.split_mode_active
+        scene_props.merge_mode_active
+        or scene_props.split_mode_active
+        or getattr(scene_props, "fit_mode_active", False)
     ):
         return
     session = _MERGE_LABEL_SESSION
@@ -305,6 +307,9 @@ def draw_region_merge_labels() -> None:
     if scene_props.merge_mode_active:
         anchor_id = int(scene_props.merge_anchor_id)
         hover_id = int(scene_props.merge_hover_id)
+    elif getattr(scene_props, "fit_mode_active", False):
+        anchor_id = int(getattr(scene_props, "fit_target_id", -1))
+        hover_id = int(getattr(scene_props, "fit_hover_id", -1))
     else:
         anchor_id = int(getattr(scene_props, "split_target_id", -1))
         hover_id = int(getattr(scene_props, "split_hover_id", -1))

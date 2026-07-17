@@ -24,6 +24,23 @@ def _on_viewport_simplify_percent_update(self, context) -> None:
     schedule_simplify_rebuild(context)
 
 
+def _on_fit_segments_update(self, context) -> None:
+    """拟合模态中侧栏段数变化时重建预览。"""
+    if not getattr(self, "fit_mode_active", False):
+        return
+    if getattr(self, "fit_phase", "") != "PREVIEW":
+        return
+    try:
+        from .operators.region_fit import _get_active_fit_op
+
+        op = _get_active_fit_op()
+        if op is None or getattr(op, "_updating_segments", False):
+            return
+        op._rebuild_preview(context)
+    except Exception:
+        pass
+
+
 class ARE_SceneProperties(bpy.types.PropertyGroup):
     """场景级插件属性，供 UI 面板与 Operator 读写。"""
 
@@ -423,6 +440,86 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     show_split_help: BoolProperty(
         name="拆分说明",
         description="展开/收起拆分模式操作说明",
+        default=False,
+    )
+
+    # ------------------------------------------------------------------
+    # 领域拟合模态
+    # ------------------------------------------------------------------
+    region_fit_triangle_ratio: FloatProperty(
+        name="三边判定阈值",
+        description=(
+            "第四边长度低于最长边该比例时视为三边曲面（百分比）"
+        ),
+        default=15.0,
+        min=1.0,
+        max=50.0,
+        soft_min=5.0,
+        soft_max=30.0,
+        precision=1,
+        subtype="PERCENTAGE",
+    )
+    fit_mode_active: BoolProperty(
+        name="拟合模式",
+        description="是否正在进行领域曲面拟合",
+        default=False,
+    )
+    fit_confirm_requested: BoolProperty(
+        name="请求确认拟合",
+        description="面板确认按钮通知模态算子提交拟合",
+        default=False,
+    )
+    fit_target_id: IntProperty(
+        name="拟合目标领域",
+        description="当前选中的待拟合领域编号，-1 表示未选择",
+        default=-1,
+        min=-1,
+    )
+    fit_hover_id: IntProperty(
+        name="拟合悬停领域",
+        description="拟合模式下鼠标悬停的领域编号",
+        default=-1,
+        min=-1,
+    )
+    fit_phase: StringProperty(
+        name="拟合阶段",
+        description="SELECT / PREVIEW / IDLE",
+        default="IDLE",
+    )
+    fit_segments_u: IntProperty(
+        name="U 向段数",
+        description="四边面对边 U 向分段，或三边面底边分段",
+        default=4,
+        min=1,
+        max=64,
+        update=_on_fit_segments_update,
+    )
+    fit_segments_v: IntProperty(
+        name="V 向段数",
+        description="四边面对边 V 向分段，或三边面两条长边分段",
+        default=4,
+        min=1,
+        max=64,
+        update=_on_fit_segments_update,
+    )
+    fit_topology: StringProperty(
+        name="拟合拓扑",
+        description="TRI 或 QUAD",
+        default="",
+    )
+    fit_status: StringProperty(
+        name="拟合状态",
+        description="拟合模式提示文案",
+        default="",
+    )
+    fit_status_detail: StringProperty(
+        name="拟合状态详情",
+        description="拟合附加说明",
+        default="",
+    )
+    show_fit_help: BoolProperty(
+        name="拟合说明",
+        description="展开/收起拟合模式操作说明",
         default=False,
     )
 

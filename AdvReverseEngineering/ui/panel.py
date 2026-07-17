@@ -140,7 +140,9 @@ class ARE_PT_main(bpy.types.Panel):
             simplify_box = layout.box()
             mesh_ready = obj is not None and obj.type == "MESH"
             modal_busy = bool(
-                scene_props.merge_mode_active or scene_props.split_mode_active
+                scene_props.merge_mode_active
+                or scene_props.split_mode_active
+                or getattr(scene_props, "fit_mode_active", False)
             )
             simplify_box.enabled = not modal_busy
             simplify_box.prop(
@@ -187,7 +189,8 @@ class ARE_PT_main(bpy.types.Panel):
             mesh_ready = obj is not None and obj.type == "MESH"
             merging = bool(scene_props.merge_mode_active)
             splitting = bool(scene_props.split_mode_active)
-            modal_busy = merging or splitting
+            fitting = bool(getattr(scene_props, "fit_mode_active", False))
+            modal_busy = merging or splitting or fitting
 
             region_box.prop(
                 scene_props,
@@ -210,6 +213,11 @@ class ARE_PT_main(bpy.types.Panel):
                     "region_min_area_ratio",
                     text="碎屑面积占比 (%)",
                 )
+            region_box.prop(
+                scene_props,
+                "region_fit_triangle_ratio",
+                text="三边判定阈值 (%)",
+            )
 
             button_row = region_box.row(align=True)
             button_row.scale_y = 1.2
@@ -238,6 +246,14 @@ class ARE_PT_main(bpy.types.Panel):
                 "are.split_regions",
                 text="拆分领域",
                 icon="MOD_BOOLEAN",
+            )
+
+            fit_row = region_box.row(align=True)
+            fit_row.enabled = mesh_ready and not modal_busy
+            fit_row.operator(
+                "are.fit_region",
+                text="拟合领域",
+                icon="MOD_SMOOTH",
             )
 
             clear_row = region_box.row(align=True)
@@ -302,6 +318,60 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box.label(text="3. 松开 0.5 秒后自动分色预览")
                     help_box.label(text="Ctrl+Z 清除涂绘")
                     help_box.label(text="点击确认拆分或 Enter 写入并退出")
+                    help_box.label(text="Esc 取消")
+
+            if fitting:
+                tip = region_box.box()
+                tip.label(text="拟合模式", icon="INFO")
+                if scene_props.fit_status:
+                    tip.label(text=scene_props.fit_status)
+                if scene_props.fit_status_detail:
+                    tip.label(text=scene_props.fit_status_detail)
+                if scene_props.fit_phase == "PREVIEW":
+                    tip.label(
+                        text=(
+                            "三边曲面"
+                            if scene_props.fit_topology == "TRI"
+                            else "四边曲面"
+                        )
+                    )
+                    tip.prop(
+                        scene_props,
+                        "fit_segments_u",
+                        text=(
+                            "底边段数"
+                            if scene_props.fit_topology == "TRI"
+                            else "U 向段数"
+                        ),
+                    )
+                    tip.prop(
+                        scene_props,
+                        "fit_segments_v",
+                        text=(
+                            "长边段数"
+                            if scene_props.fit_topology == "TRI"
+                            else "V 向段数"
+                        ),
+                    )
+                confirm_row = tip.row()
+                confirm_row.scale_y = 1.2
+                confirm_row.enabled = scene_props.fit_phase == "PREVIEW"
+                confirm_row.operator(
+                    "are.confirm_fit_region",
+                    text="确认",
+                    icon="CHECKMARK",
+                )
+                if _draw_foldout(
+                    tip,
+                    scene_props,
+                    "show_fit_help",
+                    "操作说明",
+                ):
+                    help_box = tip.box()
+                    help_box.label(text="1. 点击编号选择要拟合的领域")
+                    help_box.label(text="2. 滚轮调节第一组控制点")
+                    help_box.label(text="3. PageUp/PageDown 调节第二组")
+                    help_box.label(text="点击确认或 Enter 写入「拟合面」集合")
                     help_box.label(text="Esc 取消")
 
             if scene_props.region_status:

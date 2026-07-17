@@ -1,6 +1,7 @@
 """AdvReverseEngineering 操作符子包。"""
 
 from .orient import ARE_OT_auto_orient
+from .region_fit import ARE_OT_confirm_fit_region, ARE_OT_fit_region
 from .regions import (
     ARE_OT_clear_regions,
     ARE_OT_confirm_merge_regions,
@@ -27,6 +28,8 @@ classes = (
     ARE_OT_confirm_merge_regions,
     ARE_OT_split_regions,
     ARE_OT_confirm_split_regions,
+    ARE_OT_fit_region,
+    ARE_OT_confirm_fit_region,
     ARE_OT_check_github_update,
     ARE_OT_update_from_github,
 )

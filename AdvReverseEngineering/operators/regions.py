@@ -267,9 +267,11 @@ def _build_label_session(
 
 
 def _modal_busy(scene_props) -> bool:
-    """合并或拆分模态进行中。"""
+    """合并、拆分或拟合模态进行中。"""
     return bool(
-        scene_props.merge_mode_active or scene_props.split_mode_active
+        scene_props.merge_mode_active
+        or scene_props.split_mode_active
+        or getattr(scene_props, "fit_mode_active", False)
     )
 
 
