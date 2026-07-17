@@ -443,6 +443,9 @@ class ARE_OT_merge_regions(bpy.types.Operator):
             self._live_colors,
         )
         session["object_name"] = obj.name
+        # 预览版本号驱动 overlay 缓存，仅标签变化时重建三角缓冲。
+        self._preview_serial += 1
+        session["preview_version"] = self._preview_serial
         set_merge_label_session(session)
         scene_props.region_count = int(self._live_count)
         scene_props.region_object = obj
@@ -549,9 +552,11 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         self._history: list[dict] = []
         self._redo: list[dict] = []
         self._closing_by_system = False
+        self._preview_serial = 0
 
         session = _build_label_session(region_ids, mesh_data, colors)
         session["object_name"] = obj.name
+        session["preview_version"] = 0
         set_merge_label_session(session)
         register_label_draw_handler()
 
@@ -628,8 +633,11 @@ class ARE_OT_merge_regions(bpy.types.Operator):
                 session.get("labels", []),
                 LABEL_RADIUS_PX,
             )
-            scene_props.merge_hover_id = -1 if hover is None else int(hover)
-            _tag_redraw(context)
+            new_hover = -1 if hover is None else int(hover)
+            # 悬停未变化则不触发重绘，避免拖动视角时反复刷新覆盖层。
+            if new_hover != int(scene_props.merge_hover_id):
+                scene_props.merge_hover_id = new_hover
+                _tag_redraw(context)
             return {"PASS_THROUGH"}
 
         if event.type == "LEFTMOUSE" and event.value == "PRESS":

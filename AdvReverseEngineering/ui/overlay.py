@@ -24,6 +24,9 @@ OVERLAY_UI_KEY = "AdvReverseEngineering.overlay_ui_callback"
 # 世界坐标 / 颜色缓存：signature 记录矩阵、网格与领域版本。
 _BOTTOM_CACHE: dict[int, dict] = {}
 _REGION_CACHE: dict[int, dict] = {}
+# 合并预览缓存：按 (对象指针, 预览版本) 复用三角缓冲，避免每帧重建。
+_MERGE_PREVIEW_CACHE: dict = {}
+_HIGHLIGHT_CACHE: dict = {}
 
 # 合并模式标签会话（由 merge operator 写入）
 _MERGE_LABEL_SESSION: dict | None = None
@@ -114,6 +117,9 @@ def set_merge_label_session(session: dict | None) -> None:
     """设置或清除合并模式编号标签会话。"""
     global _MERGE_LABEL_SESSION
     _MERGE_LABEL_SESSION = session
+    if session is None:
+        _MERGE_PREVIEW_CACHE.clear()
+        _HIGHLIGHT_CACHE.clear()
 
 
 def get_merge_label_session() -> dict | None:
@@ -150,6 +156,17 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
                     break
     if region is None or rv3d is None:
         return
+
+    # 视角与区域尺寸未变时跳过投影/遮挡计算（每标签一次射线，代价高）。
+    view_signature = (
+        tuple(round(v, 6) for row in rv3d.view_matrix for v in row),
+        region.width,
+        region.height,
+        session.get("preview_version", 0),
+    )
+    if session.get("_proj_signature") == view_signature:
+        return
+    session["_proj_signature"] = view_signature
 
     depsgraph = context.evaluated_depsgraph_get()
     if getattr(rv3d, "is_perspective", True):
@@ -299,7 +316,9 @@ def draw_region_merge_labels() -> None:
                 fill = (0.12, 0.12, 0.14, 0.82)
                 leader = (0.85, 0.85, 0.88, 0.75)
 
-            face_screen = label.get("face_screen_xy") or screen
+            face_screen = label.get("face_screen_xy")
+            if face_screen is None:
+                face_screen = screen
             edge_x, edge_y = _leader_edge_point(
                 screen.x,
                 screen.y,
@@ -652,13 +671,63 @@ def _read_region_colors(obj: bpy.types.Object, region_count: int) -> np.ndarray:
     return generate_region_colors(region_count)
 
 
+def _read_loop_arrays(
+    mesh: bpy.types.Mesh,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """批量读取 loop_start / loop_total / loop 顶点索引。"""
+    face_count = len(mesh.polygons)
+    loop_count = len(mesh.loops)
+    loop_start = np.empty(face_count, dtype=np.int32)
+    loop_total = np.empty(face_count, dtype=np.int32)
+    mesh.polygons.foreach_get("loop_start", loop_start)
+    mesh.polygons.foreach_get("loop_total", loop_total)
+    loop_verts = np.empty(loop_count, dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_verts)
+    return loop_start, loop_total, loop_verts
+
+
+def _triangle_fan_arrays(
+    loop_start: np.ndarray,
+    loop_total: np.ndarray,
+    loop_verts: np.ndarray,
+    faces: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    向量化三角扇展开。
+
+    返回 (顶点索引 (T*3,), 每个三角形所属面 (T,))。
+    """
+    faces = np.asarray(faces, dtype=np.int64)
+    if len(faces) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+    totals = loop_total[faces].astype(np.int64) - 2
+    keep = totals > 0
+    faces = faces[keep]
+    totals = totals[keep]
+    if len(faces) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+    tri_count = int(totals.sum())
+    face_per_tri = np.repeat(faces, totals)
+    start_per_tri = np.repeat(loop_start[faces].astype(np.int64), totals)
+    offsets = np.cumsum(totals) - totals
+    local_tri = np.arange(tri_count, dtype=np.int64) - np.repeat(offsets, totals)
+
+    tri_verts = np.empty(tri_count * 3, dtype=np.int64)
+    tri_verts[0::3] = loop_verts[start_per_tri]
+    tri_verts[1::3] = loop_verts[start_per_tri + local_tri + 1]
+    tri_verts[2::3] = loop_verts[start_per_tri + local_tri + 2]
+    return tri_verts, face_per_tri
+
+
 def _build_region_draw_arrays(
     obj: bpy.types.Object,
     region_ids: np.ndarray | None = None,
     palette: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    构建领域绘制用世界坐标与逐顶点颜色。
+    构建领域绘制用世界坐标与逐顶点颜色（全程 NumPy 向量化）。
 
     忽略标签（<0）的面不进入绘制缓冲。
     可传入内存中的 region_ids/palette（合并预览）。
@@ -673,6 +742,10 @@ def _build_region_draw_arrays(
         empty_pos = np.empty((0, 3), dtype=np.float32)
         empty_col = np.empty((0, 4), dtype=np.float32)
         return empty_pos, empty_col
+
+    polygon_count = len(mesh.polygons)
+    if len(region_ids) != polygon_count:
+        region_ids = region_ids[:polygon_count]
 
     valid_faces = np.flatnonzero(region_ids >= 0)
     if len(valid_faces) == 0:
@@ -691,38 +764,25 @@ def _build_region_draw_arrays(
             extra = generate_region_colors(region_count - len(palette))
             palette = np.vstack((palette, extra))
 
-    # 按面展开三角扇，并为每个三角形顶点写入对应领域颜色。
-    positions_local: list[np.ndarray] = []
-    colors: list[np.ndarray] = []
-    local_all = _read_local_vertices(mesh)
-    polygon_count = len(mesh.polygons)
-
-    for face_index in valid_faces.tolist():
-        if face_index < 0 or face_index >= polygon_count:
-            continue
-        region_id = int(region_ids[face_index])
-        if region_id < 0 or region_id >= len(palette):
-            continue
-        vert_indices = mesh.polygons[face_index].vertices
-        if len(vert_indices) < 3:
-            continue
-        color = palette[region_id]
-        anchor = int(vert_indices[0])
-        for tri in range(1, len(vert_indices) - 1):
-            i1 = int(vert_indices[tri])
-            i2 = int(vert_indices[tri + 1])
-            tri_local = local_all[[anchor, i1, i2]]
-            positions_local.append(tri_local)
-            colors.append(np.broadcast_to(color, (3, 4)).copy())
-
-    if not positions_local:
+    loop_start, loop_total, loop_verts = _read_loop_arrays(mesh)
+    tri_verts, face_per_tri = _triangle_fan_arrays(
+        loop_start,
+        loop_total,
+        loop_verts,
+        valid_faces,
+    )
+    if len(tri_verts) == 0:
         empty_pos = np.empty((0, 3), dtype=np.float32)
         empty_col = np.empty((0, 4), dtype=np.float32)
         return empty_pos, empty_col
 
-    local = np.vstack(positions_local)
-    world = _local_to_world(obj, local)
-    color_array = np.vstack(colors).astype(np.float32)
+    local_all = _read_local_vertices(mesh)
+    world = _local_to_world(obj, local_all[tri_verts])
+    color_array = np.repeat(
+        palette[region_ids[face_per_tri]].astype(np.float32),
+        3,
+        axis=0,
+    )
     return world, color_array
 
 
@@ -735,27 +795,23 @@ def _build_selection_highlight_coords(
     if highlight_id < 0:
         return np.empty((0, 3), dtype=np.float32)
     mesh = obj.data
-    faces = np.flatnonzero(np.asarray(region_ids, dtype=np.int32) == highlight_id)
+    faces = np.flatnonzero(
+        np.asarray(region_ids, dtype=np.int32) == highlight_id
+    )
     if len(faces) == 0:
         return np.empty((0, 3), dtype=np.float32)
 
-    local_all = _read_local_vertices(mesh)
-    positions_local: list[np.ndarray] = []
-    polygon_count = len(mesh.polygons)
-    for face_index in faces.tolist():
-        if face_index < 0 or face_index >= polygon_count:
-            continue
-        vert_indices = mesh.polygons[face_index].vertices
-        if len(vert_indices) < 3:
-            continue
-        anchor = int(vert_indices[0])
-        for tri in range(1, len(vert_indices) - 1):
-            i1 = int(vert_indices[tri])
-            i2 = int(vert_indices[tri + 1])
-            positions_local.append(local_all[[anchor, i1, i2]])
-    if not positions_local:
+    loop_start, loop_total, loop_verts = _read_loop_arrays(mesh)
+    tri_verts, _ = _triangle_fan_arrays(
+        loop_start,
+        loop_total,
+        loop_verts,
+        faces,
+    )
+    if len(tri_verts) == 0:
         return np.empty((0, 3), dtype=np.float32)
-    return _local_to_world(obj, np.vstack(positions_local))
+    local_all = _read_local_vertices(mesh)
+    return _local_to_world(obj, local_all[tri_verts])
 
 
 def _cached_region_draw_arrays(
@@ -857,29 +913,47 @@ def draw_overlays() -> None:
         if use_merge_preview:
             live_ids = np.asarray(merge_session["region_ids"], dtype=np.int32)
             live_colors = merge_session.get("colors")
-            coords, colors = _build_region_draw_arrays(
-                region_obj,
-                region_ids=live_ids,
-                palette=live_colors,
+            version = merge_session.get("preview_version", 0)
+            pointer = region_obj.as_pointer()
+
+            preview_key = (pointer, version)
+            if _MERGE_PREVIEW_CACHE.get("key") != preview_key:
+                coords, colors = _build_region_draw_arrays(
+                    region_obj,
+                    region_ids=live_ids,
+                    palette=live_colors,
+                )
+                _MERGE_PREVIEW_CACHE["key"] = preview_key
+                _MERGE_PREVIEW_CACHE["coords"] = coords
+                _MERGE_PREVIEW_CACHE["colors"] = colors
+            _draw_colored_tris(
+                _MERGE_PREVIEW_CACHE["coords"],
+                _MERGE_PREVIEW_CACHE["colors"],
             )
-            _draw_colored_tris(coords, colors)
 
             anchor_id = int(scene_props.merge_anchor_id)
             hover_id = int(scene_props.merge_hover_id)
-            if hover_id >= 0 and hover_id != anchor_id:
-                hover_coords = _build_selection_highlight_coords(
-                    region_obj,
-                    live_ids,
-                    hover_id,
-                )
-                _draw_uniform_tris(hover_coords, HOVER_HIGHLIGHT_COLOR)
-            if anchor_id >= 0:
-                anchor_coords = _build_selection_highlight_coords(
-                    region_obj,
-                    live_ids,
-                    anchor_id,
-                )
-                _draw_uniform_tris(anchor_coords, ANCHOR_HIGHLIGHT_COLOR)
+            for slot, region_id, color in (
+                ("hover", hover_id, HOVER_HIGHLIGHT_COLOR),
+                ("anchor", anchor_id, ANCHOR_HIGHLIGHT_COLOR),
+            ):
+                if region_id < 0:
+                    continue
+                if slot == "hover" and region_id == anchor_id:
+                    continue
+                slot_key = (pointer, version, region_id)
+                entry = _HIGHLIGHT_CACHE.get(slot)
+                if entry is None or entry.get("key") != slot_key:
+                    entry = {
+                        "key": slot_key,
+                        "coords": _build_selection_highlight_coords(
+                            region_obj,
+                            live_ids,
+                            region_id,
+                        ),
+                    }
+                    _HIGHLIGHT_CACHE[slot] = entry
+                _draw_uniform_tris(entry["coords"], color)
         else:
             coords, colors = _cached_region_draw_arrays(region_obj)
             _draw_colored_tris(coords, colors)
