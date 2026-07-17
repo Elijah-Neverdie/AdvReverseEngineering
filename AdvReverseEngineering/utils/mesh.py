@@ -20,6 +20,18 @@ class MeshData(TypedDict):
     centroid: np.ndarray
 
 
+class FaceTopology(TypedDict):
+    """面拓扑：loop 索引与按共享边的 CSR 邻接表。"""
+
+    loop_start: np.ndarray
+    loop_total: np.ndarray
+    loop_vertex_indices: np.ndarray
+    adjacency_offsets: np.ndarray
+    adjacency_indices: np.ndarray
+    edge_face_a: np.ndarray
+    edge_face_b: np.ndarray
+
+
 def subsample_array(
     array: np.ndarray,
     max_count: int,
@@ -94,6 +106,103 @@ def extract_mesh_data(obj: "bpy.types.Object") -> MeshData:
         areas=areas,
         face_centers=face_centers,
         centroid=vertices.mean(axis=0),
+    )
+
+
+def extract_face_topology(mesh: "bpy.types.Mesh") -> FaceTopology:
+    """
+    批量读取 polygon/loop，并构建共享边面邻接（CSR）。
+
+    仅顶点接触、不共享边的面不会进入邻接表，符合领域生长语义。
+    """
+    face_count = len(mesh.polygons)
+    loop_count = len(mesh.loops)
+    if face_count == 0 or loop_count == 0:
+        empty_i32 = np.empty(0, dtype=np.int32)
+        return FaceTopology(
+            loop_start=empty_i32.copy(),
+            loop_total=empty_i32.copy(),
+            loop_vertex_indices=empty_i32.copy(),
+            adjacency_offsets=np.zeros(1, dtype=np.int32),
+            adjacency_indices=empty_i32.copy(),
+            edge_face_a=empty_i32.copy(),
+            edge_face_b=empty_i32.copy(),
+        )
+
+    loop_start = np.empty(face_count, dtype=np.int32)
+    loop_total = np.empty(face_count, dtype=np.int32)
+    mesh.polygons.foreach_get("loop_start", loop_start)
+    mesh.polygons.foreach_get("loop_total", loop_total)
+
+    loop_verts = np.empty(loop_count, dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_verts)
+
+    face_for_loop = np.repeat(
+        np.arange(face_count, dtype=np.int32),
+        loop_total,
+    )
+    next_loop = np.arange(loop_count, dtype=np.int32) + 1
+    is_last = np.zeros(loop_count, dtype=bool)
+    is_last[loop_start + loop_total - 1] = True
+    next_loop[is_last] = loop_start[face_for_loop[is_last]]
+
+    v0 = loop_verts
+    v1 = loop_verts[next_loop]
+    edge_lo = np.minimum(v0, v1)
+    edge_hi = np.maximum(v0, v1)
+
+    order = np.lexsort((edge_hi, edge_lo))
+    edge_lo_s = edge_lo[order]
+    edge_hi_s = edge_hi[order]
+    face_s = face_for_loop[order]
+
+    same_edge = (
+        (edge_lo_s[1:] == edge_lo_s[:-1])
+        & (edge_hi_s[1:] == edge_hi_s[:-1])
+    )
+    face_a = face_s[:-1][same_edge]
+    face_b = face_s[1:][same_edge]
+    valid = face_a != face_b
+    face_a = face_a[valid]
+    face_b = face_b[valid]
+
+    if len(face_a) == 0:
+        return FaceTopology(
+            loop_start=loop_start,
+            loop_total=loop_total,
+            loop_vertex_indices=loop_verts,
+            adjacency_offsets=np.zeros(face_count + 1, dtype=np.int32),
+            adjacency_indices=np.empty(0, dtype=np.int32),
+            edge_face_a=np.empty(0, dtype=np.int32),
+            edge_face_b=np.empty(0, dtype=np.int32),
+        )
+
+    pair_lo = np.minimum(face_a, face_b)
+    pair_hi = np.maximum(face_a, face_b)
+    packed = np.stack((pair_lo, pair_hi), axis=1)
+    unique_pairs = np.unique(packed, axis=0)
+    edge_face_a = unique_pairs[:, 0].astype(np.int32, copy=False)
+    edge_face_b = unique_pairs[:, 1].astype(np.int32, copy=False)
+
+    # 无向边展开为双向邻接，再按起点排序构建 CSR。
+    both_a = np.concatenate((edge_face_a, edge_face_b))
+    both_b = np.concatenate((edge_face_b, edge_face_a))
+    sort_order = np.argsort(both_a, kind="stable")
+    both_a = both_a[sort_order]
+    both_b = both_b[sort_order]
+
+    adjacency_offsets = np.zeros(face_count + 1, dtype=np.int32)
+    counts = np.bincount(both_a, minlength=face_count)
+    adjacency_offsets[1:] = np.cumsum(counts, dtype=np.int32)
+
+    return FaceTopology(
+        loop_start=loop_start,
+        loop_total=loop_total,
+        loop_vertex_indices=loop_verts,
+        adjacency_offsets=adjacency_offsets,
+        adjacency_indices=both_b.astype(np.int32, copy=False),
+        edge_face_a=edge_face_a,
+        edge_face_b=edge_face_b,
     )
 
 

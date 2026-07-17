@@ -127,5 +127,55 @@ class ARE_PT_main(bpy.types.Panel):
             status_box.label(text=scene_props.orientation_status_detail)
             status_box.label(text=scene_props.orientation_status_next)
 
+        layout.separator()
+        region_box = layout.box()
+        region_box.label(text="领域分割", icon="FACESEL")
+        mesh_ready = obj is not None and obj.type == "MESH"
+        if scene_props is not None:
+            region_box.prop(
+                scene_props,
+                "region_normal_threshold",
+                text="法线阈值 (°)",
+            )
+            region_box.prop(
+                scene_props,
+                "region_ignore_discrete",
+                text="忽略离散面",
+            )
+            if scene_props.region_ignore_discrete:
+                region_box.prop(
+                    scene_props,
+                    "region_min_area_ratio",
+                    text="最小面积占比 (%)",
+                )
+
+            button_row = region_box.row(align=True)
+            button_row.scale_y = 1.2
+            button_row.enabled = mesh_ready and (
+                obj is None or obj.mode != "EDIT"
+            )
+            button_row.operator(
+                "are.segment_regions",
+                text="识别领域",
+                icon="MOD_EDGESPLIT",
+            )
+            clear_row = region_box.row(align=True)
+            clear_row.enabled = mesh_ready
+            clear_row.operator(
+                "are.clear_regions",
+                text="清除领域",
+                icon="X",
+            )
+
+            if scene_props.region_status:
+                region_box.label(
+                    text=scene_props.region_status,
+                    icon="INFO",
+                )
+                if scene_props.region_status_detail:
+                    region_box.label(text=scene_props.region_status_detail)
+        else:
+            region_box.label(text="属性未就绪", icon="ERROR")
+
 
 classes = (ARE_PT_main,)

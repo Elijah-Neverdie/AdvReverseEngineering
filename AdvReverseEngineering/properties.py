@@ -162,6 +162,80 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
 
     # ------------------------------------------------------------------
+    # 领域分割（Geomagic Design X 风格 Region）
+    # ------------------------------------------------------------------
+    region_normal_threshold: FloatProperty(
+        name="法线阈值",
+        description="相邻面法线夹角小于等于该值时合并为同一领域（度）",
+        default=15.0,
+        min=0.1,
+        max=90.0,
+        soft_min=1.0,
+        soft_max=45.0,
+        precision=1,
+    )
+    region_ignore_discrete: BoolProperty(
+        name="忽略离散面",
+        description="忽略面积过小的领域（相对网格总面积）",
+        default=True,
+    )
+    region_min_area_ratio: FloatProperty(
+        name="最小面积占比",
+        description="领域面积低于网格总面积该比例时视为离散并忽略（百分比）",
+        default=0.1,
+        min=0.001,
+        max=50.0,
+        soft_min=0.01,
+        soft_max=5.0,
+        precision=3,
+        subtype="PERCENTAGE",
+    )
+    show_region_highlight: BoolProperty(
+        name="显示领域",
+        description="在 3D 视口中以随机色显示自动识别的领域",
+        default=True,
+    )
+    region_object: PointerProperty(
+        name="领域对象",
+        description="当前领域分割结果所属对象",
+        type=bpy.types.Object,
+    )
+    region_count: IntProperty(
+        name="领域数量",
+        description="最近一次识别到的有效领域数量",
+        default=0,
+        min=0,
+    )
+    region_ignored_face_count: IntProperty(
+        name="忽略面数",
+        description="因面积过小被忽略的面数量",
+        default=0,
+        min=0,
+    )
+    region_ignored_region_count: IntProperty(
+        name="忽略领域数",
+        description="因面积过小被忽略的领域数量",
+        default=0,
+        min=0,
+    )
+    region_version: IntProperty(
+        name="领域结果版本",
+        description="每次识别递增，用于覆盖层缓存失效",
+        default=0,
+        min=0,
+    )
+    region_status: StringProperty(
+        name="领域状态",
+        description="最近一次领域识别的摘要",
+        default="",
+    )
+    region_status_detail: StringProperty(
+        name="领域状态详情",
+        description="忽略离散面等附加说明",
+        default="",
+    )
+
+    # ------------------------------------------------------------------
     # 原点设置
     # ------------------------------------------------------------------
     origin_mode: EnumProperty(
