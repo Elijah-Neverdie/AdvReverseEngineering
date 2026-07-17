@@ -123,6 +123,15 @@ class ARE_PT_main(bpy.types.Panel):
         if obj is None or obj.type != "MESH":
             layout.label(text="请选中网格对象", icon="INFO")
 
+        row = layout.row()
+        row.scale_y = 1.4
+        row.enabled = obj is not None and obj.type == "MESH"
+        row.operator(
+            "are.auto_orient",
+            text="自动摆正",
+            icon="ORIENTATION_GLOBAL",
+        )
+
         if scene_props is None:
             return
 
