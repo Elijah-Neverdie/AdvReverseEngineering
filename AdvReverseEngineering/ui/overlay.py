@@ -115,8 +115,15 @@ def get_merge_label_session() -> dict | None:
 
 
 def update_merge_label_projections(context: bpy.types.Context) -> None:
-    """根据当前视角刷新标签屏幕坐标。"""
-    from ..utils.viewport import project_world_to_region
+    """根据当前视角刷新标签屏幕坐标，并过滤背面/遮挡编号。"""
+    from mathutils import Vector
+
+    from ..utils.viewport import (
+        is_label_facing_camera,
+        is_world_point_occluded,
+        project_world_to_region,
+        view_direction_to_point,
+    )
 
     session = _MERGE_LABEL_SESSION
     if session is None:
@@ -124,31 +131,68 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
     region = context.region
     rv3d = getattr(context, "region_data", None)
     if region is None or rv3d is None or region.type != "WINDOW":
-        # 尝试从当前屏幕找 VIEW_3D
         space = getattr(context, "space_data", None)
         if space is None or space.type != "VIEW_3D":
             return
         rv3d = space.region_3d
+        # draw handler 下尽量取当前 WINDOW region
+        if region is None or region.type != "WINDOW":
+            for area_region in getattr(space, "regions", []):
+                if area_region.type == "WINDOW":
+                    region = area_region
+                    break
+    if region is None or rv3d is None:
+        return
+
+    depsgraph = context.evaluated_depsgraph_get()
+    if getattr(rv3d, "is_perspective", True):
+        view_origin = rv3d.view_matrix.inverted().translation
+    else:
+        # 正交：从标签沿视线反方向退一段作为射线起点。
+        view_origin = None
+
+    exclude_obj = None
+    object_name = session.get("object_name")
+    if object_name:
+        exclude_obj = bpy.data.objects.get(object_name)
 
     labels = session.get("labels", [])
     for label in labels:
         world = label.get("world_co")
-        if world is None:
+        normal = label.get("normal")
+        if world is None or normal is None:
             label["visible"] = False
             label["screen_xy"] = None
             continue
-        # 中心上方偏移一点，避免贴在表面上。
-        raised = (
-            float(world[0]),
-            float(world[1]),
-            float(world[2]) + float(session.get("lift", 0.0)),
-        )
-        screen = project_world_to_region(region, rv3d, raised)
+
+        view_dir = view_direction_to_point(rv3d, world)
+        if not is_label_facing_camera(normal, view_dir):
+            label["visible"] = False
+            label["screen_xy"] = None
+            continue
+
+        if view_origin is None:
+            # 正交视图：从标签朝向相机方向退回一段距离。
+            ray_origin = Vector(world) - view_dir * 1000.0
+        else:
+            ray_origin = view_origin
+
+        if is_world_point_occluded(
+            depsgraph,
+            ray_origin,
+            world,
+            exclude_obj=exclude_obj,
+        ):
+            label["visible"] = False
+            label["screen_xy"] = None
+            continue
+
+        screen = project_world_to_region(region, rv3d, world)
         if screen is None:
             label["visible"] = False
             label["screen_xy"] = None
             continue
-        screen.y += LABEL_OFFSET_Y
+
         label["screen_xy"] = screen
         label["visible"] = True
 
@@ -175,7 +219,7 @@ def _draw_circle_2d(center_x: float, center_y: float, radius: float, color) -> N
 
 
 def draw_region_merge_labels() -> None:
-    """POST_PIXEL：绘制始终置顶的领域编号按钮。"""
+    """POST_PIXEL：绘制当前可见的领域编号按钮（已过滤遮挡）。"""
     import blf
 
     context = bpy.context
@@ -209,7 +253,6 @@ def draw_region_merge_labels() -> None:
                 fill = (0.12, 0.12, 0.14, 0.82)
 
             _draw_circle_2d(screen.x, screen.y, LABEL_RADIUS_PX, fill)
-            # 外圈
             _draw_circle_2d(
                 screen.x,
                 screen.y,
@@ -550,7 +593,7 @@ def _draw_colored_tris(coords: np.ndarray, colors: np.ndarray) -> None:
 
 
 def draw_overlays() -> None:
-    """视口叠加回调：绘制领域多色与底面紫色。"""
+    """视口叠加回调：领域多色与底面紫色统一由“显示领域”控制。"""
     context = bpy.context
     if context is None or context.scene is None:
         return
@@ -558,37 +601,37 @@ def draw_overlays() -> None:
     scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
     if scene_props is None:
         return
+    if not scene_props.show_region_highlight:
+        return
 
-    # 先画领域，再画底面，保证紫色底面叠在上层更易辨认。
-    if scene_props.show_region_highlight:
-        region_obj = scene_props.region_object
-        if (
-            region_obj is not None
-            and region_obj.type == "MESH"
-            and _is_object_selected(context, region_obj)
-            and not region_obj.hide_get()
-            and not region_obj.hide_viewport
-            and region_obj.mode != "EDIT"
-            and region_obj.data.attributes.get(REGION_ID_ATTR) is not None
-        ):
-            coords, colors = _cached_region_draw_arrays(region_obj)
-            _draw_colored_tris(coords, colors)
+    # 先画普通领域，再画底面紫色（底面是固定前置领域，不参与编号）。
+    region_obj = scene_props.region_object
+    if (
+        region_obj is not None
+        and region_obj.type == "MESH"
+        and _is_object_selected(context, region_obj)
+        and not region_obj.hide_get()
+        and not region_obj.hide_viewport
+        and region_obj.mode != "EDIT"
+        and region_obj.data.attributes.get(REGION_ID_ATTR) is not None
+    ):
+        coords, colors = _cached_region_draw_arrays(region_obj)
+        _draw_colored_tris(coords, colors)
 
-    if scene_props.show_bottom_highlight:
-        obj = scene_props.highlight_object
-        if (
-            obj is not None
-            and obj.type == "MESH"
-            and _is_object_selected(context, obj)
-            and not obj.hide_get()
-            and not obj.hide_viewport
-            and obj.mode != "EDIT"
-            and BOTTOM_FACES_ATTR in obj
-        ):
-            face_indices = list(obj[BOTTOM_FACES_ATTR])
-            if face_indices:
-                coords = _cached_bottom_coords(obj, face_indices)
-                _draw_uniform_tris(coords, HIGHLIGHT_COLOR)
+    obj = scene_props.highlight_object
+    if (
+        obj is not None
+        and obj.type == "MESH"
+        and _is_object_selected(context, obj)
+        and not obj.hide_get()
+        and not obj.hide_viewport
+        and obj.mode != "EDIT"
+        and BOTTOM_FACES_ATTR in obj
+    ):
+        face_indices = list(obj[BOTTOM_FACES_ATTR])
+        if face_indices:
+            coords = _cached_bottom_coords(obj, face_indices)
+            _draw_uniform_tris(coords, HIGHLIGHT_COLOR)
 
 
 def draw_overlay_controls(self, context: bpy.types.Context) -> None:
@@ -601,11 +644,6 @@ def draw_overlay_controls(self, context: bpy.types.Context) -> None:
     layout.separator()
     column = layout.column(align=True)
     column.label(text="逆向工具")
-    column.prop(
-        scene_props,
-        "show_bottom_highlight",
-        text="显示底面",
-    )
     column.prop(
         scene_props,
         "show_region_highlight",

@@ -9,7 +9,7 @@ import bpy
 import numpy as np
 
 from ..algorithms.regions import (
-    compute_region_centroids,
+    compute_region_label_anchors,
     merge_region_ids,
     segment_regions_by_normal,
 )
@@ -99,27 +99,31 @@ def _read_region_colors(obj: bpy.types.Object, region_count: int) -> np.ndarray:
 
 
 def _bbox_lift(mesh_data) -> float:
-    """标签上浮高度，取包围盒对角线的一小部分。"""
+    """标签法线偏移参考尺度。"""
     vertices = mesh_data["vertices"]
     if len(vertices) == 0:
         return 0.01
     size = vertices.max(axis=0) - vertices.min(axis=0)
-    return float(max(np.linalg.norm(size) * 0.02, 1e-4))
+    return float(max(np.linalg.norm(size) * 0.015, 1e-4))
 
 
 def _build_label_session(region_ids: np.ndarray, mesh_data) -> dict:
-    """根据领域标签构建编号会话。"""
-    centroids = compute_region_centroids(
+    """根据最中心面及法线正方向构建编号锚点会话。"""
+    anchors = compute_region_label_anchors(
         region_ids,
         mesh_data["face_centers"],
+        mesh_data["normals"],
         mesh_data["areas"],
     )
     labels = []
-    for region_id in sorted(centroids.keys()):
+    for region_id in sorted(anchors.keys()):
+        anchor = anchors[region_id]
         labels.append(
             {
                 "id": int(region_id),
-                "world_co": centroids[region_id].copy(),
+                "world_co": np.asarray(anchor["world_co"], dtype=np.float64),
+                "face_center": np.asarray(anchor["face_center"], dtype=np.float64),
+                "normal": np.asarray(anchor["normal"], dtype=np.float64),
                 "screen_xy": None,
                 "visible": False,
             }
@@ -127,6 +131,7 @@ def _build_label_session(region_ids: np.ndarray, mesh_data) -> dict:
     return {
         "labels": labels,
         "lift": _bbox_lift(mesh_data),
+        "object_name": None,
     }
 
 
@@ -381,6 +386,7 @@ class ARE_OT_merge_regions(bpy.types.Operator):
 
         mesh_data = extract_mesh_data(obj)
         session = _build_label_session(region_ids, mesh_data)
+        session["object_name"] = obj.name
         set_merge_label_session(session)
         set_region_highlight(context, obj, region_ids, colors)
         scene_props.merge_status = (
@@ -420,6 +426,7 @@ class ARE_OT_merge_regions(bpy.types.Operator):
 
         mesh_data = extract_mesh_data(obj)
         session = _build_label_session(region_ids, mesh_data)
+        session["object_name"] = obj.name
         set_merge_label_session(session)
         register_label_draw_handler()
 

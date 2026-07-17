@@ -164,7 +164,7 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
     show_bottom_highlight: BoolProperty(
         name="显示底面",
-        description="在 3D 视口中以紫色显示当前选中物体的检测底面",
+        description="兼容旧属性；底面已并入“显示领域”统一控制",
         default=True,
     )
 
@@ -210,7 +210,7 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
     show_region_highlight: BoolProperty(
         name="显示领域",
-        description="在 3D 视口中以随机色显示自动识别的领域",
+        description="在 3D 视口中显示自动识别的领域颜色，以及作为前置固定领域的紫色底面",
         default=True,
     )
     region_object: PointerProperty(

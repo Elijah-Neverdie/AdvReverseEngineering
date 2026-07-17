@@ -391,6 +391,64 @@ def compute_region_centroids(
     return result
 
 
+def compute_region_label_anchors(
+    region_ids: np.ndarray,
+    face_centers: np.ndarray,
+    face_normals: np.ndarray,
+    areas: np.ndarray,
+    offset_ratio: float = 0.015,
+    min_offset: float = 1e-4,
+) -> dict[int, dict]:
+    """
+    为每个领域选择最靠近面积加权中心的面，并把编号锚点放到其法线正方向。
+
+    返回:
+        {
+            region_id: {
+                "world_co": 面中心沿法线偏移后的点,
+                "face_center": 面中心,
+                "normal": 单位法线,
+                "face_index": 选中的面索引,
+            }
+        }
+    """
+    centroids = compute_region_centroids(region_ids, face_centers, areas)
+    ids = np.asarray(region_ids, dtype=np.int32)
+    centers = np.asarray(face_centers, dtype=np.float64)
+    normals = np.asarray(face_normals, dtype=np.float64)
+    if len(centroids) == 0 or len(ids) == 0:
+        return {}
+
+    # 偏移量随模型尺度变化，保证数字略离开表面。
+    extent = float(np.linalg.norm(centers.max(axis=0) - centers.min(axis=0)))
+    offset = max(extent * float(offset_ratio), float(min_offset))
+
+    anchors: dict[int, dict] = {}
+    for region_id, centroid in centroids.items():
+        mask = ids == int(region_id)
+        if not np.any(mask):
+            continue
+        face_indices = np.flatnonzero(mask)
+        region_centers = centers[face_indices]
+        distances = np.linalg.norm(region_centers - centroid, axis=1)
+        best_local = int(np.argmin(distances))
+        face_index = int(face_indices[best_local])
+        normal = normals[face_index]
+        length = float(np.linalg.norm(normal))
+        if length < 1e-12:
+            normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            normal = normal / length
+        face_center = centers[face_index]
+        anchors[int(region_id)] = {
+            "world_co": face_center + normal * offset,
+            "face_center": face_center.copy(),
+            "normal": normal.copy(),
+            "face_index": face_index,
+        }
+    return anchors
+
+
 def compact_region_ids(
     region_ids: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, int]:

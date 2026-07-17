@@ -10,6 +10,7 @@ from AdvReverseEngineering.algorithms.regions import (
     REGION_IGNORED_ID,
     compact_region_ids,
     compute_region_centroids,
+    compute_region_label_anchors,
     merge_region_ids,
     remap_region_colors,
 )
@@ -34,6 +35,44 @@ class RegionMergeTests(unittest.TestCase):
 
         np.testing.assert_allclose(centroids[0], [1.5, 0.0, 0.0])
         np.testing.assert_allclose(centroids[1], [10.0, 0.0, 0.0])
+
+    def test_label_anchor_uses_central_face_normal(self) -> None:
+        region_ids = np.array([0, 0, 0], dtype=np.int32)
+        centers = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        normals = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        areas = np.array([1.0, 10.0, 1.0], dtype=np.float64)
+
+        anchors = compute_region_label_anchors(
+            region_ids,
+            centers,
+            normals,
+            areas,
+            offset_ratio=0.0,
+            min_offset=0.1,
+        )
+
+        self.assertIn(0, anchors)
+        # 面积加权中心靠近 [1,0,0]，应选中第 1 个面，沿 +Y 偏移。
+        self.assertEqual(int(anchors[0]["face_index"]), 1)
+        np.testing.assert_allclose(
+            anchors[0]["world_co"],
+            [1.0, 0.1, 0.0],
+            atol=1e-8,
+        )
 
     def test_merge_then_compact_keeps_anchor_color(self) -> None:
         region_ids = np.array([0, 1, 2, 1], dtype=np.int32)
