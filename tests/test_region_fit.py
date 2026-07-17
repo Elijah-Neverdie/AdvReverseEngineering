@@ -271,7 +271,9 @@ class BoundaryExtractionTests(unittest.TestCase):
         # 回归：弯曲条带的两个 island 合并时，包络不得在弧的两条臂
         # 之间跳变（旧的主轴分箱会导致拟合面交叉扭曲）
         vertices, loops = _arc_band_island_loops()
-        envelope = combine_boundary_islands(loops, vertices)
+        envelope, band_sides = combine_boundary_islands(loops, vertices)
+        self.assertIsNotNone(band_sides)
+        self.assertEqual(len(band_sides), 4)
         radii = np.linalg.norm(envelope[:, :2], axis=1)
         self.assertTrue(bool(np.all(radii > 3.9)))
         self.assertTrue(bool(np.all(radii < 5.1)))
@@ -291,7 +293,9 @@ class BoundaryExtractionTests(unittest.TestCase):
             mesh["loop_vertex_indices"],
         )
         self.assertEqual(len(loops), 2)
-        envelope = combine_boundary_islands(loops, mesh["vertices"])
+        envelope, band_sides = combine_boundary_islands(loops, mesh["vertices"])
+        self.assertIsNotNone(band_sides)
+        self.assertEqual(len(band_sides), 4)
         self.assertGreaterEqual(len(envelope), 4)
         self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=6)
         self.assertAlmostEqual(float(envelope[:, 0].max()), 2.5, places=6)
@@ -460,6 +464,28 @@ class ResampleAndCoonsTests(unittest.TestCase):
         np.testing.assert_allclose(grid[-1, 0], [0.0, 2.0, 0.0])
         np.testing.assert_allclose(grid[-1, -1], [2.0, 2.0, 0.0])
         np.testing.assert_allclose(grid[1, 1], [1.0, 1.0, 0.0], atol=1e-8)
+
+    def test_shared_param_keeps_radial_correspondence(self) -> None:
+        # 内外弧弧长不同时，按索引重采样保持同一极角对应，避免扭转
+        thetas = np.linspace(0.0, np.pi * 0.6, 40)
+        inner = np.column_stack(
+            (4.0 * np.cos(thetas), 4.0 * np.sin(thetas), np.zeros(40))
+        )
+        outer = np.column_stack(
+            (5.0 * np.cos(thetas), 5.0 * np.sin(thetas), np.zeros(40))
+        )
+        end = np.vstack((inner[-1], outer[-1]))
+        start = np.vstack((outer[0], inner[0]))
+        sides = [inner, end, outer[::-1], start]
+        verts, faces = build_quad_patch(
+            sides, segments_u=8, segments_v=3, shared_param=True
+        )
+        grid = verts.reshape(4, 9, 3)
+        # 同一 u 列的点应近似共径（与原点夹角接近）
+        for i in range(9):
+            angles = np.arctan2(grid[:, i, 1], grid[:, i, 0])
+            self.assertLess(float(angles.max() - angles.min()), 0.08)
+        self.assertEqual(len(faces), 8 * 3)
 
     def test_quad_opposite_counts_match(self) -> None:
         sides = [

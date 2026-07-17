@@ -311,22 +311,189 @@ def _band_parameterization(
     return param_u, radii
 
 
+def _polyline_self_cross_count_2d(points_2d: np.ndarray) -> int:
+    """闭环折线在 2D 上的真自交段数（不含相邻边）。"""
+    xy = _as_float_array(points_2d)
+    count = len(xy)
+    if count < 4:
+        return 0
+    crosses = 0
+
+    def _orient(a, b, c) -> float:
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    def _proper_cross(a, b, c, d) -> bool:
+        o1 = _orient(a, b, c)
+        o2 = _orient(a, b, d)
+        o3 = _orient(c, d, a)
+        o4 = _orient(c, d, b)
+        return (o1 * o2 < 0.0) and (o3 * o4 < 0.0)
+
+    for i in range(count):
+        a = xy[i]
+        b = xy[(i + 1) % count]
+        for j in range(i + 2, count if i > 0 else count - 1):
+            if i == 0 and j == count - 1:
+                continue
+            if (j + 1) % count == i:
+                continue
+            if _proper_cross(a, b, xy[j], xy[(j + 1) % count]):
+                crosses += 1
+    return crosses
+
+
+def _band_envelope_from_samples(
+    points_3d: np.ndarray,
+    points_2d: np.ndarray,
+    force_axis: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray]]:
+    """
+    由采样点构建条带外包络。
+
+    返回 (envelope_3d, structural_corners_3d[4], envelope_2d, band_sides)。
+    band_sides 为 [下链, 末端短边, 上链(反向), 首端短边]，两条长边共享
+    同一 u 分箱下标，供 Coons 按索引重采样，避免弧长参数错位扭曲。
+    """
+    pts3 = _as_float_array(points_3d)
+    pts2 = _as_float_array(points_2d)
+    if force_axis:
+        param_u = pts2[:, 0]
+        param_v = pts2[:, 1]
+    else:
+        param_u, param_v = _band_parameterization(pts2)
+
+    u_min = float(param_u.min())
+    u_max = float(param_u.max())
+    u_span = u_max - u_min
+    if u_span < 1e-12:
+        raise RegionFitError("多个 island 沿主方向跨度过小，无法合并")
+
+    bin_count = int(np.clip(len(pts3) // 4, 48, _BOUNDARY_SAMPLES_MAX // 2))
+    bin_ids = np.floor(
+        (param_u - u_min) / u_span * (bin_count - 1)
+    ).astype(np.int32)
+    bin_ids = np.clip(bin_ids, 0, bin_count - 1)
+
+    lower3 = np.full((bin_count, 3), np.nan, dtype=np.float64)
+    upper3 = np.full((bin_count, 3), np.nan, dtype=np.float64)
+    lower2 = np.full((bin_count, 2), np.nan, dtype=np.float64)
+    upper2 = np.full((bin_count, 2), np.nan, dtype=np.float64)
+    for bin_index in range(bin_count):
+        members = np.flatnonzero(bin_ids == bin_index)
+        if len(members) == 0:
+            continue
+        member_v = param_v[members]
+        lo = int(members[int(np.argmin(member_v))])
+        hi = int(members[int(np.argmax(member_v))])
+        lower3[bin_index] = pts3[lo]
+        upper3[bin_index] = pts3[hi]
+        lower2[bin_index] = pts2[lo]
+        upper2[bin_index] = pts2[hi]
+
+    valid = np.flatnonzero(np.isfinite(lower3[:, 0]))
+    if len(valid) < 2:
+        raise RegionFitError("多个 island 无法形成连续包络")
+    first = int(valid[0])
+    last = int(valid[-1])
+    grid = np.arange(first, last + 1, dtype=np.float64)
+    for axis in range(3):
+        lower3[first : last + 1, axis] = np.interp(
+            grid, valid.astype(np.float64), lower3[valid, axis]
+        )
+        upper3[first : last + 1, axis] = np.interp(
+            grid, valid.astype(np.float64), upper3[valid, axis]
+        )
+    for axis in range(2):
+        lower2[first : last + 1, axis] = np.interp(
+            grid, valid.astype(np.float64), lower2[valid, axis]
+        )
+        upper2[first : last + 1, axis] = np.interp(
+            grid, valid.astype(np.float64), upper2[valid, axis]
+        )
+
+    lower_u = lower3[first : last + 1]
+    upper_u = upper3[first : last + 1]  # 与 lower 共享同一 u 分箱
+    lower_u2 = lower2[first : last + 1]
+    upper_u2 = upper2[first : last + 1]
+
+    # 修剪条带两端宽度过窄的分箱，避免零长度端帽把 Coons 压扁
+    widths = np.linalg.norm(upper_u - lower_u, axis=1)
+    positive = widths[widths > 1e-9]
+    if len(positive) == 0:
+        raise RegionFitError("多个 island 条带宽度过小，无法合并")
+    width_min = max(float(np.median(positive)) * 0.15, 1e-6)
+    usable = np.flatnonzero(widths >= width_min)
+    if len(usable) < 2:
+        usable = np.flatnonzero(widths > 1e-9)
+    if len(usable) < 2:
+        raise RegionFitError("多个 island 条带有效跨度过小，无法合并")
+    lo = int(usable[0])
+    hi = int(usable[-1])
+    lower_u = lower_u[lo : hi + 1]
+    upper_u = upper_u[lo : hi + 1]
+    lower_u2 = lower_u2[lo : hi + 1]
+    upper_u2 = upper_u2[lo : hi + 1]
+
+    upper_chain = upper_u[::-1]
+    envelope = np.vstack((lower_u, upper_chain))
+    envelope_2d = np.vstack((lower_u2, upper_u2[::-1]))
+    n_lower = len(lower_u)
+    raw_corners = [0, n_lower - 1, n_lower, 2 * n_lower - 1]
+
+    keep = np.ones(len(envelope), dtype=bool)
+    if len(envelope) > 1:
+        keep[1:] = (
+            np.linalg.norm(np.diff(envelope, axis=0), axis=1) > 1e-10
+        )
+    for index in raw_corners:
+        keep[index] = True
+    envelope = envelope[keep]
+    envelope_2d = envelope_2d[keep]
+    old_to_new = np.cumsum(keep) - 1
+    corner_indices = [int(old_to_new[i]) for i in raw_corners]
+    count = len(envelope)
+    unique: list[int] = []
+    for index in corner_indices:
+        candidate = int(index) % count
+        for _ in range(count):
+            if candidate not in unique:
+                break
+            candidate = (candidate + 1) % count
+        unique.append(candidate)
+    corners = envelope[np.asarray(unique, dtype=np.int32)]
+    if len(envelope) < 4:
+        raise RegionFitError("合并后的 island 包络点数不足")
+
+    # 共享 u 参数的四边：长边按下标对应，避免后续弧长重采样错位
+    cap_count = int(np.clip(n_lower // 8, 2, 16))
+    end_t = np.linspace(0.0, 1.0, cap_count, dtype=np.float64)[:, None]
+    end_cap = lower_u[-1][None, :] + end_t * (upper_u[-1] - lower_u[-1])
+    start_cap = upper_u[0][None, :] + end_t * (lower_u[0] - upper_u[0])
+    band_sides = [lower_u, end_cap, upper_chain, start_cap]
+    return envelope, corners, envelope_2d, band_sides
+
+
 def combine_boundary_islands(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, list[np.ndarray] | None]:
     """
     将同一领域内互不连通的 island 边界合成为一个连续外包络。
 
     所有环先投影到共同 PCA 平面，按条带参数化（平直用主轴坐标、
     弯弧用极角）分箱提取两侧包络；island 之间无采样的区间用两侧
-    包络线性连接。返回一个有序 3D 闭环（不重复首点）。
+    包络线性连接。
+
+    返回 (envelope, band_sides)：
+      - envelope: 有序 3D 闭环（不重复首点）
+      - band_sides: 多 island 时为共享 u 参数的四边
+        [下链, 末端短边, 上链, 首端短边]；单环时为 None
     """
     if not loops:
         raise RegionFitError("没有边界环可合并")
     verts = _as_float_array(vertices)
     if len(loops) == 1:
-        return verts[np.asarray(loops[0], dtype=np.int32)].copy()
+        return verts[np.asarray(loops[0], dtype=np.int32)].copy(), None
 
     loop_points = [
         verts[np.asarray(loop, dtype=np.int32)]
@@ -357,63 +524,54 @@ def combine_boundary_islands(
 
     points_3d = np.vstack(samples_3d)
     points_2d = np.vstack(samples_2d)
-    param_u, param_v = _band_parameterization(points_2d)
-    u_min = float(param_u.min())
-    u_max = float(param_u.max())
-    u_span = u_max - u_min
-    if u_span < 1e-12:
-        raise RegionFitError("多个 island 沿主方向跨度过小，无法合并")
 
-    bin_count = int(
-        np.clip(len(points_3d) // 4, 48, _BOUNDARY_SAMPLES_MAX // 2)
+    envelope, _corners, envelope_2d, band_sides = _band_envelope_from_samples(
+        points_3d, points_2d, force_axis=False
     )
-    bin_ids = np.floor(
-        (param_u - u_min) / u_span * (bin_count - 1)
-    ).astype(np.int32)
-    bin_ids = np.clip(bin_ids, 0, bin_count - 1)
-
-    lower = np.full((bin_count, 3), np.nan, dtype=np.float64)
-    upper = np.full((bin_count, 3), np.nan, dtype=np.float64)
-    for bin_index in range(bin_count):
-        members = np.flatnonzero(bin_ids == bin_index)
-        if len(members) == 0:
-            continue
-        member_v = param_v[members]
-        lower[bin_index] = points_3d[members[int(np.argmin(member_v))]]
-        upper[bin_index] = points_3d[members[int(np.argmax(member_v))]]
-
-    valid = np.flatnonzero(np.isfinite(lower[:, 0]))
-    if len(valid) < 2:
-        raise RegionFitError("多个 island 无法形成连续包络")
-    first = int(valid[0])
-    last = int(valid[-1])
-    grid = np.arange(first, last + 1, dtype=np.float64)
-    for axis in range(3):
-        lower[first : last + 1, axis] = np.interp(
-            grid,
-            valid.astype(np.float64),
-            lower[valid, axis],
+    # 极角包络若自交，回退主轴分箱；仍自交则保留自交较少者
+    if _polyline_self_cross_count_2d(envelope_2d) > 0:
+        alt_env, _alt_c, alt_2d, alt_sides = _band_envelope_from_samples(
+            points_3d, points_2d, force_axis=True
         )
-        upper[first : last + 1, axis] = np.interp(
-            grid,
-            valid.astype(np.float64),
-            upper[valid, axis],
-        )
+        if _polyline_self_cross_count_2d(alt_2d) <= _polyline_self_cross_count_2d(
+            envelope_2d
+        ):
+            envelope, band_sides = alt_env, alt_sides
 
-    lower_chain = lower[first : last + 1]
-    upper_chain = upper[first : last + 1][::-1]
-    envelope = np.vstack((lower_chain, upper_chain))
+    # 对边长弧长度相差过大，或 island 过于碎散：说明并非同一条带，
+    # 强行并包络会产生扭曲；回退为最长单环。
+    if band_sides is not None and len(band_sides) == 4:
+        long_a = polyline_length(band_sides[0])
+        long_b = polyline_length(band_sides[2])
+        shorter = min(long_a, long_b)
+        longer = max(long_a, long_b)
+        too_asymmetric = shorter < 1e-9 or longer > 1.6 * shorter
+        too_fragmented = len(loop_points) >= 10
+        if too_asymmetric or too_fragmented:
+            primary = max(
+                loop_points,
+                key=lambda pts: polyline_length(
+                    np.vstack((pts, pts[:1]))
+                ),
+            )
+            return primary.copy(), None
+    return envelope, band_sides
 
-    # 去除相邻重复点，避免极端 bin 产生零长度边。
-    keep = np.ones(len(envelope), dtype=bool)
-    if len(envelope) > 1:
-        keep[1:] = (
-            np.linalg.norm(np.diff(envelope, axis=0), axis=1) > 1e-10
-        )
-    envelope = envelope[keep]
-    if len(envelope) < 4:
-        raise RegionFitError("合并后的 island 包络点数不足")
-    return envelope
+
+def resample_polyline_by_index(points: np.ndarray, count: int) -> np.ndarray:
+    """按下标均匀重采样（非弧长）。用于共享参数域的条带对边。"""
+    pts = _as_float_array(points)
+    target = max(int(count), 2)
+    if len(pts) == 0:
+        raise RegionFitError("空折线无法重采样")
+    if len(pts) == 1:
+        return np.repeat(pts, target, axis=0)
+    positions = np.linspace(0.0, len(pts) - 1, target, dtype=np.float64)
+    result = np.empty((target, pts.shape[1]), dtype=np.float64)
+    base = np.arange(len(pts), dtype=np.float64)
+    for axis in range(pts.shape[1]):
+        result[:, axis] = np.interp(positions, base, pts[:, axis])
+    return result
 
 
 def compute_region_frame(
@@ -881,16 +1039,24 @@ def build_quad_patch(
     sides: Sequence[np.ndarray],
     segments_u: int,
     segments_v: int,
+    *,
+    shared_param: bool = False,
 ) -> tuple[np.ndarray, list[tuple[int, ...]]]:
-    """四边 Coons：对边同分段。"""
+    """
+    四边 Coons：对边同分段。
+
+    shared_param=True 时对边按下标重采样（条带内外弧共享 u 参数），
+    否则按弧长重采样。
+    """
     if len(sides) != 4:
         raise RegionFitError("四边拟合需要恰好四条边")
     seg_u = max(int(segments_u), MIN_SEGMENTS)
     seg_v = max(int(segments_v), MIN_SEGMENTS)
-    bottom = resample_polyline(sides[0], seg_u + 1)
-    right = resample_polyline(sides[1], seg_v + 1)
-    top = resample_polyline(sides[2][::-1], seg_u + 1)
-    left = resample_polyline(sides[3][::-1], seg_v + 1)
+    resample = resample_polyline_by_index if shared_param else resample_polyline
+    bottom = resample(sides[0], seg_u + 1)
+    right = resample(sides[1], seg_v + 1)
+    top = resample(sides[2][::-1], seg_u + 1)
+    left = resample(sides[3][::-1], seg_v + 1)
     grid = coons_patch(bottom, right, top, left)
     vertices = grid.reshape(-1, 3)
     faces = patch_grid_faces(seg_u, seg_v)
@@ -1004,7 +1170,7 @@ def analyze_region_fit_topology(
         loop_total,
         loop_vertex_indices,
     )
-    loop_pts = combine_boundary_islands(loops, vertices)
+    loop_pts, band_sides = combine_boundary_islands(loops, vertices)
     _, normal, _, _ = compute_region_frame(
         face_normals,
         face_areas,
@@ -1014,36 +1180,59 @@ def analyze_region_fit_topology(
     )
     # 2D 分析基底用边界点 PCA 平面，避免弯曲条带投影折叠
     origin, axis_u, axis_v = _loop_pca_basis(loop_pts)
-    pts_2d_raw = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
-    # 统一为逆时针（角点检测与凹口桥接依赖此方向约定）
-    if _signed_area_2d(pts_2d_raw) < 0.0:
-        loop_pts = loop_pts[::-1]
+    shared_param = False
 
-    # 闭环按弧长均匀重采样：3D 边链直接来自采样点，保留扫描起伏
-    sample_count = int(
-        np.clip(len(loop_pts) * 2, _BOUNDARY_SAMPLES_MIN, _BOUNDARY_SAMPLES_MAX)
-    )
-    loop_rs = resample_closed_polyline(loop_pts, sample_count)
-    pts_2d = project_points_to_plane(loop_rs, origin, axis_u, axis_v)
+    if band_sides is not None and len(band_sides) == 4:
+        # 多 island 条带：直接使用共享 u 分箱的四边，跳过转角检测与
+        # 整环弧长重采样（二者都会破坏内外弧的参数对应，导致扭曲）。
+        # 结构上恒为四边（两长弧+两端帽），即使一端很短也不坍成三边。
+        sides_3d = [np.asarray(side, dtype=np.float64) for side in band_sides]
+        pts_2d_raw = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
+        if _signed_area_2d(pts_2d_raw) < 0.0:
+            sides_3d = [side[::-1] for side in reversed(sides_3d)]
+        # 旋转使 sides[0]/sides[2] 为两条长边（U 向沿条带）
+        lengths = [polyline_length(side) for side in sides_3d]
+        if lengths[0] + lengths[2] < lengths[1] + lengths[3]:
+            sides_3d = [sides_3d[1], sides_3d[2], sides_3d[3], sides_3d[0]]
+        topology = "QUAD"
+        shared_param = True
+        corner_count = 4
+    else:
+        pts_2d_raw = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
+        # 统一为逆时针（角点检测与凹口桥接依赖此方向约定）
+        if _signed_area_2d(pts_2d_raw) < 0.0:
+            loop_pts = loop_pts[::-1]
 
-    corners = detect_corner_indices(
-        pts_2d,
-        corner_angle_deg,
-        max_corners=4,
-    )
-    if len(corners) < 3:
-        # 无明显角点（近圆/椭圆域）：按弧长均匀取 4 个角点
-        quarter = max(sample_count // 4, 1)
-        corners = [0, quarter, 2 * quarter, 3 * quarter]
+        # 闭环按弧长均匀重采样：3D 边链直接来自采样点，保留扫描起伏
+        sample_count = int(
+            np.clip(
+                len(loop_pts) * 2,
+                _BOUNDARY_SAMPLES_MIN,
+                _BOUNDARY_SAMPLES_MAX,
+            )
+        )
+        loop_rs = resample_closed_polyline(loop_pts, sample_count)
+        pts_2d = project_points_to_plane(loop_rs, origin, axis_u, axis_v)
 
-    sides_3d = split_loop_into_sides(loop_rs, corners)
-    sides_2d = split_loop_into_sides(pts_2d, corners)
-    sides_2d, sides_3d = bridge_concave_notches(
-        sides_2d,
-        sides_3d,
-        corner_angle_deg,
-    )
-    topology, sides_3d = classify_tri_or_quad(sides_3d, triangle_ratio)
+        corners = detect_corner_indices(
+            pts_2d,
+            corner_angle_deg,
+            max_corners=4,
+        )
+        if len(corners) < 3:
+            # 无明显角点（近圆/椭圆域）：按弧长均匀取 4 个角点
+            quarter = max(sample_count // 4, 1)
+            corners = [0, quarter, 2 * quarter, 3 * quarter]
+
+        sides_3d = split_loop_into_sides(loop_rs, corners)
+        sides_2d = split_loop_into_sides(pts_2d, corners)
+        sides_2d, sides_3d = bridge_concave_notches(
+            sides_2d,
+            sides_3d,
+            corner_angle_deg,
+        )
+        topology, sides_3d = classify_tri_or_quad(sides_3d, triangle_ratio)
+        corner_count = len(corners)
 
     lengths = tuple(polyline_length(side) for side in sides_3d)
     return {
@@ -1053,7 +1242,8 @@ def analyze_region_fit_topology(
         "normal": normal,
         "origin": origin,
         "loop_count": len(loops),
-        "corner_count": len(corners),
+        "corner_count": corner_count,
+        "shared_param": shared_param,
     }
 
 
@@ -1110,7 +1300,12 @@ def fit_region_surface(
             segments_base=seg_u,
         )
     else:
-        mesh_verts, faces = build_quad_patch(sides, seg_u, seg_v)
+        mesh_verts, faces = build_quad_patch(
+            sides,
+            seg_u,
+            seg_v,
+            shared_param=bool(analysis.get("shared_param", False)),
+        )
 
     faces = _orient_faces(mesh_verts, faces, normal)
     return RegionFitResult(
