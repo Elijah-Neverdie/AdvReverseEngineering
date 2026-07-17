@@ -4,12 +4,13 @@
 """
 领域（Region）自动分割算法。
 
-参考 Geomagic Design X 的 Auto Segment 思路：
+参考 Geomagic Design X 的 Auto Segment，并以 Blender 视图叠加层
+「线框」阈值作为默认硬边判据：
     1. 边保护法线平滑，抑制扫描噪声但不软化硬边
-    2. 种子区域生长：候选面须同时接近相邻面法线与领域平均法线，
-       杜绝链式合并越过圆角/硬边的“泄漏”
-    3. 按网格总面积占比过滤离散小领域
-    4. 为有效领域生成稳定可复现的随机色
+    2. 按 Blender edge_fac 公式把相邻面法线夹角映射为线框可见性
+    3. 种子区域生长：只越过「线框不可见」的平坦边；双重法线判据防泄漏
+    4. 按网格总面积占比过滤离散小领域
+    5. 为有效领域生成稳定可复现的随机色
 """
 
 from __future__ import annotations
@@ -25,6 +26,10 @@ from ..utils.mesh import FaceTopology
 
 REGION_IGNORED_ID = -1
 COLOR_SEED = 20260717
+# Blender extract_mesh_vbo_edge_fac.cc::edge_factor_calc 中的缩放常数：
+# fac = clamp(200*(dot-1)+1, 0, 1)；约 acos(0.995)≈5.73° 以上恒为硬边。
+_BLENDER_WIRE_FAC_SCALE = 200.0
+_BLENDER_WIRE_FAC_HIDE = 254.0 / 255.0
 
 
 class RegionSegmentationResult(TypedDict):
@@ -36,6 +41,50 @@ class RegionSegmentationResult(TypedDict):
     ignored_region_count: int
     colors: np.ndarray
     total_area: float
+
+
+def blender_wire_edge_fac(cosine: np.ndarray | float) -> np.ndarray | float:
+    """
+    复刻 Blender 线框边因子 edge_factor_calc。
+
+    cosine 为相邻面单位法线点积；返回 [0, 254/255]：
+    越接近 0 表示越硬（线框更易显示），接近 1 表示越平坦。
+    """
+    cosine_arr = np.asarray(cosine, dtype=np.float64)
+    fac = (_BLENDER_WIRE_FAC_SCALE * (cosine_arr - 1.0)) + 1.0
+    fac = np.clip(fac, 0.0, 1.0) * _BLENDER_WIRE_FAC_HIDE
+    if np.ndim(cosine) == 0:
+        return float(fac)
+    return fac.astype(np.float64, copy=False)
+
+
+def blender_wire_step_param(wireframe_threshold: float) -> float:
+    """
+    复刻 overlay_wireframe.hh::wire_discard_threshold_get。
+
+    着色器中边可见条件为：edge_fac <= wire_step_param。
+    """
+    threshold = float(np.sqrt(abs(float(wireframe_threshold))))
+    return float(threshold * _BLENDER_WIRE_FAC_HIDE)
+
+
+def wireframe_threshold_to_cos_limit(wireframe_threshold: float) -> float:
+    """
+    把视图叠加层线框阈值 T 换成「可合并」的最小法线点积。
+
+    边在线框中可见（应作为领域边界）当 fac <= sqrt(T)*254/255，
+    等价于（未触底时）cosine <= 1 + (sqrt(T)-1)/200。
+    区域生长仅允许越过更平坦的边，即 cosine > 该值。
+    """
+    step = float(np.sqrt(abs(float(wireframe_threshold))))
+    # fac = clamp(200*(c-1)+1,0,1)；fac > step 才能合并。
+    # 反解未钳制段：c > 1 + (step - 1)/200。
+    return float(1.0 + (step - 1.0) / _BLENDER_WIRE_FAC_SCALE)
+
+
+def angle_threshold_to_cos_limit(angle_threshold_deg: float) -> float:
+    """兼容旧的角度阈值：夹角小于等于该值才允许合并。"""
+    return float(np.cos(np.radians(max(float(angle_threshold_deg), 0.0))))
 
 
 def smooth_face_normals(
@@ -179,19 +228,20 @@ def _grow_regions(
                 cand_x = nx[neighbor]
                 cand_y = ny[neighbor]
                 cand_z = nz[neighbor]
-                # 判据 1: 与接壤面法线接近
-                if (
+                # 判据 1: 与接壤面法线接近（对齐 Blender 线框：<= 视为硬边）
+                local_dot = (
                     cand_x * face_x
                     + cand_y * face_y
                     + cand_z * face_z
-                ) < cos_limit:
+                )
+                if local_dot <= cos_limit:
                     continue
                 # 判据 2: 与领域平均法线接近（防泄漏关键）
                 if (
                     cand_x * mean_x
                     + cand_y * mean_y
                     + cand_z * mean_z
-                ) < cos_limit:
+                ) <= cos_limit:
                     continue
                 labels[neighbor] = region_id
                 cand_weight = weight[neighbor]
@@ -256,24 +306,27 @@ def segment_regions_by_normal(
     normals: np.ndarray,
     areas: np.ndarray,
     topology: FaceTopology,
-    angle_threshold_deg: float = 15.0,
+    angle_threshold_deg: float | None = None,
     ignore_discrete: bool = True,
     min_area_ratio: float = 0.001,
     smooth_iterations: int = 0,
+    wireframe_threshold: float | None = 0.1,
 ) -> RegionSegmentationResult:
     """
-    按法线阈值进行领域分割（种子区域生长，防泄漏）。
+    按 Blender 线框硬边（或兼容角度阈值）进行领域分割。
 
     参数:
         normals: (F, 3) 单位法线
         areas: (F,) 面面积（任意一致尺度）
         topology: 共享边邻接拓扑
-        angle_threshold_deg: 法线最大夹角（度），同时约束
-            相邻面与领域平均法线两个判据
+        angle_threshold_deg: 旧版角度阈值（度）；仅当
+            wireframe_threshold 为 None 时生效
         ignore_discrete: 是否按面积占比忽略小领域
         min_area_ratio: 相对网格总面积的最小占比阈值
         smooth_iterations: 边保护法线平滑迭代次数，
             细碎扫描网格建议 1~3，规则网格可为 0
+        wireframe_threshold: 对齐视图叠加层线框滑条（0~1），
+            默认 0.1；越低领域边界越接近更硬的橘色线框边
     """
     face_count = len(normals)
     if face_count == 0:
@@ -293,14 +346,17 @@ def segment_regions_by_normal(
         areas = np.ones(face_count, dtype=np.float64)
         total_area = float(face_count)
 
-    cos_limit = float(
-        np.cos(np.radians(max(angle_threshold_deg, 0.0)))
-    )
+    if wireframe_threshold is not None:
+        cos_limit = wireframe_threshold_to_cos_limit(wireframe_threshold)
+        # 平滑保护角固定约 30°：可平均 <30° 的扫描噪声，
+        # 又不会让 Blender 线框硬边（fac=0，约 ≥5.7°）两侧互相污染。
+        smooth_limit = 30.0
+    else:
+        angle = 15.0 if angle_threshold_deg is None else float(angle_threshold_deg)
+        cos_limit = angle_threshold_to_cos_limit(angle)
+        smooth_limit = max(angle * 2.0, 30.0)
 
-    # 平滑保护角取阈值两倍（至少 30°）：既能平均噪声，
-    # 又不会让真正的硬边两侧互相污染。
     if smooth_iterations > 0:
-        smooth_limit = max(float(angle_threshold_deg) * 2.0, 30.0)
         normals = smooth_face_normals(
             normals,
             areas,

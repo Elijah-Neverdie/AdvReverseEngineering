@@ -301,12 +301,12 @@ def _tag_redraw(context: bpy.types.Context) -> None:
 
 
 class ARE_OT_segment_regions(bpy.types.Operator):
-    """按法线阈值自动识别领域并以随机色标记。"""
+    """按 Blender 线框硬边阈值自动识别领域并以随机色标记。"""
 
     bl_idname = "are.segment_regions"
     bl_label = "识别领域"
     bl_description = (
-        "按相邻面法线阈值分割领域，并可忽略面积过小的离散领域"
+        "按视图叠加层线框阈值分割领域，橘色硬边作为默认领域边界"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -334,19 +334,20 @@ class ARE_OT_segment_regions(bpy.types.Operator):
                 step("构建面邻接拓扑")
                 topology = extract_face_topology(obj.data)
 
-                step("法线阈值区域生长")
+                step("线框硬边区域生长")
                 min_ratio = (
                     float(scene_props.region_min_area_ratio) / 100.0
                     if scene_props.region_ignore_discrete
                     else 0.0
                 )
+                wire_threshold = float(
+                    getattr(scene_props, "region_wireframe_threshold", 0.1)
+                )
                 result = segment_regions_by_normal(
                     normals=mesh_data["normals"],
                     areas=mesh_data["areas"],
                     topology=topology,
-                    angle_threshold_deg=float(
-                        scene_props.region_normal_threshold
-                    ),
+                    wireframe_threshold=wire_threshold,
                     ignore_discrete=bool(
                         scene_props.region_ignore_discrete
                     ),

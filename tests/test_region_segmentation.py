@@ -8,9 +8,12 @@ import numpy as np
 
 from AdvReverseEngineering.algorithms.regions import (
     REGION_IGNORED_ID,
+    blender_wire_edge_fac,
+    blender_wire_step_param,
     generate_region_colors,
     segment_regions_by_normal,
     smooth_face_normals,
+    wireframe_threshold_to_cos_limit,
 )
 from AdvReverseEngineering.utils.mesh import FaceTopology
 
@@ -54,8 +57,41 @@ def _topology_from_pairs(
     )
 
 
+class BlenderWireframeFormulaTests(unittest.TestCase):
+    """对齐 Blender overlay 线框边因子公式。"""
+
+    def test_coplanar_fac_near_one(self) -> None:
+        fac = blender_wire_edge_fac(1.0)
+        self.assertAlmostEqual(fac, 254.0 / 255.0, places=6)
+
+    def test_hard_edge_fac_zero(self) -> None:
+        # cosine<=0.995 → fac 触底为 0，任意非零线框阈值下都显示
+        fac = blender_wire_edge_fac(0.0)
+        self.assertEqual(fac, 0.0)
+        fac = blender_wire_edge_fac(0.995)
+        self.assertEqual(fac, 0.0)
+
+    def test_threshold_0_1_matches_shader_visibility(self) -> None:
+        step = blender_wire_step_param(0.1)
+        # 平坦边不可见
+        self.assertFalse(blender_wire_edge_fac(1.0) <= step)
+        # 硬边可见
+        self.assertTrue(blender_wire_edge_fac(0.0) <= step)
+        # 临界：fac == step 时仍可见（着色器用 <=）
+        cos_limit = wireframe_threshold_to_cos_limit(0.1)
+        fac_at_limit = blender_wire_edge_fac(cos_limit)
+        self.assertAlmostEqual(fac_at_limit, step, places=5)
+
+    def test_lower_threshold_keeps_softer_edges_mergeable(self) -> None:
+        cos_low = wireframe_threshold_to_cos_limit(0.05)
+        cos_high = wireframe_threshold_to_cos_limit(0.5)
+        # 更低的线框阈值 → 更低的合并点积门槛：
+        # 软边更易并入同一领域，硬边（fac=0）仍始终切断。
+        self.assertLess(cos_low, cos_high)
+
+
 class RegionSegmentationTests(unittest.TestCase):
-    """法线阈值领域分割测试。"""
+    """线框硬边领域分割测试。"""
 
     def test_coplanar_adjacent_faces_merge(self) -> None:
         normals = np.array(
@@ -73,12 +109,34 @@ class RegionSegmentationTests(unittest.TestCase):
             normals,
             areas,
             topology,
-            angle_threshold_deg=15.0,
+            wireframe_threshold=0.1,
             ignore_discrete=False,
         )
 
         self.assertEqual(result["region_count"], 1)
         self.assertTrue(np.all(result["region_ids"] == 0))
+
+    def test_wireframe_visible_edge_splits_region(self) -> None:
+        # 约 10° 夹角：Blender 线框下 fac=0，必为领域边界
+        angle = np.radians(10.0)
+        normals = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, -np.sin(angle), np.cos(angle)],
+            ],
+            dtype=np.float64,
+        )
+        areas = np.array([1.0, 1.0], dtype=np.float64)
+        topology = _topology_from_pairs(2, [(0, 1)])
+
+        result = segment_regions_by_normal(
+            normals,
+            areas,
+            topology,
+            wireframe_threshold=0.1,
+            ignore_discrete=False,
+        )
+        self.assertEqual(result["region_count"], 2)
 
     def test_large_normal_angle_keeps_separate(self) -> None:
         normals = np.array(
@@ -95,7 +153,7 @@ class RegionSegmentationTests(unittest.TestCase):
             normals,
             areas,
             topology,
-            angle_threshold_deg=15.0,
+            wireframe_threshold=0.1,
             ignore_discrete=False,
         )
 
@@ -104,7 +162,6 @@ class RegionSegmentationTests(unittest.TestCase):
         self.assertEqual(int(result["region_ids"][1]), 1)
 
     def test_vertex_only_contact_does_not_merge(self) -> None:
-        # 两平面法线相同，但没有共享边邻接，不应合并。
         normals = np.array(
             [
                 [0.0, 0.0, 1.0],
@@ -119,7 +176,7 @@ class RegionSegmentationTests(unittest.TestCase):
             normals,
             areas,
             topology,
-            angle_threshold_deg=15.0,
+            wireframe_threshold=0.1,
             ignore_discrete=False,
         )
 
@@ -138,7 +195,6 @@ class RegionSegmentationTests(unittest.TestCase):
             ],
             dtype=np.float64,
         )
-        # 前两面形成大平面，第三面是离散小侧面。
         areas = np.array([10.0, 10.0, 0.01], dtype=np.float64)
         topology = _topology_from_pairs(3, [(0, 1)])
 
@@ -146,7 +202,7 @@ class RegionSegmentationTests(unittest.TestCase):
             normals,
             areas,
             topology,
-            angle_threshold_deg=15.0,
+            wireframe_threshold=0.1,
             ignore_discrete=True,
             min_area_ratio=0.01,
         )
@@ -159,8 +215,7 @@ class RegionSegmentationTests(unittest.TestCase):
         self.assertEqual(int(result["region_ids"][2]), REGION_IGNORED_ID)
 
     def test_gradual_curve_does_not_leak(self) -> None:
-        # 链式合并陷阱：相邻面两两只差 10°，累计 90°。
-        # 若仅用局部判据会合成一个领域；领域均值判据必须拆开。
+        # 相邻面两两差 10°：线框下每条边 fac=0，不应链式合成一块
         count = 10
         angles = np.radians(np.arange(count) * 10.0)
         normals = np.stack(
@@ -179,20 +234,38 @@ class RegionSegmentationTests(unittest.TestCase):
             normals,
             areas,
             topology,
-            angle_threshold_deg=15.0,
+            wireframe_threshold=0.1,
             ignore_discrete=False,
             smooth_iterations=0,
         )
 
         self.assertGreaterEqual(result["region_count"], 2)
-        # 首尾两面（相差 90°）绝不能同属一个领域
         self.assertNotEqual(
             int(result["region_ids"][0]),
             int(result["region_ids"][-1]),
         )
 
+    def test_legacy_angle_threshold_still_works(self) -> None:
+        normals = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        areas = np.ones(2, dtype=np.float64)
+        topology = _topology_from_pairs(2, [(0, 1)])
+        result = segment_regions_by_normal(
+            normals,
+            areas,
+            topology,
+            wireframe_threshold=None,
+            angle_threshold_deg=15.0,
+            ignore_discrete=False,
+        )
+        self.assertEqual(result["region_count"], 1)
+
     def test_smoothing_preserves_hard_edges(self) -> None:
-        # 90° 硬边两侧的法线在边保护平滑后不应互相污染。
         normals = np.array(
             [
                 [0.0, 0.0, 1.0],
@@ -214,7 +287,6 @@ class RegionSegmentationTests(unittest.TestCase):
         np.testing.assert_allclose(smoothed, normals, atol=1e-12)
 
     def test_smoothing_reduces_scan_noise(self) -> None:
-        # 近平面带噪声（±8°），平滑后应聚为一个领域。
         count = 9
         rng = np.random.default_rng(7)
         noise = np.radians((rng.random(count) - 0.5) * 16.0)
@@ -249,7 +321,7 @@ class RegionSegmentationTests(unittest.TestCase):
             normals,
             areas,
             topology,
-            angle_threshold_deg=15.0,
+            wireframe_threshold=0.1,
             ignore_discrete=False,
             smooth_iterations=2,
         )
@@ -260,7 +332,6 @@ class RegionSegmentationTests(unittest.TestCase):
         second = generate_region_colors(5)
         self.assertEqual(first.shape, (5, 4))
         np.testing.assert_allclose(first, second)
-        # 相邻编号色相应有明显差异，避免全同色。
         self.assertGreater(
             float(np.linalg.norm(first[0, :3] - first[1, :3])),
             0.05,

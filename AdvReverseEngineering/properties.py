@@ -171,9 +171,23 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     # ------------------------------------------------------------------
     # 领域分割（Geomagic Design X 风格 Region）
     # ------------------------------------------------------------------
+    region_wireframe_threshold: FloatProperty(
+        name="线框阈值",
+        description=(
+            "对齐视图叠加层「几何数据 → 线框」滑条："
+            "越低只把更硬的橘色边当作领域边界（建议 0.1）"
+        ),
+        default=0.1,
+        min=0.0,
+        max=1.0,
+        soft_min=0.05,
+        soft_max=0.5,
+        precision=3,
+        step=1,
+    )
     region_normal_threshold: FloatProperty(
-        name="法线阈值",
-        description="相邻面法线夹角小于等于该值时合并为同一领域（度）",
+        name="法线阈值（兼容）",
+        description="旧版角度阈值，仅内部兼容保留",
         default=15.0,
         min=0.1,
         max=90.0,

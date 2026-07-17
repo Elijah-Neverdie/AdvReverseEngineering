@@ -182,8 +182,8 @@ class ARE_PT_main(bpy.types.Panel):
 
             region_box.prop(
                 scene_props,
-                "region_normal_threshold",
-                text="法线阈值 (°)",
+                "region_wireframe_threshold",
+                text="线框阈值",
             )
             region_box.prop(
                 scene_props,
