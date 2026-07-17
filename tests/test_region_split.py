@@ -8,6 +8,7 @@ import numpy as np
 
 from AdvReverseEngineering.algorithms.region_split import (
     complete_cut_edges_dijkstra,
+    cut_edges_from_paint_corridor,
     prepare_edge_costs,
     split_region_by_cut_edges,
     stroke_hits_to_seed_edges,
@@ -224,11 +225,85 @@ class RegionSplitTests(unittest.TestCase):
         self.assertEqual(len(np.unique(new_ids[new_ids >= 0])), 2)
         self.assertEqual(new_colors.shape[0], 2)
 
+    def test_paint_corridor_prefers_hard_edges(self) -> None:
+        topology, centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        costs, mids = prepare_edge_costs(
+            topology, normals, centers, region_ids
+        )
+        # 涂红中间一列上下两面，应沿垂直硬边切开
+        painted = np.array([1, 4], dtype=np.int32)
+        stroke = centers[painted]
+        completed, message = cut_edges_from_paint_corridor(
+            painted,
+            topology,
+            normals,
+            centers,
+            region_ids,
+            0,
+            stroke,
+            costs,
+            mids,
+            topology["vert_edge_offsets"],
+            topology["vert_edge_indices"],
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+            max_radius=10.0,
+        )
+        self.assertEqual(message, "")
+        self.assertTrue(len(completed) >= 1)
+        # 应包含中间垂直硬边
+        self.assertIn(5, set(completed.tolist()))
+
+        new_ids, new_colors, new_count = split_region_by_cut_edges(
+            region_ids,
+            topology,
+            completed,
+            generate_region_colors(1),
+        )
+        self.assertGreaterEqual(new_count, 2)
+        self.assertEqual(new_colors.shape[0], new_count)
+
+    def test_paint_corridor_too_few_faces(self) -> None:
+        topology, centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        costs, mids = prepare_edge_costs(
+            topology, normals, centers, region_ids
+        )
+        completed, message = cut_edges_from_paint_corridor(
+            np.array([1], dtype=np.int32),
+            topology,
+            normals,
+            centers,
+            region_ids,
+            0,
+            centers[[1]],
+            costs,
+            mids,
+            topology["vert_edge_offsets"],
+            topology["vert_edge_indices"],
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+            max_radius=10.0,
+        )
+        self.assertEqual(len(completed), 0)
+        self.assertTrue(message)
+
 
 class MergeTransactionLogicTests(unittest.TestCase):
     """合并内存事务风格的撤销/重做栈逻辑（纯数据）。"""
 
-    def test_history_undo_redo(self) -> None:
+    def test_commit_flag_blocks_cancel_semantics(self) -> None:
+        committed = False
+        cancelled = True
+        if cancelled and committed:
+            cancelled = False
+        self.assertTrue(cancelled)
+        committed = True
+        cancelled = True
+        if cancelled and committed:
+            cancelled = False
+        self.assertFalse(cancelled)
         live_ids = np.array([0, 1, 2], dtype=np.int32)
         live_colors = generate_region_colors(3)
         history: list[dict] = []

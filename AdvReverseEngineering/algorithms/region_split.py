@@ -463,9 +463,169 @@ def split_region_by_cut_edges(
     return ids, colors[:region_count].copy(), region_count
 
 
+def cut_edges_from_paint_corridor(
+    painted_faces: np.ndarray,
+    topology: dict,
+    normals: np.ndarray,
+    face_centers: np.ndarray,
+    region_ids: np.ndarray,
+    target_rid: int,
+    stroke_worlds: np.ndarray,
+    edge_costs: np.ndarray,
+    edge_mids: np.ndarray,
+    vert_edge_offsets: np.ndarray,
+    vert_edge_indices: np.ndarray,
+    edge_vert_a: np.ndarray,
+    edge_vert_b: np.ndarray,
+    max_radius: float = 1.0,
+) -> tuple[np.ndarray, str]:
+    """
+    从涂红面走廊提取优先硬边的切线并补全。
+
+    返回 (completed_edge_indices, status_message)。
+    status 为空字符串表示成功；否则为失败原因。
+    """
+    painted = np.unique(np.asarray(painted_faces, dtype=np.int32))
+    if len(painted) == 0:
+        return np.empty(0, dtype=np.int32), "未涂绘任何面"
+
+    rid = np.asarray(region_ids, dtype=np.int32)
+    painted = painted[(painted >= 0) & (painted < len(rid))]
+    painted = painted[rid[painted] == int(target_rid)]
+    if len(painted) < 2:
+        return np.empty(0, dtype=np.int32), "涂绘面过少，请加粗笔刷或继续涂绘"
+
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    edge_costs = np.asarray(edge_costs, dtype=np.float64)
+    edge_mids = np.asarray(edge_mids, dtype=np.float64)
+    centers = np.asarray(face_centers, dtype=np.float64)
+    stroke_worlds = np.asarray(stroke_worlds, dtype=np.float64)
+    if len(stroke_worlds) == 0:
+        stroke_worlds = centers[painted]
+
+    painted_set = set(int(f) for f in painted.tolist())
+
+    # 走廊内边：两侧同属目标领域，且至少一侧被涂红。
+    corridor_edges: list[int] = []
+    for edge_index in range(len(face_a)):
+        fa = int(face_a[edge_index])
+        fb = int(face_b[edge_index])
+        if rid[fa] != target_rid or rid[fb] != target_rid:
+            continue
+        if fa not in painted_set and fb not in painted_set:
+            continue
+        corridor_edges.append(edge_index)
+
+    if not corridor_edges:
+        return np.empty(0, dtype=np.int32), "涂绘区域未形成可切走廊"
+
+    corridor_arr = np.asarray(corridor_edges, dtype=np.int32)
+
+    # 走廊边评分：硬边优先 + 贴近笔迹中心线。
+    scores = []
+    for edge_index in corridor_arr.tolist():
+        mid = edge_mids[edge_index]
+        dists = np.sum((stroke_worlds - mid) ** 2, axis=1)
+        nearest = float(np.sqrt(dists.min()))
+        hardness = max(0.0, 1.0 - float(edge_costs[edge_index]))
+        # 高分更好
+        score = hardness * 2.0 - nearest / max(float(max_radius), 1e-6)
+        scores.append((score, int(edge_index)))
+    scores.sort(reverse=True)
+
+    # 取评分最高的若干边作为种子骨架（至少 1 条，最多走廊 35%）。
+    seed_count = max(1, min(len(scores), max(3, len(scores) // 3)))
+    seed_edges = np.asarray(
+        [edge for _score, edge in scores[:seed_count]],
+        dtype=np.int32,
+    )
+
+    # 在种子中优先保留真正硬边；若全平坦也继续，靠笔迹约束。
+    hard_seeds = [
+        edge
+        for edge in seed_edges.tolist()
+        if float(edge_costs[edge]) < 0.45
+    ]
+    if hard_seeds:
+        seed_edges = np.asarray(hard_seeds, dtype=np.int32)
+
+    completed = complete_cut_edges_dijkstra(
+        topology,
+        normals,
+        face_centers,
+        region_ids,
+        target_rid,
+        seed_edges,
+        stroke_worlds,
+        np.empty((0, 2), dtype=np.float64),
+        edge_costs,
+        edge_mids,
+        vert_edge_offsets,
+        vert_edge_indices,
+        edge_vert_a,
+        edge_vert_b,
+        max_radius=max_radius,
+    )
+    if len(completed) == 0:
+        return np.empty(0, dtype=np.int32), "未能沿硬边补全切线，请调整笔刷"
+
+    # 验证切边是否能把目标领域拆成 >=2 个分量
+    probe_ids, _probe_colors, probe_count = split_region_by_cut_edges(
+        region_ids,
+        topology,
+        completed,
+        generate_region_colors(max(int(region_ids.max()) + 1, 1)),
+    )
+    original_count = int(region_ids.max()) + 1 if np.any(region_ids >= 0) else 0
+    if probe_count <= original_count and not np.any(
+        probe_ids[region_ids == target_rid] != target_rid
+    ):
+        # 仍可能拆出同 id 压缩前的多分量——再直接检查屏障分量数
+        members = np.flatnonzero(region_ids == target_rid)
+        if len(members) == 0:
+            return completed, "目标领域为空"
+        barrier_pairs = set()
+        for edge_index in completed.tolist():
+            fa = int(face_a[edge_index])
+            fb = int(face_b[edge_index])
+            barrier_pairs.add((min(fa, fb), max(fa, fb)))
+        offsets = np.asarray(topology["adjacency_offsets"], dtype=np.int32)
+        adj = np.asarray(topology["adjacency_indices"], dtype=np.int32)
+        visited = np.zeros(len(region_ids), dtype=bool)
+        components = 0
+        for start in members.tolist():
+            if visited[start]:
+                continue
+            components += 1
+            stack = [int(start)]
+            visited[start] = True
+            while stack:
+                face = stack.pop()
+                begin = int(offsets[face])
+                end = int(offsets[face + 1])
+                for neighbor in adj[begin:end].tolist():
+                    neighbor = int(neighbor)
+                    if visited[neighbor] or int(region_ids[neighbor]) != target_rid:
+                        continue
+                    pair = (min(face, neighbor), max(face, neighbor))
+                    if pair in barrier_pairs:
+                        continue
+                    visited[neighbor] = True
+                    stack.append(neighbor)
+        if components < 2:
+            return (
+                completed,
+                "切线未能把领域分成两块，请沿硬棱继续涂绘",
+            )
+
+    return completed, ""
+
+
 __all__ = (
     "prepare_edge_costs",
     "stroke_hits_to_seed_edges",
     "complete_cut_edges_dijkstra",
     "split_region_by_cut_edges",
+    "cut_edges_from_paint_corridor",
 )

@@ -275,12 +275,20 @@ class ARE_PT_main(bpy.types.Panel):
             if splitting:
                 tip = region_box.box()
                 tip.label(text="拆分模式", icon="INFO")
-                tip.label(text="按住左键沿硬边绘制，松开自动补全")
-                tip.label(text="可多笔 · Ctrl+Z 撤销笔迹 · Esc 取消")
+                tip.label(text="1. 点击编号选择要拆分的领域")
+                tip.label(text="2. [ ] 调节圆形笔刷粗细并涂红")
+                tip.label(text="3. 松开 0.5 秒后自动分色预览")
+                tip.label(text="Ctrl+Z 清除涂绘 · Enter/确认写入 · Esc 取消")
+                tip.prop(
+                    scene_props,
+                    "split_brush_radius",
+                    text="笔刷半径 (px)",
+                )
                 if scene_props.split_status:
                     tip.label(text=scene_props.split_status)
                 confirm_row = tip.row()
                 confirm_row.scale_y = 1.2
+                confirm_row.enabled = scene_props.split_phase == "PREVIEW"
                 confirm_row.operator(
                     "are.confirm_split_regions",
                     text="确认拆分",

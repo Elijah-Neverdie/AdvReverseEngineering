@@ -37,9 +37,13 @@ _SPLIT_STROKE_SESSION: dict | None = None
 HIGHLIGHT_COLOR = (0.78, 0.22, 1.0, 0.55)
 ANCHOR_HIGHLIGHT_COLOR = (1.0, 0.55, 0.12, 0.42)
 HOVER_HIGHLIGHT_COLOR = (0.35, 0.75, 1.0, 0.28)
+PAINT_FACE_COLOR = (1.0, 0.12, 0.08, 0.55)
 LABEL_RADIUS_PX = 16.0
 LABEL_OFFSET_Y = 28.0
 LEADER_ENDPOINT_RADIUS_PX = 3.5
+# 覆盖层沿法线外移比例（相对包围盒对角线），消除共面 Z-fighting。
+OVERLAY_NORMAL_OFFSET_RATIO = 0.0015
+OVERLAY_NORMAL_OFFSET_MIN = 1e-4
 
 # 对象自定义属性键
 BOTTOM_FACES_ATTR = "are_bottom_faces"
@@ -287,15 +291,23 @@ def draw_region_merge_labels() -> None:
     if context is None or context.scene is None:
         return
     scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
-    if scene_props is None or not scene_props.merge_mode_active:
+    if scene_props is None:
+        return
+    if not (
+        scene_props.merge_mode_active or scene_props.split_mode_active
+    ):
         return
     session = _MERGE_LABEL_SESSION
     if session is None:
         return
 
     update_merge_label_projections(context)
-    anchor_id = int(scene_props.merge_anchor_id)
-    hover_id = int(scene_props.merge_hover_id)
+    if scene_props.merge_mode_active:
+        anchor_id = int(scene_props.merge_anchor_id)
+        hover_id = int(scene_props.merge_hover_id)
+    else:
+        anchor_id = int(getattr(scene_props, "split_target_id", -1))
+        hover_id = int(getattr(scene_props, "split_hover_id", -1))
 
     gpu.state.blend_set("ALPHA")
     try:
@@ -367,6 +379,9 @@ def set_split_stroke_session(session: dict | None) -> None:
     """设置或清除拆分笔迹预览会话。"""
     global _SPLIT_STROKE_SESSION
     _SPLIT_STROKE_SESSION = session
+    if session is None:
+        _MERGE_PREVIEW_CACHE.pop("split_preview", None)
+        _HIGHLIGHT_CACHE.pop("paint", None)
 
 
 def get_split_stroke_session() -> dict | None:
@@ -374,8 +389,76 @@ def get_split_stroke_session() -> dict | None:
     return _SPLIT_STROKE_SESSION
 
 
+def draw_split_brush_cursor() -> None:
+    """POST_PIXEL：圆形笔刷光标。"""
+    context = bpy.context
+    if context is None or context.scene is None:
+        return
+    scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+    if scene_props is None or not scene_props.split_mode_active:
+        return
+    session = _SPLIT_STROKE_SESSION
+    if session is None:
+        return
+    brush = session.get("brush")
+    if not brush:
+        return
+    xy = brush.get("screen_xy")
+    radius = float(brush.get("radius_px", 0.0))
+    if xy is None or radius <= 1.0:
+        return
+    gpu.state.blend_set("ALPHA")
+    try:
+        # 外环
+        _draw_circle_outline_2d(
+            float(xy[0]),
+            float(xy[1]),
+            radius,
+            (1.0, 0.25, 0.15, 0.95),
+            segments=48,
+        )
+        _draw_circle_2d(
+            float(xy[0]),
+            float(xy[1]),
+            2.5,
+            (1.0, 0.3, 0.2, 0.9),
+        )
+    finally:
+        gpu.state.blend_set("NONE")
+
+
+def _draw_circle_outline_2d(
+    center_x: float,
+    center_y: float,
+    radius: float,
+    color,
+    segments: int = 32,
+) -> None:
+    """屏幕空间圆轮廓。"""
+    import math
+
+    coords = []
+    for index in range(segments + 1):
+        angle = (index / segments) * math.tau
+        coords.append(
+            (
+                center_x + math.cos(angle) * radius,
+                center_y + math.sin(angle) * radius,
+            )
+        )
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "LINE_STRIP", {"pos": coords})
+    shader.bind()
+    shader.uniform_float("color", color)
+    gpu.state.line_width_set(2.0)
+    try:
+        batch.draw(shader)
+    finally:
+        gpu.state.line_width_set(1.0)
+
+
 def draw_split_stroke_preview() -> None:
-    """POST_VIEW：深度感知红色笔迹与智能补全边。"""
+    """POST_VIEW：涂红面、补全硬边与可选分色预览。"""
     context = bpy.context
     if context is None or context.scene is None:
         return
@@ -386,67 +469,56 @@ def draw_split_stroke_preview() -> None:
     if session is None:
         return
 
-    strokes = session.get("strokes") or []
-    if not strokes:
+    object_name = session.get("object_name")
+    obj = bpy.data.objects.get(object_name) if object_name else None
+    if obj is None or obj.type != "MESH":
         return
 
-    gpu.state.blend_set("ALPHA")
-    gpu.state.depth_test_set("LESS_EQUAL")
-    try:
-        live_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-        for stroke in strokes:
-            poly = stroke.get("polyline_world")
-            if poly is not None and len(poly) >= 2:
-                coords = [tuple(map(float, p)) for p in np.asarray(poly)]
-                batch = batch_for_shader(
-                    live_shader,
-                    "LINE_STRIP",
-                    {"pos": coords},
-                )
-                live_shader.bind()
-                if stroke.get("live"):
-                    live_shader.uniform_float(
-                        "color",
-                        (1.0, 0.25, 0.2, 0.85),
-                    )
-                    gpu.state.line_width_set(1.5)
-                else:
-                    live_shader.uniform_float(
-                        "color",
-                        (1.0, 0.2, 0.15, 0.70),
-                    )
-                    gpu.state.line_width_set(1.5)
-                batch.draw(live_shader)
+    # 若已有内存分色预览，由 draw_overlays 绘制；此处只画涂红与切边。
+    paint_faces = session.get("paint_faces")
+    if paint_faces is not None and len(paint_faces) > 0:
+        paint_key = (
+            obj.as_pointer(),
+            session.get("preview_version", 0),
+            int(len(paint_faces)),
+            int(np.min(paint_faces)) if len(paint_faces) else -1,
+            int(np.max(paint_faces)) if len(paint_faces) else -1,
+        )
+        entry = _HIGHLIGHT_CACHE.get("paint")
+        if entry is None or entry.get("key") != paint_key:
+            entry = {
+                "key": paint_key,
+                "coords": _build_paint_face_coords(obj, paint_faces),
+            }
+            _HIGHLIGHT_CACHE["paint"] = entry
+        _draw_uniform_tris(entry["coords"], PAINT_FACE_COLOR)
 
-            completed = stroke.get("completed_edges_world")
-            if completed is not None and len(completed) > 0:
-                segments = []
-                for edge in np.asarray(completed):
-                    if len(edge) < 2:
-                        continue
-                    segments.append(tuple(map(float, edge[0])))
-                    segments.append(tuple(map(float, edge[1])))
-                if segments:
-                    batch = batch_for_shader(
-                        live_shader,
-                        "LINES",
-                        {"pos": segments},
-                    )
-                    live_shader.bind()
-                    live_shader.uniform_float(
-                        "color",
-                        (1.0, 0.05, 0.05, 0.95),
-                    )
-                    gpu.state.line_width_set(3.0)
-                    batch.draw(live_shader)
-    finally:
-        gpu.state.line_width_set(1.0)
-        gpu.state.depth_test_set("NONE")
-        gpu.state.blend_set("NONE")
+    completed = session.get("completed_edges_world")
+    if completed is not None and len(completed) > 0:
+        segments = []
+        for edge in np.asarray(completed):
+            if len(edge) < 2:
+                continue
+            segments.append(tuple(map(float, edge[0])))
+            segments.append(tuple(map(float, edge[1])))
+        if segments:
+            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+            batch = batch_for_shader(shader, "LINES", {"pos": segments})
+            gpu.state.blend_set("ALPHA")
+            gpu.state.depth_test_set("LESS_EQUAL")
+            gpu.state.line_width_set(3.0)
+            try:
+                shader.bind()
+                shader.uniform_float("color", (1.0, 0.05, 0.05, 0.95))
+                batch.draw(shader)
+            finally:
+                gpu.state.line_width_set(1.0)
+                gpu.state.depth_test_set("NONE")
+                gpu.state.blend_set("NONE")
 
 
 def register_split_draw_handler() -> None:
-    """注册拆分笔迹 POST_VIEW 绘制。"""
+    """注册拆分笔迹 POST_VIEW + 笔刷 POST_PIXEL 绘制。"""
     global _SPLIT_DRAW_HANDLE
     namespace = bpy.app.driver_namespace
     old = namespace.get(SPLIT_DRAW_HANDLE_KEY)
@@ -455,12 +527,20 @@ def register_split_draw_handler() -> None:
             bpy.types.SpaceView3D.draw_handler_remove(old, "WINDOW")
         except (ReferenceError, ValueError):
             pass
-    _SPLIT_DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+    # 用 tuple 存两个句柄
+    view_handle = bpy.types.SpaceView3D.draw_handler_add(
         draw_split_stroke_preview,
         (),
         "WINDOW",
         "POST_VIEW",
     )
+    pixel_handle = bpy.types.SpaceView3D.draw_handler_add(
+        draw_split_brush_cursor,
+        (),
+        "WINDOW",
+        "POST_PIXEL",
+    )
+    _SPLIT_DRAW_HANDLE = (view_handle, pixel_handle)
     namespace[SPLIT_DRAW_HANDLE_KEY] = _SPLIT_DRAW_HANDLE
 
 
@@ -469,13 +549,17 @@ def unregister_split_draw_handler() -> None:
     global _SPLIT_DRAW_HANDLE, _SPLIT_STROKE_SESSION
     namespace = bpy.app.driver_namespace
     handle = namespace.pop(SPLIT_DRAW_HANDLE_KEY, None) or _SPLIT_DRAW_HANDLE
-    if handle is not None:
+    handles = handle if isinstance(handle, (tuple, list)) else (handle,)
+    for item in handles:
+        if item is None:
+            continue
         try:
-            bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+            bpy.types.SpaceView3D.draw_handler_remove(item, "WINDOW")
         except (ReferenceError, ValueError):
             pass
     _SPLIT_DRAW_HANDLE = None
     _SPLIT_STROKE_SESSION = None
+    _HIGHLIGHT_CACHE.pop("paint", None)
 
 
 def register_label_draw_handler() -> None:
@@ -578,6 +662,57 @@ def _local_to_world(obj: bpy.types.Object, local: np.ndarray) -> np.ndarray:
     return world.astype(np.float32)
 
 
+def _overlay_offset_distance(obj: bpy.types.Object) -> float:
+    """按包围盒对角线计算法线外移距离。"""
+    mesh = obj.data
+    if len(mesh.vertices) == 0:
+        return OVERLAY_NORMAL_OFFSET_MIN
+    dims = np.asarray(obj.dimensions, dtype=np.float64)
+    extent = float(np.linalg.norm(dims))
+    if extent < 1e-12:
+        # dimensions 不可用时退回本地包围盒。
+        local = _read_local_vertices(mesh)
+        if len(local) == 0:
+            return OVERLAY_NORMAL_OFFSET_MIN
+        extent = float(np.linalg.norm(local.max(axis=0) - local.min(axis=0)))
+    return float(max(extent * OVERLAY_NORMAL_OFFSET_RATIO, OVERLAY_NORMAL_OFFSET_MIN))
+
+
+def _world_face_normals(obj: bpy.types.Object) -> np.ndarray:
+    """批量读取面法线并变换到世界空间。"""
+    mesh = obj.data
+    face_count = len(mesh.polygons)
+    if face_count == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    local = np.empty(face_count * 3, dtype=np.float64)
+    mesh.polygons.foreach_get("normal", local)
+    normals = local.reshape(face_count, 3)
+    matrix3 = np.asarray(obj.matrix_world, dtype=np.float64)[:3, :3]
+    # 法线用逆转置近似；均匀缩放下等价于旋转。
+    try:
+        normal_matrix = np.linalg.inv(matrix3).T
+    except np.linalg.LinAlgError:
+        normal_matrix = matrix3
+    world = normals @ normal_matrix.T
+    lengths = np.linalg.norm(world, axis=1, keepdims=True)
+    lengths = np.maximum(lengths, 1e-12)
+    return world / lengths
+
+
+def _offset_world_by_face_normals(
+    world: np.ndarray,
+    face_per_tri: np.ndarray,
+    face_normals_world: np.ndarray,
+    distance: float,
+) -> np.ndarray:
+    """把每个三角形的三个顶点沿所属面法线外移。"""
+    if len(world) == 0 or distance <= 0.0:
+        return world
+    normals = face_normals_world[face_per_tri]
+    offset = np.repeat(normals, 3, axis=0) * float(distance)
+    return (world.astype(np.float64) + offset).astype(np.float32)
+
+
 def _triangulate_face_indices(
     mesh: bpy.types.Mesh,
     face_indices: list[int] | np.ndarray,
@@ -606,25 +741,34 @@ def _build_bottom_world_coords(
     obj: bpy.types.Object,
     face_indices: list[int],
 ) -> np.ndarray:
-    """构建底面三角形世界坐标。"""
+    """构建底面三角形世界坐标（沿法线外移）。"""
     mesh = obj.data
     if len(mesh.vertices) == 0 or len(mesh.polygons) == 0:
         return np.empty((0, 3), dtype=np.float32)
 
-    index_array = _triangulate_face_indices(mesh, face_indices)
-    if len(index_array) == 0:
+    faces = np.asarray(face_indices, dtype=np.int64)
+    if len(faces) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    loop_start, loop_total, loop_verts = _read_loop_arrays(mesh)
+    tri_verts, face_per_tri = _triangle_fan_arrays(
+        loop_start,
+        loop_total,
+        loop_verts,
+        faces,
+    )
+    if len(tri_verts) == 0:
         return np.empty((0, 3), dtype=np.float32)
 
     local_all = _read_local_vertices(mesh)
-    valid = index_array < len(local_all)
-    if not np.all(valid):
-        index_array = index_array[valid]
-        remainder = len(index_array) - len(index_array) % 3
-        index_array = index_array[:remainder]
-        if len(index_array) == 0:
-            return np.empty((0, 3), dtype=np.float32)
-
-    return _local_to_world(obj, local_all[index_array])
+    world = _local_to_world(obj, local_all[tri_verts])
+    normals = _world_face_normals(obj)
+    return _offset_world_by_face_normals(
+        world,
+        face_per_tri,
+        normals,
+        _overlay_offset_distance(obj),
+    )
 
 
 def _cached_bottom_coords(
@@ -778,6 +922,13 @@ def _build_region_draw_arrays(
 
     local_all = _read_local_vertices(mesh)
     world = _local_to_world(obj, local_all[tri_verts])
+    normals = _world_face_normals(obj)
+    world = _offset_world_by_face_normals(
+        world,
+        face_per_tri,
+        normals,
+        _overlay_offset_distance(obj),
+    )
     color_array = np.repeat(
         palette[region_ids[face_per_tri]].astype(np.float32),
         3,
@@ -802,7 +953,7 @@ def _build_selection_highlight_coords(
         return np.empty((0, 3), dtype=np.float32)
 
     loop_start, loop_total, loop_verts = _read_loop_arrays(mesh)
-    tri_verts, _ = _triangle_fan_arrays(
+    tri_verts, face_per_tri = _triangle_fan_arrays(
         loop_start,
         loop_total,
         loop_verts,
@@ -811,7 +962,43 @@ def _build_selection_highlight_coords(
     if len(tri_verts) == 0:
         return np.empty((0, 3), dtype=np.float32)
     local_all = _read_local_vertices(mesh)
-    return _local_to_world(obj, local_all[tri_verts])
+    world = _local_to_world(obj, local_all[tri_verts])
+    normals = _world_face_normals(obj)
+    return _offset_world_by_face_normals(
+        world,
+        face_per_tri,
+        normals,
+        _overlay_offset_distance(obj),
+    )
+
+
+def _build_paint_face_coords(
+    obj: bpy.types.Object,
+    face_indices: np.ndarray | list[int],
+) -> np.ndarray:
+    """构建涂红面的三角世界坐标（沿法线外移）。"""
+    faces = np.asarray(list(face_indices), dtype=np.int64)
+    if len(faces) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    mesh = obj.data
+    loop_start, loop_total, loop_verts = _read_loop_arrays(mesh)
+    tri_verts, face_per_tri = _triangle_fan_arrays(
+        loop_start,
+        loop_total,
+        loop_verts,
+        faces,
+    )
+    if len(tri_verts) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    local_all = _read_local_vertices(mesh)
+    world = _local_to_world(obj, local_all[tri_verts])
+    normals = _world_face_normals(obj)
+    return _offset_world_by_face_normals(
+        world,
+        face_per_tri,
+        normals,
+        _overlay_offset_distance(obj) * 1.25,
+    )
 
 
 def _cached_region_draw_arrays(
@@ -892,10 +1079,16 @@ def draw_overlays() -> None:
     # 先画普通领域，再画底面紫色（底面是固定前置领域，不参与编号）。
     region_obj = scene_props.region_object
     merge_session = _MERGE_LABEL_SESSION
+    split_session = _SPLIT_STROKE_SESSION
     use_merge_preview = (
         bool(scene_props.merge_mode_active)
         and merge_session is not None
         and merge_session.get("region_ids") is not None
+    )
+    use_split_preview = (
+        bool(scene_props.split_mode_active)
+        and split_session is not None
+        and split_session.get("preview_ids") is not None
     )
 
     if (
@@ -907,6 +1100,7 @@ def draw_overlays() -> None:
         and region_obj.mode != "EDIT"
         and (
             use_merge_preview
+            or use_split_preview
             or region_obj.data.attributes.get(REGION_ID_ATTR) is not None
         )
     ):
@@ -954,9 +1148,52 @@ def draw_overlays() -> None:
                     }
                     _HIGHLIGHT_CACHE[slot] = entry
                 _draw_uniform_tris(entry["coords"], color)
+        elif use_split_preview:
+            live_ids = np.asarray(split_session["preview_ids"], dtype=np.int32)
+            live_colors = split_session.get("preview_colors")
+            version = split_session.get("preview_version", 0)
+            pointer = region_obj.as_pointer()
+            preview_key = ("split", pointer, version)
+            cached = _MERGE_PREVIEW_CACHE.get("split_preview")
+            if cached is None or cached.get("key") != preview_key:
+                coords, colors = _build_region_draw_arrays(
+                    region_obj,
+                    region_ids=live_ids,
+                    palette=live_colors,
+                )
+                _MERGE_PREVIEW_CACHE["split_preview"] = {
+                    "key": preview_key,
+                    "coords": coords,
+                    "colors": colors,
+                }
+                cached = _MERGE_PREVIEW_CACHE["split_preview"]
+            _draw_colored_tris(cached["coords"], cached["colors"])
+            target_id = int(getattr(scene_props, "split_target_id", -1))
+            if target_id >= 0:
+                # 高亮仍基于进入时的目标领域面集合（原始 id）
+                base_ids = split_session.get("base_ids")
+                if base_ids is not None:
+                    coords = _build_selection_highlight_coords(
+                        region_obj,
+                        np.asarray(base_ids, dtype=np.int32),
+                        target_id,
+                    )
+                    _draw_uniform_tris(coords, ANCHOR_HIGHLIGHT_COLOR)
         else:
             coords, colors = _cached_region_draw_arrays(region_obj)
             _draw_colored_tris(coords, colors)
+            if (
+                scene_props.split_mode_active
+                and int(getattr(scene_props, "split_target_id", -1)) >= 0
+            ):
+                region_ids = _read_region_ids(region_obj.data)
+                if region_ids is not None:
+                    coords = _build_selection_highlight_coords(
+                        region_obj,
+                        region_ids,
+                        int(scene_props.split_target_id),
+                    )
+                    _draw_uniform_tris(coords, ANCHOR_HIGHLIGHT_COLOR)
 
     obj = scene_props.highlight_object
     if (

@@ -377,6 +377,30 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         description="拆分模式提示文案",
         default="",
     )
+    split_target_id: IntProperty(
+        name="拆分目标领域",
+        description="当前选中的待拆分领域编号，-1 表示未选择",
+        default=-1,
+        min=-1,
+    )
+    split_hover_id: IntProperty(
+        name="拆分悬停领域",
+        description="拆分模式下鼠标悬停的领域编号",
+        default=-1,
+        min=-1,
+    )
+    split_phase: StringProperty(
+        name="拆分阶段",
+        description="SELECT / BRUSH / PREVIEW / IDLE",
+        default="IDLE",
+    )
+    split_brush_radius: FloatProperty(
+        name="拆分笔刷半径",
+        description="圆形笔刷屏幕像素半径，可用 [ ] 调节",
+        default=40.0,
+        min=8.0,
+        max=200.0,
+    )
 
     # ------------------------------------------------------------------
     # 原点设置
