@@ -7,16 +7,18 @@ from __future__ import annotations
 
 import bpy
 import gpu
+import numpy as np
 from gpu_extras.batch import batch_for_shader
-from mathutils import Matrix
 
 from ..registration import SCENE_PROP_NAME
 
 # 视口绘制句柄
 _DRAW_HANDLE = None
+DRAW_HANDLE_KEY = "AdvReverseEngineering.bottom_draw_handle"
+OVERLAY_UI_KEY = "AdvReverseEngineering.overlay_ui_callback"
 
 # 缓存对象本地坐标三角面，绘制时再乘 matrix_world，确保跟随物体变换
-_OVERLAY_CACHE: dict[int, list[tuple[float, float, float]]] = {}
+_OVERLAY_CACHE: dict[int, np.ndarray] = {}
 
 # 紫色半透明 (R, G, B, A)
 HIGHLIGHT_COLOR = (0.78, 0.22, 1.0, 0.55)
@@ -39,9 +41,9 @@ def set_bottom_face_highlight(
         _OVERLAY_CACHE.pop(old_obj.as_pointer(), None)
 
     obj[BOTTOM_FACES_ATTR] = list(face_indices)
-    _OVERLAY_CACHE[obj.as_pointer()] = _collect_bottom_face_local_coords(
-        obj,
-        face_indices,
+    _OVERLAY_CACHE[obj.as_pointer()] = np.asarray(
+        _collect_bottom_face_local_coords(obj, face_indices),
+        dtype=np.float32,
     )
     scene_props.highlight_object = obj
     _tag_view3d_redraw(context)
@@ -96,9 +98,22 @@ def _collect_bottom_face_local_coords(
 
 def _is_object_selected(context: bpy.types.Context, obj: bpy.types.Object) -> bool:
     """仅当对象被选中时显示高亮。"""
-    if obj.select_get():
-        return True
-    return context.view_layer.objects.active == obj
+    try:
+        return bool(obj.select_get())
+    except ReferenceError:
+        return False
+
+
+def _local_to_world(
+    obj: bpy.types.Object,
+    local_coords: np.ndarray,
+) -> np.ndarray:
+    """按对象当前 matrix_world 将缓存本地坐标转换为世界坐标。"""
+    matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+    local = np.asarray(local_coords, dtype=np.float64)
+    ones = np.ones((len(local), 1), dtype=np.float64)
+    homogeneous = np.hstack((local, ones))
+    return (matrix @ homogeneous.T).T[:, :3].astype(np.float32)
 
 
 def draw_bottom_faces_overlay() -> None:
@@ -109,6 +124,8 @@ def draw_bottom_faces_overlay() -> None:
 
     scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
     if scene_props is None:
+        return
+    if not scene_props.show_bottom_highlight:
         return
 
     obj = scene_props.highlight_object
@@ -128,46 +145,105 @@ def draw_bottom_faces_overlay() -> None:
     pointer = obj.as_pointer()
     coords = _OVERLAY_CACHE.get(pointer)
     if coords is None:
-        coords = _collect_bottom_face_local_coords(obj, face_indices)
+        coords = np.asarray(
+            _collect_bottom_face_local_coords(obj, face_indices),
+            dtype=np.float32,
+        )
         _OVERLAY_CACHE[pointer] = coords
-    if not coords:
+    if len(coords) == 0:
         return
 
+    world_coords = _local_to_world(obj, coords)
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-    batch = batch_for_shader(shader, "TRIS", {"pos": coords})
+    batch = batch_for_shader(shader, "TRIS", {"pos": world_coords})
 
     gpu.state.blend_set("ALPHA")
     gpu.state.depth_test_set("LESS_EQUAL")
     try:
-        gpu.matrix.push()
-        gpu.matrix.multiply_matrix(Matrix(obj.matrix_world))
         shader.bind()
         shader.uniform_float("color", HIGHLIGHT_COLOR)
         batch.draw(shader)
     finally:
-        gpu.matrix.pop()
         gpu.state.depth_test_set("NONE")
         gpu.state.blend_set("NONE")
 
 
-def register_draw_handler() -> None:
-    """注册视口绘制句柄。"""
-    global _DRAW_HANDLE
-    if _DRAW_HANDLE is not None:
+def draw_overlay_controls(self, context: bpy.types.Context) -> None:
+    """向 Viewport Overlays 弹窗追加逆向工具控制项。"""
+    scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+    if scene_props is None:
         return
+
+    layout = self.layout
+    layout.separator()
+    column = layout.column(align=True)
+    column.label(text="逆向工具")
+    column.prop(
+        scene_props,
+        "show_bottom_highlight",
+        text="显示底面",
+    )
+
+
+def register_draw_handler() -> None:
+    """注册视口绘制句柄，并清理由旧模块遗留的句柄。"""
+    global _DRAW_HANDLE
+
+    namespace = bpy.app.driver_namespace
+    old_handle = namespace.get(DRAW_HANDLE_KEY)
+    if old_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(
+                old_handle,
+                "WINDOW",
+            )
+        except (ReferenceError, ValueError):
+            pass
+
     _DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
         draw_bottom_faces_overlay,
         (),
         "WINDOW",
         "POST_VIEW",
     )
+    namespace[DRAW_HANDLE_KEY] = _DRAW_HANDLE
+
+
+def register_overlay_ui() -> None:
+    """把“显示底面”复选框追加到 Viewport Overlays。"""
+    namespace = bpy.app.driver_namespace
+    old_callback = namespace.get(OVERLAY_UI_KEY)
+    if old_callback is not None:
+        try:
+            bpy.types.VIEW3D_PT_overlay.remove(old_callback)
+        except (AttributeError, ValueError):
+            pass
+
+    bpy.types.VIEW3D_PT_overlay.append(draw_overlay_controls)
+    namespace[OVERLAY_UI_KEY] = draw_overlay_controls
 
 
 def unregister_draw_handler() -> None:
     """注销视口绘制句柄。"""
     global _DRAW_HANDLE
-    if _DRAW_HANDLE is None:
-        return
-    bpy.types.SpaceView3D.draw_handler_remove(_DRAW_HANDLE, "WINDOW")
+    namespace = bpy.app.driver_namespace
+    handle = namespace.pop(DRAW_HANDLE_KEY, None) or _DRAW_HANDLE
+    if handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+        except (ReferenceError, ValueError):
+            pass
     _DRAW_HANDLE = None
     _OVERLAY_CACHE.clear()
+
+
+def unregister_overlay_ui() -> None:
+    """从 Viewport Overlays 移除逆向工具控制项。"""
+    namespace = bpy.app.driver_namespace
+    callback = namespace.pop(OVERLAY_UI_KEY, None)
+    if callback is None:
+        callback = draw_overlay_controls
+    try:
+        bpy.types.VIEW3D_PT_overlay.remove(callback)
+    except (AttributeError, ValueError):
+        pass

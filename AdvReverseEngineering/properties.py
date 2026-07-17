@@ -155,6 +155,11 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         description="底面高亮显示的目标对象",
         type=bpy.types.Object,
     )
+    show_bottom_highlight: BoolProperty(
+        name="显示底面",
+        description="在 3D 视口中以紫色显示当前选中物体的检测底面",
+        default=True,
+    )
 
     # ------------------------------------------------------------------
     # 原点设置
