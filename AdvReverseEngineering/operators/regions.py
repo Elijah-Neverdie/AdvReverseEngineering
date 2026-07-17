@@ -69,6 +69,34 @@ def _remove_modal_timer(operator, context: bpy.types.Context) -> None:
     operator._timer = None
 
 
+# 当前活跃的模态实例，供侧栏确认/取消按钮直接调用，
+# 不依赖 TIMER 事件的派发时机。
+_ACTIVE_MERGE_OP = None
+_ACTIVE_SPLIT_OP = None
+
+
+def _set_active_merge_op(operator) -> None:
+    global _ACTIVE_MERGE_OP
+    _ACTIVE_MERGE_OP = operator
+
+
+def _clear_active_merge_op(operator) -> None:
+    global _ACTIVE_MERGE_OP
+    if _ACTIVE_MERGE_OP is operator:
+        _ACTIVE_MERGE_OP = None
+
+
+def _set_active_split_op(operator) -> None:
+    global _ACTIVE_SPLIT_OP
+    _ACTIVE_SPLIT_OP = operator
+
+
+def _clear_active_split_op(operator) -> None:
+    global _ACTIVE_SPLIT_OP
+    if _ACTIVE_SPLIT_OP is operator:
+        _ACTIVE_SPLIT_OP = None
+
+
 def _ensure_region_attribute(mesh: bpy.types.Mesh):
     """获取或创建 FACE 域整型属性 are_region_id。"""
     attribute = mesh.attributes.get(REGION_ID_ATTR)
@@ -383,6 +411,15 @@ class ARE_OT_confirm_merge_regions(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        # 优先直接驱动活跃模态实例，确保立即提交并退出。
+        op = _ACTIVE_MERGE_OP
+        if op is not None:
+            try:
+                op.confirm_from_panel(context)
+                return {"FINISHED"}
+            except Exception as exc:
+                self.report({"ERROR"}, f"确认合并失败: {exc}")
+        # 后备：置位标志，等待模态在下一次事件消费。
         scene_props.merge_confirm_requested = True
         return {"FINISHED"}
 
@@ -405,6 +442,7 @@ class ARE_OT_merge_regions(bpy.types.Operator):
     def _cleanup_ui(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         _remove_modal_timer(self, context)
+        _clear_active_merge_op(self)
         unregister_label_draw_handler()
         set_merge_label_session(None)
         scene_props.merge_mode_active = False
@@ -412,6 +450,15 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         scene_props.merge_hover_id = -1
         scene_props.merge_confirm_requested = False
         _tag_redraw(context)
+
+    def confirm_from_panel(self, context: bpy.types.Context) -> None:
+        """侧栏确认按钮直接调用：提交并结束模态显示。"""
+        if getattr(self, "_closed", False):
+            return
+        if not self._committed:
+            self._commit_to_mesh(context)
+        self._finish_mode(context, cancelled=False)
+        self._closed = True
 
     def _commit_to_mesh(self, context: bpy.types.Context) -> None:
         """仅在确认时写入一次 Mesh。"""
@@ -584,6 +631,7 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         self._closing_by_system = False
         self._preview_serial = 0
         self._committed = False
+        self._closed = False
         self._timer = None
 
         session = _build_label_session(region_ids, mesh_data, colors)
@@ -591,6 +639,7 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         session["preview_version"] = 0
         set_merge_label_session(session)
         register_label_draw_handler()
+        _set_active_merge_op(self)
 
         scene_props.merge_mode_active = True
         scene_props.merge_anchor_id = -1
@@ -617,6 +666,10 @@ class ARE_OT_merge_regions(bpy.types.Operator):
     def modal(self, context: bpy.types.Context, event):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         obj = self._object
+
+        # 侧栏确认已直接完成提交并清理，模态只需静默结束。
+        if getattr(self, "_closed", False):
+            return {"FINISHED"}
 
         try:
             if obj is None or obj.name not in bpy.data.objects:
@@ -755,6 +808,14 @@ class ARE_OT_confirm_split_regions(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        op = _ACTIVE_SPLIT_OP
+        if op is not None:
+            try:
+                if op.confirm_from_panel(context):
+                    return {"FINISHED"}
+                return {"CANCELLED"}
+            except Exception as exc:
+                self.report({"ERROR"}, f"确认拆分失败: {exc}")
         scene_props.split_confirm_requested = True
         return {"FINISHED"}
 
@@ -776,6 +837,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         self._cancel_debounce_timer()
         _remove_modal_timer(self, context)
+        _clear_active_split_op(self)
         unregister_split_draw_handler()
         unregister_label_draw_handler()
         set_split_stroke_session(None)
@@ -786,6 +848,17 @@ class ARE_OT_split_regions(bpy.types.Operator):
         scene_props.split_hover_id = -1
         scene_props.split_phase = "IDLE"
         _tag_redraw(context)
+
+    def confirm_from_panel(self, context: bpy.types.Context) -> bool:
+        """侧栏确认按钮直接调用：提交并结束模态显示。"""
+        if getattr(self, "_closed", False):
+            return True
+        if not self._commit_splits(context):
+            return False
+        self._alive = False
+        self._cleanup_ui(context)
+        self._closed = True
+        return True
 
     def _cancel_debounce_timer(self) -> None:
         timer = getattr(self, "_debounce_timer", None)
@@ -1253,6 +1326,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._painting = False
         self._last_sample_xy = None
         self._committed = False
+        self._closed = False
         self._alive = True
         self._timer = None
         self._debounce_timer = None
@@ -1266,6 +1340,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         register_split_draw_handler()
         self._set_phase_select(context)
         _add_modal_timer(self, context)
+        _set_active_split_op(self)
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
@@ -1290,6 +1365,10 @@ class ARE_OT_split_regions(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         obj = self._object
 
+        # 侧栏确认已直接完成提交并清理，模态只需静默结束。
+        if getattr(self, "_closed", False):
+            return {"FINISHED"}
+
         try:
             if obj is None or obj.name not in bpy.data.objects:
                 return self.cancel(context)
@@ -1303,6 +1382,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             if self._commit_splits(context):
                 self._alive = False
                 self._cleanup_ui(context)
+                self._closed = True
                 self.report({"INFO"}, scene_props.region_status)
                 return {"FINISHED"}
             return {"RUNNING_MODAL"}
