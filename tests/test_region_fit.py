@@ -184,6 +184,36 @@ def _disconnected_same_region_strip():
     }
 
 
+def _arc_band_island_loops():
+    """
+    弯成 150° 弧的条带被分成两个 island（0°–70° 与 80°–150°），
+    内弧半径 4、外弧半径 5，位于 z=0 平面。
+    返回 (vertices, loops)。
+    """
+
+    def band(theta0: float, theta1: float, steps: int) -> np.ndarray:
+        thetas = np.linspace(
+            np.radians(theta0),
+            np.radians(theta1),
+            steps,
+        )
+        inner = np.column_stack(
+            (4.0 * np.cos(thetas), 4.0 * np.sin(thetas), np.zeros(steps))
+        )
+        outer = np.column_stack(
+            (5.0 * np.cos(thetas), 5.0 * np.sin(thetas), np.zeros(steps))
+        )
+        # 闭环：内弧正向 + 外弧反向
+        return np.vstack((inner, outer[::-1]))
+
+    island_a = band(0.0, 70.0, 24)
+    island_b = band(80.0, 150.0, 24)
+    vertices = np.vstack((island_a, island_b))
+    loop_a = list(range(len(island_a)))
+    loop_b = list(range(len(island_a), len(island_a) + len(island_b)))
+    return vertices, [loop_a, loop_b]
+
+
 class BoundaryExtractionTests(unittest.TestCase):
     def test_square_outer_boundary_loop(self) -> None:
         mesh = _square_mesh()
@@ -236,6 +266,20 @@ class BoundaryExtractionTests(unittest.TestCase):
         )
         self.assertEqual(len(loops), 1)
         self.assertEqual(len(loops[0]), 6)
+
+    def test_curved_band_islands_envelope_follows_arc(self) -> None:
+        # 回归：弯曲条带的两个 island 合并时，包络不得在弧的两条臂
+        # 之间跳变（旧的主轴分箱会导致拟合面交叉扭曲）
+        vertices, loops = _arc_band_island_loops()
+        envelope = combine_boundary_islands(loops, vertices)
+        radii = np.linalg.norm(envelope[:, :2], axis=1)
+        self.assertTrue(bool(np.all(radii > 3.9)))
+        self.assertTrue(bool(np.all(radii < 5.1)))
+        # 相邻包络点步长必须远小于两臂间距（约 8.7），
+        # 略大于缺口弧长（约 0.8）即为正常连接
+        closed = np.vstack((envelope, envelope[:1]))
+        steps = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+        self.assertLess(float(steps.max()), 1.5)
 
     def test_same_region_islands_combined_to_full_envelope(self) -> None:
         mesh = _disconnected_same_region_strip()

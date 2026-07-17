@@ -242,6 +242,75 @@ def select_primary_boundary_loop(
     return best_loop
 
 
+def _fit_circle_2d(points_2d: np.ndarray) -> tuple[np.ndarray, float] | None:
+    """Kasa 最小二乘圆拟合，返回 (圆心(2,), 半径)；退化时返回 None。"""
+    pts = _as_float_array(points_2d)
+    if len(pts) < 3:
+        return None
+    x = pts[:, 0]
+    y = pts[:, 1]
+    matrix = np.column_stack((x, y, np.ones(len(pts), dtype=np.float64)))
+    rhs = x * x + y * y
+    try:
+        coeffs, _, rank, _ = np.linalg.lstsq(matrix, rhs, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    if rank < 3:
+        return None
+    center = np.array(
+        [coeffs[0] * 0.5, coeffs[1] * 0.5],
+        dtype=np.float64,
+    )
+    radius_sq = float(coeffs[2] + center[0] ** 2 + center[1] ** 2)
+    if radius_sq <= 0.0:
+        return None
+    return center, float(np.sqrt(radius_sq))
+
+
+def _band_parameterization(
+    points_2d: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    为包络分箱选择参数化：返回 (param_u, param_v)。
+
+    平直条带用 PCA 主轴坐标；弯曲成弧的条带（点集贴近圆环）
+    改用绕拟合圆心的极角 + 半径，避免同一主轴坐标截到弧的两条臂
+    导致上下包络在两臂之间跳变（拟合面扭曲交叉的根源）。
+    """
+    pts = _as_float_array(points_2d)
+    param_u = pts[:, 0]
+    param_v = pts[:, 1]
+
+    circle = _fit_circle_2d(pts)
+    if circle is None:
+        return param_u, param_v
+    center, _radius = circle
+    radial = pts - center[None, :]
+    radii = np.linalg.norm(radial, axis=1)
+    r_mean = float(radii.mean())
+    if r_mean < 1e-9:
+        return param_u, param_v
+    # 半径分布集中（环带特征）才启用极角参数化
+    if float(radii.std()) / r_mean >= 0.25:
+        return param_u, param_v
+
+    angles = np.arctan2(radial[:, 1], radial[:, 0])
+    # 以最大空缺角为分支切口，保证条带角度连续不跨越 ±π
+    order = np.argsort(angles)
+    sorted_angles = angles[order]
+    gaps = np.diff(sorted_angles)
+    wrap_gap = float(sorted_angles[0] + 2.0 * np.pi - sorted_angles[-1])
+    if len(gaps) == 0 or wrap_gap >= float(gaps.max()):
+        cut_angle = float(sorted_angles[-1]) + wrap_gap * 0.5
+    else:
+        widest = int(np.argmax(gaps))
+        cut_angle = float(
+            (sorted_angles[widest] + sorted_angles[widest + 1]) * 0.5
+        )
+    param_u = np.mod(angles - cut_angle, 2.0 * np.pi)
+    return param_u, radii
+
+
 def combine_boundary_islands(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
@@ -249,9 +318,9 @@ def combine_boundary_islands(
     """
     将同一领域内互不连通的 island 边界合成为一个连续外包络。
 
-    所有环先投影到其共同 PCA 平面，再沿第一主轴提取上下包络；
-    island 之间无采样的区间用两侧包络线性连接。返回一个有序 3D
-    闭环（不重复首点），供后续四角检测和 Coons 拟合使用。
+    所有环先投影到共同 PCA 平面，按条带参数化（平直用主轴坐标、
+    弯弧用极角）分箱提取两侧包络；island 之间无采样的区间用两侧
+    包络线性连接。返回一个有序 3D 闭环（不重复首点）。
     """
     if not loops:
         raise RegionFitError("没有边界环可合并")
@@ -288,10 +357,9 @@ def combine_boundary_islands(
 
     points_3d = np.vstack(samples_3d)
     points_2d = np.vstack(samples_2d)
-    u_values = points_2d[:, 0]
-    v_values = points_2d[:, 1]
-    u_min = float(u_values.min())
-    u_max = float(u_values.max())
+    param_u, param_v = _band_parameterization(points_2d)
+    u_min = float(param_u.min())
+    u_max = float(param_u.max())
     u_span = u_max - u_min
     if u_span < 1e-12:
         raise RegionFitError("多个 island 沿主方向跨度过小，无法合并")
@@ -300,7 +368,7 @@ def combine_boundary_islands(
         np.clip(len(points_3d) // 4, 48, _BOUNDARY_SAMPLES_MAX // 2)
     )
     bin_ids = np.floor(
-        (u_values - u_min) / u_span * (bin_count - 1)
+        (param_u - u_min) / u_span * (bin_count - 1)
     ).astype(np.int32)
     bin_ids = np.clip(bin_ids, 0, bin_count - 1)
 
@@ -310,7 +378,7 @@ def combine_boundary_islands(
         members = np.flatnonzero(bin_ids == bin_index)
         if len(members) == 0:
             continue
-        member_v = v_values[members]
+        member_v = param_v[members]
         lower[bin_index] = points_3d[members[int(np.argmin(member_v))]]
         upper[bin_index] = points_3d[members[int(np.argmax(member_v))]]
 
