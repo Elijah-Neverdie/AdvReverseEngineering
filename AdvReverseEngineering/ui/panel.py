@@ -369,6 +369,8 @@ class ARE_PT_main(bpy.types.Panel):
                 ):
                     help_box = tip.box()
                     help_box.label(text="1. 点击编号选择要拟合的领域")
+                    help_box.label(text="   连点多个编号可合并成一个拟合域")
+                    help_box.label(text="   再次点击已选编号可移除")
                     help_box.label(text="2. 滚轮调节第一组控制点")
                     help_box.label(text="3. PageUp/PageDown 调节第二组")
                     help_box.label(text="点击确认或 Enter 写入「拟合面」集合")

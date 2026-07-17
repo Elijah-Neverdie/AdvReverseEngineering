@@ -104,17 +104,33 @@ def resample_closed_polyline(points: np.ndarray, count: int) -> np.ndarray:
     return sampled[:-1]
 
 
+def _normalize_target_ids(target_id) -> list[int]:
+    """把单个编号或编号集合规整为有序去重列表。"""
+    if isinstance(target_id, (int, np.integer)):
+        ids = [int(target_id)]
+    else:
+        ids = sorted({int(value) for value in target_id})
+    if not ids or any(value < 0 for value in ids):
+        raise RegionFitError("拟合领域编号无效")
+    return ids
+
+
+def _target_label(target_ids: list[int]) -> str:
+    return "+".join(str(value) for value in target_ids)
+
+
 def extract_region_boundary_loops(
     region_ids: np.ndarray,
-    target_id: int,
+    target_id,
     loop_start: np.ndarray,
     loop_total: np.ndarray,
     loop_vertex_indices: np.ndarray,
 ) -> list[list[int]]:
     """
-    从 polygon loops 提取目标领域的有序边界闭环。
+    从 polygon loops 提取目标领域（可为多个领域的并集）的有序边界闭环。
 
-    通过取消领域内部成对有向半边保留外轮廓与跨领域边。
+    通过取消并集内部成对有向半边保留外轮廓与跨领域边；
+    相邻被选领域之间的公共边会自动消去。
     """
     ids = _as_int_array(region_ids)
     starts = _as_int_array(loop_start)
@@ -122,11 +138,14 @@ def extract_region_boundary_loops(
     loops = _as_int_array(loop_vertex_indices)
     if len(ids) == 0:
         return []
-    if target_id < 0 or not np.any(ids == int(target_id)):
-        raise RegionFitError(f"领域 {target_id} 不存在")
+    targets = _normalize_target_ids(target_id)
+    label = _target_label(targets)
+    mask = np.isin(ids, np.asarray(targets, dtype=np.int32))
+    if not np.any(mask):
+        raise RegionFitError(f"领域 {label} 不存在")
 
     halfedge_count: dict[tuple[int, int], int] = defaultdict(int)
-    face_indices = np.flatnonzero(ids == int(target_id))
+    face_indices = np.flatnonzero(mask)
     for face_index in face_indices.tolist():
         start = int(starts[face_index])
         total = int(totals[face_index])
@@ -147,7 +166,7 @@ def extract_region_boundary_loops(
             boundary_edges.append((v0, v1))
 
     if not boundary_edges:
-        raise RegionFitError(f"领域 {target_id} 没有可提取的外边界")
+        raise RegionFitError(f"领域 {label} 没有可提取的外边界")
 
     outgoing: dict[int, list[int]] = defaultdict(list)
     for v0, v1 in boundary_edges:
@@ -158,7 +177,7 @@ def extract_region_boundary_loops(
             # 分支/非流形：暂时仍尝试追踪，但若失败会报错
             if len(neighbors) == 0:
                 raise RegionFitError(
-                    f"领域 {target_id} 边界在顶点 {vertex} 处中断"
+                    f"领域 {label} 边界在顶点 {vertex} 处中断"
                 )
 
     unused: dict[tuple[int, int], int] = defaultdict(int)
@@ -184,7 +203,7 @@ def extract_region_boundary_loops(
             ]
             if not candidates:
                 raise RegionFitError(
-                    f"领域 {target_id} 边界不闭合（顶点 {current}）"
+                    f"领域 {label} 边界不闭合（顶点 {current}）"
                 )
             # 多分支时选第一条未使用出边
             nxt = candidates[0]
@@ -192,12 +211,12 @@ def extract_region_boundary_loops(
             current = nxt
             guard += 1
             if guard > max_steps:
-                raise RegionFitError(f"领域 {target_id} 边界追踪溢出")
+                raise RegionFitError(f"领域 {label} 边界追踪溢出")
         if len(loop) >= 3:
             closed_loops.append(loop)
 
     if not closed_loops:
-        raise RegionFitError(f"领域 {target_id} 未形成有效闭环边界")
+        raise RegionFitError(f"领域 {label} 未形成有效闭环边界")
     return closed_loops
 
 
@@ -227,14 +246,15 @@ def compute_region_frame(
     face_normals: np.ndarray,
     face_areas: np.ndarray,
     region_ids: np.ndarray,
-    target_id: int,
+    target_id,
     face_centers: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """返回 (origin, normal, axis_u, axis_v)。"""
+    """返回 (origin, normal, axis_u, axis_v)；target_id 可为编号集合。"""
     ids = _as_int_array(region_ids)
-    mask = ids == int(target_id)
+    targets = _normalize_target_ids(target_id)
+    mask = np.isin(ids, np.asarray(targets, dtype=np.int32))
     if not np.any(mask):
-        raise RegionFitError(f"领域 {target_id} 不存在")
+        raise RegionFitError(f"领域 {_target_label(targets)} 不存在")
     normals = _as_float_array(face_normals)[mask]
     areas = np.maximum(_as_float_array(face_areas)[mask], 1e-12)
     centers = _as_float_array(face_centers)[mask]
@@ -708,21 +728,23 @@ def _orient_faces(
     faces: Sequence[tuple[int, ...]],
     reference_normal: np.ndarray,
 ) -> list[tuple[int, ...]]:
+    """
+    统一面朝向：网格由参数域构建，绕序本身一致，
+    只按面积加权法线和与参考法线的点积决定整体是否翻转。
+    逐面翻转会在强弯曲曲面上破坏绕序一致性，禁止使用。
+    """
     ref = _normalize(_as_float_array(reference_normal))
-    oriented: list[tuple[int, ...]] = []
     verts = _as_float_array(vertices)
-    for face in faces:
-        if len(face) < 3:
-            continue
+    total = np.zeros(3, dtype=np.float64)
+    cleaned = [tuple(face) for face in faces if len(face) >= 3]
+    for face in cleaned:
         a = verts[face[0]]
         b = verts[face[1]]
         c = verts[face[2]]
-        normal = np.cross(b - a, c - a)
-        if float(normal.dot(ref)) < 0.0:
-            oriented.append(tuple(reversed(face)))
-        else:
-            oriented.append(tuple(face))
-    return oriented
+        total += np.cross(b - a, c - a)
+    if float(total.dot(ref)) < 0.0:
+        return [tuple(reversed(face)) for face in cleaned]
+    return cleaned
 
 
 def _order_triangle_sides(
@@ -769,9 +791,27 @@ def _order_triangle_sides(
     return long0, long1, base
 
 
+def _loop_pca_basis(
+    loop_points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    边界环点集的 PCA 基底：返回 (centroid, axis_u, axis_v)。
+
+    对跨越大弧度的弯曲条带，面法线均值方向会与边界主平面共面，
+    投影会折叠自交；改用边界点最佳拟合平面保证投影展开。
+    """
+    pts = _as_float_array(loop_points)
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    axis_u = _normalize(vh[0])
+    axis_v = _normalize(vh[1])
+    return centroid, axis_u, axis_v
+
+
 def analyze_region_fit_topology(
     region_ids: np.ndarray,
-    target_id: int,
+    target_id,
     vertices: np.ndarray,
     loop_start: np.ndarray,
     loop_total: np.ndarray,
@@ -782,7 +822,7 @@ def analyze_region_fit_topology(
     triangle_ratio: float = DEFAULT_TRIANGLE_RATIO,
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
 ) -> dict:
-    """分析领域边界并返回拟合拓扑描述（不含网格）。"""
+    """分析领域边界并返回拟合拓扑描述；target_id 可为编号集合。"""
     loops = extract_region_boundary_loops(
         region_ids,
         target_id,
@@ -791,7 +831,7 @@ def analyze_region_fit_topology(
         loop_vertex_indices,
     )
     primary = select_primary_boundary_loop(loops, vertices)
-    origin, normal, axis_u, axis_v = compute_region_frame(
+    _, normal, _, _ = compute_region_frame(
         face_normals,
         face_areas,
         region_ids,
@@ -799,6 +839,8 @@ def analyze_region_fit_topology(
         face_centers,
     )
     loop_pts = _as_float_array(vertices)[np.asarray(primary, dtype=np.int32)]
+    # 2D 分析基底用边界点 PCA 平面，避免弯曲条带投影折叠
+    origin, axis_u, axis_v = _loop_pca_basis(loop_pts)
     pts_2d_raw = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
     # 统一为逆时针（角点检测与凹口桥接依赖此方向约定）
     if _signed_area_2d(pts_2d_raw) < 0.0:
@@ -844,7 +886,7 @@ def analyze_region_fit_topology(
 
 def fit_region_surface(
     region_ids: np.ndarray,
-    target_id: int,
+    target_id,
     vertices: np.ndarray,
     loop_start: np.ndarray,
     loop_total: np.ndarray,
@@ -857,7 +899,7 @@ def fit_region_surface(
     triangle_ratio: float = DEFAULT_TRIANGLE_RATIO,
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
 ) -> RegionFitResult:
-    """拟合指定领域为三边或四边规则网格。"""
+    """拟合指定领域（或多个领域并集）为三边或四边规则网格。"""
     analysis = analyze_region_fit_topology(
         region_ids=region_ids,
         target_id=target_id,

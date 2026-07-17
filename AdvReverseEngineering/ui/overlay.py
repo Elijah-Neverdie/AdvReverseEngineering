@@ -314,6 +314,8 @@ def draw_region_merge_labels() -> None:
         anchor_id = int(getattr(scene_props, "split_target_id", -1))
         hover_id = int(getattr(scene_props, "split_hover_id", -1))
 
+    selected_ids = session.get("selected_ids") or ()
+
     gpu.state.blend_set("ALPHA")
     try:
         for label in session.get("labels", []):
@@ -323,7 +325,7 @@ def draw_region_merge_labels() -> None:
             if screen is None:
                 continue
             region_id = int(label["id"])
-            if region_id == anchor_id:
+            if region_id == anchor_id or region_id in selected_ids:
                 fill = (1.0, 0.55, 0.12, 0.92)
                 leader = (1.0, 0.65, 0.25, 0.95)
             elif region_id == hover_id:

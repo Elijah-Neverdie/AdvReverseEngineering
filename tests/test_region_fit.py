@@ -180,6 +180,20 @@ class BoundaryExtractionTests(unittest.TestCase):
                 mesh["loop_vertex_indices"],
             )
 
+    def test_union_of_adjacent_regions_single_loop(self) -> None:
+        # 两个相邻领域并集：公共边消去，外轮廓为单一闭环
+        mesh = _two_quad_strip()
+        region_ids = np.array([0, 1], dtype=np.int32)
+        loops = extract_region_boundary_loops(
+            region_ids,
+            [0, 1],
+            mesh["loop_start"],
+            mesh["loop_total"],
+            mesh["loop_vertex_indices"],
+        )
+        self.assertEqual(len(loops), 1)
+        self.assertEqual(len(loops[0]), 6)
+
 
 class TopologyClassificationTests(unittest.TestCase):
     def test_detect_square_corners(self) -> None:
@@ -442,6 +456,29 @@ class FitRegionSurfaceTests(unittest.TestCase):
             a, b, c = (result.vertices[i] for i in face[:3])
             normal = np.cross(b - a, c - a)
             self.assertGreater(float(normal[2]), 0.0)
+
+    def test_fit_union_of_regions_as_quad(self) -> None:
+        # 一条被切成两个领域的矩形条带，合并拟合成完整四边面
+        mesh = _two_quad_strip()
+        region_ids = np.array([0, 1], dtype=np.int32)
+        result = fit_region_surface(
+            region_ids=region_ids,
+            target_id=[0, 1],
+            vertices=mesh["vertices"],
+            loop_start=mesh["loop_start"],
+            loop_total=mesh["loop_total"],
+            loop_vertex_indices=mesh["loop_vertex_indices"],
+            face_normals=mesh["normals"],
+            face_areas=mesh["areas"],
+            face_centers=mesh["centers"],
+            segments_u=4,
+            segments_v=2,
+        )
+        self.assertEqual(result.topology, "QUAD")
+        self.assertEqual(len(result.vertices), 5 * 3)
+        # 拟合面应覆盖 2x1 全域
+        self.assertAlmostEqual(float(result.vertices[:, 0].min()), 0.0, places=6)
+        self.assertAlmostEqual(float(result.vertices[:, 0].max()), 2.0, places=6)
 
     def test_polyline_length(self) -> None:
         pts = np.array(
