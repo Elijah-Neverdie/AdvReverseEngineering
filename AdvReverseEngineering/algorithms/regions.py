@@ -161,6 +161,56 @@ def _seed_order_by_flatness(
     return np.argsort(-min_dot, kind="stable")
 
 
+def _split_by_visible_wire_edges(
+    normals: np.ndarray,
+    topology: FaceTopology,
+    cos_limit: float,
+) -> np.ndarray:
+    """
+    纯逐边切断（与 Blender 线框完全一致）：
+    线框中可见的边（dot <= cos_limit）为领域边界，
+    其余边两侧面合并，最后取连通分量作为领域。
+
+    没有任何“累计角度/平均法线”判据——光滑大曲面
+    在线框中看不到边，就应保持为一个完整领域。
+    使用向量化并查集，支撑百万面网格。
+    """
+    face_count = len(normals)
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int64)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int64)
+    parent = np.arange(face_count, dtype=np.int64)
+
+    if len(face_a):
+        dots = np.sum(normals[face_a] * normals[face_b], axis=1)
+        keep = dots > cos_limit
+        pair_a = face_a[keep]
+        pair_b = face_b[keep]
+
+        def find(x: int) -> int:
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:
+                parent[x], x = root, parent[x]
+            return root
+
+        for a, b in zip(pair_a.tolist(), pair_b.tolist()):
+            ra = find(a)
+            rb = find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+    # 压缩根并映射为稠密 0..N-1 标签
+    roots = parent.copy()
+    changed = True
+    while changed:
+        new_roots = parent[roots]
+        changed = bool(np.any(new_roots != roots))
+        roots = new_roots
+    _unique, labels = np.unique(roots, return_inverse=True)
+    return labels.astype(np.int32, copy=False)
+
+
 def _grow_regions(
     normals: np.ndarray,
     areas: np.ndarray,
@@ -168,7 +218,7 @@ def _grow_regions(
     cos_limit: float,
 ) -> np.ndarray:
     """
-    种子区域生长，输出稠密领域标签（0..N-1）。
+    种子区域生长，输出稠密领域标签（0..N-1）。（旧版角度模式）
 
     双重判据：
         1. 候选面与其接壤面法线夹角 <= 阈值（局部平滑性）
@@ -367,6 +417,14 @@ def segment_regions_by_normal(
 
     if len(topology["edge_face_a"]) == 0:
         temp_ids = np.arange(face_count, dtype=np.int32)
+    elif wireframe_threshold is not None:
+        # 与 Blender 线框一致：逐边判断，无累计判据，
+        # 光滑曲面不会被切成横带。
+        temp_ids = _split_by_visible_wire_edges(
+            normals,
+            topology,
+            cos_limit,
+        )
     else:
         temp_ids = _grow_regions(normals, areas, topology, cos_limit)
 

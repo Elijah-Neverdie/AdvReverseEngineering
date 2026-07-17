@@ -245,6 +245,34 @@ class RegionSegmentationTests(unittest.TestCase):
             int(result["region_ids"][-1]),
         )
 
+    def test_smooth_curve_stays_single_region(self) -> None:
+        # 关键回归：光滑曲面每步仅 2°（线框中所有边均不可见），
+        # 即使累计弯曲 18° 也必须保持为一个领域，不得切成横带。
+        count = 10
+        angles = np.radians(np.arange(count) * 2.0)
+        normals = np.stack(
+            (
+                np.zeros(count),
+                -np.sin(angles),
+                np.cos(angles),
+            ),
+            axis=1,
+        )
+        areas = np.ones(count, dtype=np.float64)
+        pairs = [(i, i + 1) for i in range(count - 1)]
+        topology = _topology_from_pairs(count, pairs)
+
+        result = segment_regions_by_normal(
+            normals,
+            areas,
+            topology,
+            wireframe_threshold=0.1,
+            ignore_discrete=False,
+            smooth_iterations=0,
+        )
+        self.assertEqual(result["region_count"], 1)
+        self.assertTrue(np.all(result["region_ids"] == 0))
+
     def test_legacy_angle_threshold_still_works(self) -> None:
         normals = np.array(
             [
