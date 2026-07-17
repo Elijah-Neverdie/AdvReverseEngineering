@@ -10,21 +10,6 @@ import numpy as np
 from ..utils.math import build_full_orientation, normalize
 
 
-def _canonical_axis_candidates() -> np.ndarray:
-    """六个主轴方向候选（用于快速法线投票）。"""
-    return np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [-1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [0.0, 0.0, -1.0],
-        ],
-        dtype=np.float64,
-    )
-
-
 def cluster_dominant_normal(
     normals: np.ndarray,
     areas: np.ndarray,
@@ -33,36 +18,41 @@ def cluster_dominant_normal(
     """
     按角度聚类面法线，返回面积加权最大的主方向。
 
-    先将法线映射到最近的主轴桶，再对相反方向合并统计，
-    适合扫描模型的大平面检测。
+    通过面积加权方向张量合并 n 与 -n，因此无需依赖当前世界六轴，
+    也不会把错误的正负轴配成一组。随后对主方向角度范围内的法线
+    做一次加权均值精修。
     """
     if len(normals) == 0:
         return np.array([0.0, 0.0, -1.0], dtype=np.float64)
 
+    valid_areas = np.maximum(
+        np.asarray(areas, dtype=np.float64),
+        0.0,
+    )
+    if float(valid_areas.sum()) < 1e-12:
+        valid_areas = np.ones(len(normals), dtype=np.float64)
+
+    # Σ area * (n nᵀ) 天然把正反法线视为同一无向轴。
+    direction_tensor = normals.T @ (normals * valid_areas[:, None])
+    eigenvalues, eigenvectors = np.linalg.eigh(direction_tensor)
+    dominant = normalize(eigenvectors[:, int(np.argmax(eigenvalues))])
+
     cos_limit = float(np.cos(np.radians(angle_threshold_deg)))
-    candidates = _canonical_axis_candidates()
-    scores = np.zeros(len(candidates), dtype=np.float64)
+    signed_dots = normals @ dominant
+    cluster_mask = np.abs(signed_dots) >= cos_limit
+    if np.any(cluster_mask):
+        cluster_normals = normals[cluster_mask].copy()
+        cluster_weights = valid_areas[cluster_mask]
+        signs = np.where(signed_dots[cluster_mask] < 0.0, -1.0, 1.0)
+        cluster_normals *= signs[:, None]
+        refined = np.sum(
+            cluster_normals * cluster_weights[:, None],
+            axis=0,
+        )
+        if float(np.linalg.norm(refined)) > 1e-12:
+            dominant = normalize(refined)
 
-    # 法线点积矩阵 (F, 6)，批量计算
-    dots = np.abs(normals @ candidates.T)
-    nearest = np.argmax(dots, axis=1)
-    nearest_dots = dots[np.arange(len(normals)), nearest]
-    valid = nearest_dots >= cos_limit
-
-    weighted_areas = areas.copy()
-    weighted_areas[~valid] = 0.0
-    for axis_index in range(len(candidates)):
-        mask = nearest == axis_index
-        scores[axis_index] = float(weighted_areas[mask].sum())
-
-    # 合并相反方向票数
-    merged = scores.copy()
-    for i in range(3):
-        merged[i] = scores[i] + scores[i + 3]
-        merged[i + 3] = merged[i]
-
-    best_index = int(np.argmax(merged))
-    dominant = candidates[best_index]
+    # 对单独使用的法线策略，优先让结果落在世界下半球。
     if dominant[2] > 0.0:
         dominant = -dominant
     return normalize(dominant)

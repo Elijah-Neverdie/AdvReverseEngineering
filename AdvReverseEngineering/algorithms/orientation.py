@@ -67,25 +67,36 @@ def _strategy_combined(mesh_data: MeshData, settings: dict) -> np.ndarray:
     vertices = mesh_data["vertices"]
     centroid = mesh_data["centroid"]
 
+    rotation = np.eye(3, dtype=np.float64)
+
     if settings.get("use_pca", True):
-        rotation = orientation_matrix_pca(vertices)
-    else:
-        rotation = np.eye(3, dtype=np.float64)
+        correction = orientation_matrix_pca(vertices)
+        rotation = correction @ rotation
 
     if settings.get("detect_largest_plane", True):
-        ransac_rot = orientation_matrix_ransac(vertices, centroid)
-        rotation = ransac_rot
+        # 后续阶段在前一阶段结果坐标系中计算修正量，再左乘累计。
+        transformed_vertices = vertices @ rotation.T
+        transformed_centroid = centroid @ rotation.T
+        correction = orientation_matrix_ransac(
+            transformed_vertices,
+            transformed_centroid,
+        )
+        rotation = correction @ rotation
 
     if settings.get("normal_clustering", True):
-        normal_rot = orientation_matrix_normal_cluster(
-            vertices,
-            mesh_data["normals"],
+        transformed_vertices = vertices @ rotation.T
+        transformed_normals = mesh_data["normals"] @ rotation.T
+        transformed_centroid = centroid @ rotation.T
+        correction = orientation_matrix_normal_cluster(
+            transformed_vertices,
+            transformed_normals,
             mesh_data["areas"],
-            centroid,
+            transformed_centroid,
         )
-        rotation = normal_rot
+        rotation = correction @ rotation
 
     if settings.get("obb_refinement", True):
+        # OBB 使用原始点和累计旋转，仅在最终姿态附近 ±15° 精修。
         rotation = orientation_matrix_obb(vertices, rotation)
 
     return rotation
