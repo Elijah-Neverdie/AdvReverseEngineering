@@ -22,6 +22,20 @@ def _prefs(context: bpy.types.Context):
     return addon.preferences
 
 
+def _draw_foldout(layout, props, prop_name: str, title: str):
+    """绘制可折叠卷展栏标题行，返回是否展开。"""
+    row = layout.row(align=True)
+    expanded = bool(getattr(props, prop_name))
+    row.prop(
+        props,
+        prop_name,
+        text=title,
+        icon="TRIA_DOWN" if expanded else "TRIA_RIGHT",
+        emboss=False,
+    )
+    return expanded
+
+
 class ARE_PT_main(bpy.types.Panel):
     """逆向工具主面板，始终显示以确保侧边栏标签可见。"""
 
@@ -35,6 +49,7 @@ class ARE_PT_main(bpy.types.Panel):
         layout = self.layout
         obj = context.active_object
         prefs = _prefs(context)
+        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
 
         # GitHub 同步位于工具顶部，默认收起。
         if prefs is not None:
@@ -117,7 +132,6 @@ class ARE_PT_main(bpy.types.Panel):
             icon="ORIENTATION_GLOBAL",
         )
 
-        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
         if scene_props is not None and scene_props.orientation_status:
             status_box = layout.box()
             status_box.label(
@@ -127,11 +141,57 @@ class ARE_PT_main(bpy.types.Panel):
             status_box.label(text=scene_props.orientation_status_detail)
             status_box.label(text=scene_props.orientation_status_next)
 
+        if scene_props is None:
+            return
+
         layout.separator()
-        region_box = layout.box()
-        region_box.label(text="领域分割", icon="FACESEL")
-        mesh_ready = obj is not None and obj.type == "MESH"
-        if scene_props is not None:
+        if _draw_foldout(layout, scene_props, "show_simplify_section", "简化"):
+            simplify_box = layout.box()
+            mesh_ready = obj is not None and obj.type == "MESH"
+            simplify_box.prop(
+                scene_props,
+                "viewport_simplify_percent",
+                text="视图简化 (%)",
+            )
+            if scene_props.simplify_active or scene_props.simplify_status:
+                if scene_props.simplify_original_faces:
+                    simplify_box.label(
+                        text=(
+                            f"面数 {scene_props.simplify_original_faces}"
+                            f" → {scene_props.simplify_current_faces}"
+                        ),
+                        icon="MESH_DATA",
+                    )
+                if scene_props.simplify_status:
+                    simplify_box.label(
+                        text=scene_props.simplify_status,
+                        icon=(
+                            "TIME"
+                            if scene_props.simplify_rebuild_pending
+                            else "INFO"
+                        ),
+                    )
+
+            apply_row = simplify_box.row()
+            apply_row.scale_y = 1.2
+            apply_row.enabled = (
+                scene_props.simplify_active
+                and not scene_props.simplify_rebuild_pending
+            )
+            apply_row.operator(
+                "are.simplify_apply",
+                text="应用",
+                icon="CHECKMARK",
+            )
+            if not mesh_ready:
+                simplify_box.label(text="请选中网格对象", icon="INFO")
+
+        layout.separator()
+        if _draw_foldout(layout, scene_props, "show_region_section", "领域"):
+            region_box = layout.box()
+            mesh_ready = obj is not None and obj.type == "MESH"
+            merging = bool(scene_props.merge_mode_active)
+
             region_box.prop(
                 scene_props,
                 "region_normal_threshold",
@@ -156,21 +216,47 @@ class ARE_PT_main(bpy.types.Panel):
 
             button_row = region_box.row(align=True)
             button_row.scale_y = 1.2
-            button_row.enabled = mesh_ready and (
-                obj is None or obj.mode != "EDIT"
+            button_row.enabled = (
+                mesh_ready
+                and not merging
+                and (obj is None or obj.mode != "EDIT")
             )
             button_row.operator(
                 "are.segment_regions",
                 text="识别领域",
                 icon="MOD_EDGESPLIT",
             )
+
+            merge_row = region_box.row(align=True)
+            merge_row.enabled = mesh_ready and not merging
+            merge_row.operator(
+                "are.merge_regions",
+                text="合并领域",
+                icon="AUTOMERGE_ON",
+            )
+
             clear_row = region_box.row(align=True)
-            clear_row.enabled = mesh_ready
+            clear_row.enabled = mesh_ready and not merging
             clear_row.operator(
                 "are.clear_regions",
                 text="清除领域",
                 icon="X",
             )
+
+            if merging:
+                tip = region_box.box()
+                tip.label(text="合并模式", icon="INFO")
+                tip.label(text="首击设锚点，续击立即合并")
+                tip.label(text="点击空白换组 · Enter 确认 · Esc 取消")
+                if scene_props.merge_status:
+                    tip.label(text=scene_props.merge_status)
+                confirm_row = tip.row()
+                confirm_row.scale_y = 1.2
+                confirm_row.operator(
+                    "are.confirm_merge_regions",
+                    text="确认",
+                    icon="CHECKMARK",
+                )
 
             if scene_props.region_status:
                 region_box.label(
@@ -179,8 +265,6 @@ class ARE_PT_main(bpy.types.Panel):
                 )
                 if scene_props.region_status_detail:
                     region_box.label(text=scene_props.region_status_detail)
-        else:
-            region_box.label(text="属性未就绪", icon="ERROR")
 
 
 classes = (ARE_PT_main,)

@@ -17,6 +17,13 @@ from bpy.props import (
 )
 
 
+def _on_viewport_simplify_percent_update(self, context) -> None:
+    """百分比变化时调度防抖重建，避免拖动滑块连续重算。"""
+    from .operators.simplify import schedule_simplify_rebuild
+
+    schedule_simplify_rebuild(context)
+
+
 class ARE_SceneProperties(bpy.types.PropertyGroup):
     """场景级插件属性，供 UI 面板与 Operator 读写。"""
 
@@ -243,6 +250,112 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     region_status_detail: StringProperty(
         name="领域状态详情",
         description="忽略离散面等附加说明",
+        default="",
+    )
+
+    # ------------------------------------------------------------------
+    # 简化（视图 Decimate 预览 + 原始备份）
+    # ------------------------------------------------------------------
+    show_simplify_section: BoolProperty(
+        name="简化",
+        description="展开/收起简化卷展栏",
+        default=True,
+    )
+    show_region_section: BoolProperty(
+        name="领域",
+        description="展开/收起领域卷展栏",
+        default=True,
+    )
+    viewport_simplify_percent: FloatProperty(
+        name="视图简化",
+        description="保留三角面比例（百分比）；停止拖动约 0.5 秒后自动重建预览",
+        default=100.0,
+        min=1.0,
+        max=100.0,
+        soft_min=5.0,
+        soft_max=100.0,
+        precision=1,
+        subtype="PERCENTAGE",
+        update=_on_viewport_simplify_percent_update,
+    )
+    simplify_active: BoolProperty(
+        name="简化会话中",
+        description="是否已创建隐藏原始备份与工作副本",
+        default=False,
+    )
+    simplify_backup: PointerProperty(
+        name="简化备份",
+        description="隐藏的原始网格备份对象",
+        type=bpy.types.Object,
+    )
+    simplify_working: PointerProperty(
+        name="简化工作副本",
+        description="当前用于显示与后续制作的简化对象",
+        type=bpy.types.Object,
+    )
+    simplify_source_name: StringProperty(
+        name="简化源名称",
+        description="进入简化会话前的对象显示名称",
+        default="",
+    )
+    simplify_applied_percent: FloatProperty(
+        name="已应用简化百分比",
+        description="当前工作副本实际使用的保留比例",
+        default=100.0,
+        min=1.0,
+        max=100.0,
+    )
+    simplify_original_faces: IntProperty(
+        name="原始面数",
+        description="备份网格的三角面数",
+        default=0,
+        min=0,
+    )
+    simplify_current_faces: IntProperty(
+        name="当前面数",
+        description="工作副本的三角面数",
+        default=0,
+        min=0,
+    )
+    simplify_status: StringProperty(
+        name="简化状态",
+        description="简化会话摘要",
+        default="",
+    )
+    simplify_rebuild_pending: BoolProperty(
+        name="等待重建",
+        description="百分比已变，等待防抖计时器重建",
+        default=False,
+    )
+
+    # ------------------------------------------------------------------
+    # 领域合并模态
+    # ------------------------------------------------------------------
+    merge_mode_active: BoolProperty(
+        name="合并模式",
+        description="是否正在进行领域合并",
+        default=False,
+    )
+    merge_anchor_id: IntProperty(
+        name="合并锚点",
+        description="当前锚点领域编号，-1 表示未选择",
+        default=-1,
+        min=-1,
+    )
+    merge_confirm_requested: BoolProperty(
+        name="请求确认合并",
+        description="面板确认按钮通知模态算子提交",
+        default=False,
+    )
+    merge_hover_id: IntProperty(
+        name="悬停领域",
+        description="鼠标悬停的领域编号",
+        default=-1,
+        min=-1,
+    )
+    merge_status: StringProperty(
+        name="合并状态",
+        description="合并模式提示文案",
         default="",
     )
 

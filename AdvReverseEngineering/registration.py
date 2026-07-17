@@ -130,9 +130,11 @@ def register() -> None:
 
 def unregister() -> None:
     """按相反顺序注销插件全部 Blender 类型。"""
+    from .operators.simplify import cancel_simplify_timers
     from .operators.update import cancel_update_check_timers
     from .ui.overlay import (
         unregister_draw_handler,
+        unregister_label_draw_handler,
         unregister_overlay_ui,
     )
 
@@ -141,7 +143,9 @@ def unregister() -> None:
     panel_classes = _get_panel_classes()
 
     cancel_update_check_timers()
+    cancel_simplify_timers()
     unregister_overlay_ui()
+    unregister_label_draw_handler()
     unregister_draw_handler()
     _unregister_classes(panel_classes, "Panel")
     _unregister_classes(operator_classes, "Operator")

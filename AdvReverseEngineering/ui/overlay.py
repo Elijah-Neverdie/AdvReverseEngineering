@@ -14,15 +14,22 @@ from ..registration import SCENE_PROP_NAME
 
 # 视口绘制句柄
 _DRAW_HANDLE = None
+_LABEL_DRAW_HANDLE = None
 DRAW_HANDLE_KEY = "AdvReverseEngineering.bottom_draw_handle"
+LABEL_DRAW_HANDLE_KEY = "AdvReverseEngineering.region_label_draw_handle"
 OVERLAY_UI_KEY = "AdvReverseEngineering.overlay_ui_callback"
 
 # 世界坐标 / 颜色缓存：signature 记录矩阵、网格与领域版本。
 _BOTTOM_CACHE: dict[int, dict] = {}
 _REGION_CACHE: dict[int, dict] = {}
 
+# 合并模式标签会话（由 merge operator 写入）
+_MERGE_LABEL_SESSION: dict | None = None
+
 # 紫色半透明 (R, G, B, A)
 HIGHLIGHT_COLOR = (0.78, 0.22, 1.0, 0.55)
+LABEL_RADIUS_PX = 16.0
+LABEL_OFFSET_Y = 28.0
 
 # 对象自定义属性键
 BOTTOM_FACES_ATTR = "are_bottom_faces"
@@ -94,6 +101,170 @@ def clear_region_highlight(
         # 调用方负责清理 scene 状态时可不强行置空。
         pass
     _tag_view3d_redraw(context)
+
+
+def set_merge_label_session(session: dict | None) -> None:
+    """设置或清除合并模式编号标签会话。"""
+    global _MERGE_LABEL_SESSION
+    _MERGE_LABEL_SESSION = session
+
+
+def get_merge_label_session() -> dict | None:
+    """读取合并模式编号标签会话。"""
+    return _MERGE_LABEL_SESSION
+
+
+def update_merge_label_projections(context: bpy.types.Context) -> None:
+    """根据当前视角刷新标签屏幕坐标。"""
+    from ..utils.viewport import project_world_to_region
+
+    session = _MERGE_LABEL_SESSION
+    if session is None:
+        return
+    region = context.region
+    rv3d = getattr(context, "region_data", None)
+    if region is None or rv3d is None or region.type != "WINDOW":
+        # 尝试从当前屏幕找 VIEW_3D
+        space = getattr(context, "space_data", None)
+        if space is None or space.type != "VIEW_3D":
+            return
+        rv3d = space.region_3d
+
+    labels = session.get("labels", [])
+    for label in labels:
+        world = label.get("world_co")
+        if world is None:
+            label["visible"] = False
+            label["screen_xy"] = None
+            continue
+        # 中心上方偏移一点，避免贴在表面上。
+        raised = (
+            float(world[0]),
+            float(world[1]),
+            float(world[2]) + float(session.get("lift", 0.0)),
+        )
+        screen = project_world_to_region(region, rv3d, raised)
+        if screen is None:
+            label["visible"] = False
+            label["screen_xy"] = None
+            continue
+        screen.y += LABEL_OFFSET_Y
+        label["screen_xy"] = screen
+        label["visible"] = True
+
+
+def _draw_circle_2d(center_x: float, center_y: float, radius: float, color) -> None:
+    """绘制填充圆（像素空间）。"""
+    import math
+
+    segments = 24
+    coords = [(center_x, center_y)]
+    for index in range(segments + 1):
+        angle = (index / segments) * math.tau
+        coords.append(
+            (
+                center_x + math.cos(angle) * radius,
+                center_y + math.sin(angle) * radius,
+            )
+        )
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "TRI_FAN", {"pos": coords})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def draw_region_merge_labels() -> None:
+    """POST_PIXEL：绘制始终置顶的领域编号按钮。"""
+    import blf
+
+    context = bpy.context
+    if context is None or context.scene is None:
+        return
+    scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+    if scene_props is None or not scene_props.merge_mode_active:
+        return
+    session = _MERGE_LABEL_SESSION
+    if session is None:
+        return
+
+    update_merge_label_projections(context)
+    anchor_id = int(scene_props.merge_anchor_id)
+    hover_id = int(scene_props.merge_hover_id)
+
+    gpu.state.blend_set("ALPHA")
+    try:
+        for label in session.get("labels", []):
+            if not label.get("visible", False):
+                continue
+            screen = label.get("screen_xy")
+            if screen is None:
+                continue
+            region_id = int(label["id"])
+            if region_id == anchor_id:
+                fill = (1.0, 0.55, 0.12, 0.92)
+            elif region_id == hover_id:
+                fill = (0.35, 0.75, 1.0, 0.90)
+            else:
+                fill = (0.12, 0.12, 0.14, 0.82)
+
+            _draw_circle_2d(screen.x, screen.y, LABEL_RADIUS_PX, fill)
+            # 外圈
+            _draw_circle_2d(
+                screen.x,
+                screen.y,
+                LABEL_RADIUS_PX + 2.0,
+                (1.0, 1.0, 1.0, 0.35),
+            )
+            _draw_circle_2d(screen.x, screen.y, LABEL_RADIUS_PX, fill)
+
+            text = str(region_id)
+            font_id = 0
+            blf.size(font_id, 14)
+            width, height = blf.dimensions(font_id, text)
+            blf.position(
+                font_id,
+                screen.x - width * 0.5,
+                screen.y - height * 0.35,
+                0,
+            )
+            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+            blf.draw(font_id, text)
+    finally:
+        gpu.state.blend_set("NONE")
+
+
+def register_label_draw_handler() -> None:
+    """按需注册领域编号 POST_PIXEL 绘制。"""
+    global _LABEL_DRAW_HANDLE
+    namespace = bpy.app.driver_namespace
+    old = namespace.get(LABEL_DRAW_HANDLE_KEY)
+    if old is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(old, "WINDOW")
+        except (ReferenceError, ValueError):
+            pass
+    _LABEL_DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+        draw_region_merge_labels,
+        (),
+        "WINDOW",
+        "POST_PIXEL",
+    )
+    namespace[LABEL_DRAW_HANDLE_KEY] = _LABEL_DRAW_HANDLE
+
+
+def unregister_label_draw_handler() -> None:
+    """注销领域编号绘制句柄。"""
+    global _LABEL_DRAW_HANDLE, _MERGE_LABEL_SESSION
+    namespace = bpy.app.driver_namespace
+    handle = namespace.pop(LABEL_DRAW_HANDLE_KEY, None) or _LABEL_DRAW_HANDLE
+    if handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+        except (ReferenceError, ValueError):
+            pass
+    _LABEL_DRAW_HANDLE = None
+    _MERGE_LABEL_SESSION = None
 
 
 def _tag_view3d_redraw(context: bpy.types.Context) -> None:
@@ -483,6 +654,7 @@ def register_overlay_ui() -> None:
 def unregister_draw_handler() -> None:
     """注销视口绘制句柄。"""
     global _DRAW_HANDLE
+    unregister_label_draw_handler()
     namespace = bpy.app.driver_namespace
     handle = namespace.pop(DRAW_HANDLE_KEY, None) or _DRAW_HANDLE
     if handle is not None:

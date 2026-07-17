@@ -345,3 +345,129 @@ def segment_regions_by_normal(
         colors=colors,
         total_area=total_area,
     )
+
+
+def compute_region_centroids(
+    region_ids: np.ndarray,
+    face_centers: np.ndarray,
+    areas: np.ndarray,
+) -> dict[int, np.ndarray]:
+    """
+    计算每个有效领域的面积加权中心。
+
+    返回:
+        {region_id: world_xyz ndarray(3,)}
+    """
+    ids = np.asarray(region_ids, dtype=np.int32)
+    centers = np.asarray(face_centers, dtype=np.float64)
+    weights = np.maximum(np.asarray(areas, dtype=np.float64), 0.0)
+    result: dict[int, np.ndarray] = {}
+    if len(ids) == 0:
+        return result
+
+    valid = ids >= 0
+    if not np.any(valid):
+        return result
+
+    max_id = int(ids[valid].max())
+    sum_w = np.bincount(
+        ids[valid],
+        weights=weights[valid],
+        minlength=max_id + 1,
+    )
+    for axis in range(3):
+        axis_sum = np.bincount(
+            ids[valid],
+            weights=centers[valid, axis] * weights[valid],
+            minlength=max_id + 1,
+        )
+        for region_id in range(max_id + 1):
+            total = float(sum_w[region_id])
+            if total < 1e-18:
+                continue
+            if region_id not in result:
+                result[region_id] = np.zeros(3, dtype=np.float64)
+            result[region_id][axis] = float(axis_sum[region_id] / total)
+    return result
+
+
+def compact_region_ids(
+    region_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    将有效领域 ID 压缩为连续的 0..K-1。
+
+    返回:
+        (新标签, 旧ID->新ID映射表, 新领域数)
+        映射表长度 = max(old_id)+1，忽略槽为 REGION_IGNORED_ID。
+    """
+    ids = np.asarray(region_ids, dtype=np.int32).copy()
+    if len(ids) == 0:
+        return ids, np.empty(0, dtype=np.int32), 0
+
+    valid = ids >= 0
+    if not np.any(valid):
+        return ids, np.empty(0, dtype=np.int32), 0
+
+    unique = np.unique(ids[valid])
+    remap = np.full(int(unique.max()) + 1, REGION_IGNORED_ID, dtype=np.int32)
+    remap[unique] = np.arange(len(unique), dtype=np.int32)
+    ids[valid] = remap[ids[valid]]
+    return ids, remap, int(len(unique))
+
+
+def remap_region_colors(
+    colors: np.ndarray,
+    id_remap: np.ndarray,
+    new_count: int,
+) -> np.ndarray:
+    """
+    按 compact 映射重排颜色表，保留锚点原色。
+
+    id_remap[old_id] = new_id；未使用的旧色丢弃。
+    """
+    palette = np.asarray(colors, dtype=np.float32)
+    if new_count <= 0:
+        return np.empty((0, 4), dtype=np.float32)
+
+    remapped = np.zeros((new_count, 4), dtype=np.float32)
+    if len(palette) == 0 or len(id_remap) == 0:
+        return generate_region_colors(new_count)
+
+    for old_id, new_id in enumerate(id_remap.tolist()):
+        if new_id < 0 or new_id >= new_count:
+            continue
+        if old_id < len(palette):
+            remapped[new_id] = palette[old_id]
+        else:
+            remapped[new_id] = generate_region_colors(1)[0]
+    return remapped
+
+
+def merge_region_ids(
+    region_ids: np.ndarray,
+    colors: np.ndarray,
+    anchor_id: int,
+    source_id: int,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """
+    将 source 领域合入 anchor，并压缩编号。
+
+    返回:
+        (新标签, 新颜色表, 新领域数, 压缩后锚点ID)
+    """
+    ids = np.asarray(region_ids, dtype=np.int32).copy()
+    palette = np.asarray(colors, dtype=np.float32)
+    if anchor_id < 0 or source_id < 0:
+        raise ValueError("合并领域编号无效")
+    if anchor_id == source_id:
+        compacted, remap, count = compact_region_ids(ids)
+        new_colors = remap_region_colors(palette, remap, count)
+        new_anchor = int(remap[anchor_id]) if anchor_id < len(remap) else -1
+        return compacted, new_colors, count, new_anchor
+
+    ids[ids == source_id] = anchor_id
+    compacted, remap, count = compact_region_ids(ids)
+    new_colors = remap_region_colors(palette, remap, count)
+    new_anchor = int(remap[anchor_id]) if anchor_id < len(remap) else -1
+    return compacted, new_colors, count, new_anchor
