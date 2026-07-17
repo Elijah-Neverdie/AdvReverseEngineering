@@ -139,6 +139,11 @@ class ARE_PT_main(bpy.types.Panel):
             )
             region_box.prop(
                 scene_props,
+                "region_smooth_iterations",
+                text="法线平滑",
+            )
+            region_box.prop(
+                scene_props,
                 "region_ignore_discrete",
                 text="忽略离散面",
             )

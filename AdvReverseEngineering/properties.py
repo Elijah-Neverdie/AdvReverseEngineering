@@ -174,6 +174,17 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         soft_max=45.0,
         precision=1,
     )
+    region_smooth_iterations: IntProperty(
+        name="法线平滑",
+        description=(
+            "边保护法线平滑迭代次数；细碎扫描网格建议 1~3，"
+            "可抑制噪声让硬边更完整，0 表示不平滑"
+        ),
+        default=2,
+        min=0,
+        max=10,
+        soft_max=5,
+    )
     region_ignore_discrete: BoolProperty(
         name="忽略离散面",
         description="忽略面积过小的领域（相对网格总面积）",

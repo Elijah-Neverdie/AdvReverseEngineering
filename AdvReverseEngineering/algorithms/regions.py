@@ -5,14 +5,17 @@
 领域（Region）自动分割算法。
 
 参考 Geomagic Design X 的 Auto Segment 思路：
-    1. 以共享边为邻接
-    2. 相邻面法线夹角不超过阈值则合并
+    1. 边保护法线平滑，抑制扫描噪声但不软化硬边
+    2. 种子区域生长：候选面须同时接近相邻面法线与领域平均法线，
+       杜绝链式合并越过圆角/硬边的“泄漏”
     3. 按网格总面积占比过滤离散小领域
     4. 为有效领域生成稳定可复现的随机色
 """
 
 from __future__ import annotations
 
+from collections import deque
+from math import sqrt
 from typing import TypedDict
 
 import numpy as np
@@ -35,45 +38,171 @@ class RegionSegmentationResult(TypedDict):
     total_area: float
 
 
-def _union_find_labels(
-    face_count: int,
-    face_a: np.ndarray,
-    face_b: np.ndarray,
-    merge_mask: np.ndarray,
+def smooth_face_normals(
+    normals: np.ndarray,
+    areas: np.ndarray,
+    topology: FaceTopology,
+    iterations: int,
+    edge_angle_limit_deg: float = 30.0,
 ) -> np.ndarray:
-    """对可合并的邻接边执行并查集，返回每面根标签。"""
-    parent = np.arange(face_count, dtype=np.int32)
+    """
+    边保护的面法线平滑，抑制扫描噪声。
 
-    def find(index: int) -> int:
-        root = index
-        while parent[root] != root:
-            root = int(parent[root])
-        # 路径压缩
-        while parent[index] != index:
-            nxt = int(parent[index])
-            parent[index] = root
-            index = nxt
-        return root
+    仅对夹角不超过 edge_angle_limit_deg 的邻接面互相平均，
+    硬边（如 90° 棱）两侧法线不会互相污染。全程 NumPy 向量化。
+    """
+    face_count = len(normals)
+    if iterations <= 0 or face_count == 0:
+        return np.asarray(normals, dtype=np.float64)
 
-    for left, right, should_merge in zip(
-        face_a.tolist(),
-        face_b.tolist(),
-        merge_mask.tolist(),
-    ):
-        if not should_merge:
+    face_a = topology["edge_face_a"]
+    face_b = topology["edge_face_b"]
+    if len(face_a) == 0:
+        return np.asarray(normals, dtype=np.float64)
+
+    result = np.asarray(normals, dtype=np.float64).copy()
+    weights = np.maximum(np.asarray(areas, dtype=np.float64), 1e-12)
+    cos_limit = float(np.cos(np.radians(max(edge_angle_limit_deg, 0.0))))
+
+    for _ in range(int(iterations)):
+        dots = np.sum(result[face_a] * result[face_b], axis=1)
+        mask = dots >= cos_limit
+        keep_a = face_a[mask]
+        keep_b = face_b[mask]
+
+        accumulated = result * weights[:, None]
+        if len(keep_a):
+            for axis in range(3):
+                accumulated[:, axis] += np.bincount(
+                    keep_a,
+                    weights=result[keep_b, axis] * weights[keep_b],
+                    minlength=face_count,
+                )
+                accumulated[:, axis] += np.bincount(
+                    keep_b,
+                    weights=result[keep_a, axis] * weights[keep_a],
+                    minlength=face_count,
+                )
+
+        lengths = np.linalg.norm(accumulated, axis=1, keepdims=True)
+        lengths = np.maximum(lengths, 1e-12)
+        result = accumulated / lengths
+
+    return result
+
+
+def _seed_order_by_flatness(
+    face_count: int,
+    normals: np.ndarray,
+    topology: FaceTopology,
+) -> np.ndarray:
+    """
+    种子顺序：局部法线变化最小（最平坦）的面优先。
+
+    先从平坦处生长可以让平面/圆柱等特征先占据领域，
+    圆角过渡带留到最后自成小领域，便于按面积过滤。
+    """
+    face_a = topology["edge_face_a"]
+    face_b = topology["edge_face_b"]
+    min_dot = np.ones(face_count, dtype=np.float64)
+    if len(face_a):
+        dots = np.sum(normals[face_a] * normals[face_b], axis=1)
+        np.minimum.at(min_dot, face_a, dots)
+        np.minimum.at(min_dot, face_b, dots)
+    return np.argsort(-min_dot, kind="stable")
+
+
+def _grow_regions(
+    normals: np.ndarray,
+    areas: np.ndarray,
+    topology: FaceTopology,
+    cos_limit: float,
+) -> np.ndarray:
+    """
+    种子区域生长，输出稠密领域标签（0..N-1）。
+
+    双重判据：
+        1. 候选面与其接壤面法线夹角 <= 阈值（局部平滑性）
+        2. 候选面与领域面积加权平均法线夹角 <= 阈值（全局一致性）
+    判据 2 阻止链式合并沿圆角逐面漂移、越过硬边。
+
+    内层循环使用 Python list 索引与标量运算，
+    实测比逐元素访问 NumPy 标量快数倍，可支撑百万面网格。
+    """
+    face_count = len(normals)
+    offsets = topology["adjacency_offsets"].tolist()
+    adjacency = topology["adjacency_indices"].tolist()
+
+    nx = normals[:, 0].tolist()
+    ny = normals[:, 1].tolist()
+    nz = normals[:, 2].tolist()
+    weight = np.maximum(
+        np.asarray(areas, dtype=np.float64),
+        1e-12,
+    ).tolist()
+
+    seed_order = _seed_order_by_flatness(face_count, normals, topology)
+
+    labels = [-1] * face_count
+    region_id = 0
+
+    for seed in seed_order.tolist():
+        if labels[seed] != -1:
             continue
-        root_a = find(int(left))
-        root_b = find(int(right))
-        if root_a != root_b:
-            if root_a < root_b:
-                parent[root_b] = root_a
-            else:
-                parent[root_a] = root_b
+        labels[seed] = region_id
+        seed_weight = weight[seed]
+        sum_x = nx[seed] * seed_weight
+        sum_y = ny[seed] * seed_weight
+        sum_z = nz[seed] * seed_weight
 
-    labels = np.empty(face_count, dtype=np.int32)
-    for index in range(face_count):
-        labels[index] = find(index)
-    return labels
+        queue = deque((seed,))
+        while queue:
+            face = queue.popleft()
+            length = sqrt(
+                sum_x * sum_x + sum_y * sum_y + sum_z * sum_z
+            )
+            if length < 1e-12:
+                mean_x, mean_y, mean_z = nx[face], ny[face], nz[face]
+            else:
+                mean_x = sum_x / length
+                mean_y = sum_y / length
+                mean_z = sum_z / length
+
+            face_x = nx[face]
+            face_y = ny[face]
+            face_z = nz[face]
+
+            for slot in range(offsets[face], offsets[face + 1]):
+                neighbor = adjacency[slot]
+                if labels[neighbor] != -1:
+                    continue
+                cand_x = nx[neighbor]
+                cand_y = ny[neighbor]
+                cand_z = nz[neighbor]
+                # 判据 1: 与接壤面法线接近
+                if (
+                    cand_x * face_x
+                    + cand_y * face_y
+                    + cand_z * face_z
+                ) < cos_limit:
+                    continue
+                # 判据 2: 与领域平均法线接近（防泄漏关键）
+                if (
+                    cand_x * mean_x
+                    + cand_y * mean_y
+                    + cand_z * mean_z
+                ) < cos_limit:
+                    continue
+                labels[neighbor] = region_id
+                cand_weight = weight[neighbor]
+                sum_x += cand_x * cand_weight
+                sum_y += cand_y * cand_weight
+                sum_z += cand_z * cand_weight
+                queue.append(neighbor)
+
+        region_id += 1
+
+    return np.asarray(labels, dtype=np.int32)
 
 
 def generate_region_colors(
@@ -130,17 +259,21 @@ def segment_regions_by_normal(
     angle_threshold_deg: float = 15.0,
     ignore_discrete: bool = True,
     min_area_ratio: float = 0.001,
+    smooth_iterations: int = 0,
 ) -> RegionSegmentationResult:
     """
-    按法线阈值进行领域分割。
+    按法线阈值进行领域分割（种子区域生长，防泄漏）。
 
     参数:
         normals: (F, 3) 单位法线
         areas: (F,) 面面积（任意一致尺度）
         topology: 共享边邻接拓扑
-        angle_threshold_deg: 相邻面法线最大夹角（度）
+        angle_threshold_deg: 法线最大夹角（度），同时约束
+            相邻面与领域平均法线两个判据
         ignore_discrete: 是否按面积占比忽略小领域
         min_area_ratio: 相对网格总面积的最小占比阈值
+        smooth_iterations: 边保护法线平滑迭代次数，
+            细碎扫描网格建议 1~3，规则网格可为 0
     """
     face_count = len(normals)
     if face_count == 0:
@@ -160,43 +293,42 @@ def segment_regions_by_normal(
         areas = np.ones(face_count, dtype=np.float64)
         total_area = float(face_count)
 
-    face_a = topology["edge_face_a"]
-    face_b = topology["edge_face_b"]
-    if len(face_a) == 0:
-        labels = np.arange(face_count, dtype=np.int32)
-    else:
-        dots = np.sum(
-            normals[face_a] * normals[face_b],
-            axis=1,
-        )
-        cos_limit = float(
-            np.cos(np.radians(max(angle_threshold_deg, 0.0)))
-        )
-        merge_mask = dots >= cos_limit
-        labels = _union_find_labels(
-            face_count,
-            face_a,
-            face_b,
-            merge_mask,
+    cos_limit = float(
+        np.cos(np.radians(max(angle_threshold_deg, 0.0)))
+    )
+
+    # 平滑保护角取阈值两倍（至少 30°）：既能平均噪声，
+    # 又不会让真正的硬边两侧互相污染。
+    if smooth_iterations > 0:
+        smooth_limit = max(float(angle_threshold_deg) * 2.0, 30.0)
+        normals = smooth_face_normals(
+            normals,
+            areas,
+            topology,
+            iterations=smooth_iterations,
+            edge_angle_limit_deg=smooth_limit,
         )
 
-    # 将并查集根标签压缩为稠密临时编号，便于面积聚合。
-    unique_roots, inverse = np.unique(labels, return_inverse=True)
-    temp_ids = inverse.astype(np.int32, copy=False)
+    if len(topology["edge_face_a"]) == 0:
+        temp_ids = np.arange(face_count, dtype=np.int32)
+    else:
+        temp_ids = _grow_regions(normals, areas, topology, cos_limit)
+
+    region_total = int(temp_ids.max()) + 1 if face_count else 0
     region_areas = np.bincount(
         temp_ids,
         weights=areas,
-        minlength=len(unique_roots),
+        minlength=region_total,
     )
 
-    keep_mask = np.ones(len(unique_roots), dtype=bool)
+    keep_mask = np.ones(region_total, dtype=bool)
     ignored_region_count = 0
     if ignore_discrete and min_area_ratio > 0.0:
         area_limit = total_area * float(min_area_ratio)
         keep_mask = region_areas >= area_limit
         ignored_region_count = int((~keep_mask).sum())
 
-    remap = np.full(len(unique_roots), REGION_IGNORED_ID, dtype=np.int32)
+    remap = np.full(region_total, REGION_IGNORED_ID, dtype=np.int32)
     kept_indices = np.flatnonzero(keep_mask)
     remap[kept_indices] = np.arange(len(kept_indices), dtype=np.int32)
     region_ids = remap[temp_ids]

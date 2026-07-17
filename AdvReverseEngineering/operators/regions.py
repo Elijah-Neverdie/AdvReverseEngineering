@@ -124,6 +124,9 @@ class ARE_OT_segment_regions(bpy.types.Operator):
                         scene_props.region_ignore_discrete
                     ),
                     min_area_ratio=min_ratio,
+                    smooth_iterations=int(
+                        scene_props.region_smooth_iterations
+                    ),
                 )
 
                 step("写入领域属性")
