@@ -455,10 +455,13 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         """侧栏确认按钮直接调用：提交并结束模态显示。"""
         if getattr(self, "_closed", False):
             return
-        if not self._committed:
-            self._commit_to_mesh(context)
-        self._finish_mode(context, cancelled=False)
-        self._closed = True
+        try:
+            if not self._committed:
+                self._commit_to_mesh(context)
+        finally:
+            # 无论提交是否异常，都保证退出合并模式。
+            self._finish_mode(context, cancelled=False)
+            self._closed = True
 
     def _commit_to_mesh(self, context: bpy.types.Context) -> None:
         """仅在确认时写入一次 Mesh。"""
@@ -853,7 +856,12 @@ class ARE_OT_split_regions(bpy.types.Operator):
         """侧栏确认按钮直接调用：提交并结束模态显示。"""
         if getattr(self, "_closed", False):
             return True
-        if not self._commit_splits(context):
+        committed = False
+        try:
+            committed = self._commit_splits(context)
+        except Exception:
+            committed = False
+        if not committed:
             return False
         self._alive = False
         self._cleanup_ui(context)

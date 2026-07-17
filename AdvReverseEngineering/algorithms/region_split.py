@@ -5,12 +5,35 @@
 
 from __future__ import annotations
 
+import colorsys
 import heapq
 from typing import Iterable
 
 import numpy as np
 
 from .regions import REGION_IGNORED_ID, generate_region_colors
+
+
+def _contrast_color(base_rgba: np.ndarray, offset_index: int = 0) -> np.ndarray:
+    """
+    生成与原领域强对比的颜色（互补色相 + 高饱和度）。
+
+    拆分预览用它把新分出的领域与原领域清晰区分开。
+    """
+    base = np.asarray(base_rgba, dtype=np.float32).ravel()
+    r, g, b = float(base[0]), float(base[1]), float(base[2])
+    alpha = float(base[3]) if len(base) >= 4 else 0.55
+    h, s, v = colorsys.rgb_to_hsv(
+        min(max(r, 0.0), 1.0),
+        min(max(g, 0.0), 1.0),
+        min(max(b, 0.0), 1.0),
+    )
+    # 互补色相，多分量再各自错开，避免撞色。
+    h = (h + 0.5 + 0.137 * offset_index) % 1.0
+    s = min(1.0, max(0.75, s * 1.25 + 0.2))
+    v = min(1.0, max(0.85, v + 0.15))
+    nr, ng, nb = colorsys.hsv_to_rgb(h, s, v)
+    return np.array([nr, ng, nb, alpha], dtype=np.float32)
 
 
 def prepare_edge_costs(
@@ -436,21 +459,17 @@ def split_region_by_cut_edges(
             continue
 
         components.sort(key=len, reverse=True)
-        # 最大分量保留原 rid；其余分配新 id
-        for component in components[1:]:
+        # 最大分量保留原 rid；其余分配新 id，并用对比色以便预览区分。
+        base = colors[rid] if rid < len(colors) else np.array(
+            [0.5, 0.5, 0.8, 0.55],
+            dtype=np.float32,
+        )
+        for offset_index, component in enumerate(components[1:]):
             new_rid = next_id
             next_id += 1
             for face in component:
                 ids[face] = new_rid
-            # 新色：基于原色微扰色相
-            base = colors[rid] if rid < len(colors) else np.array(
-                [0.5, 0.5, 0.8, 0.45],
-                dtype=np.float32,
-            )
-            shift = generate_region_colors(1, seed=1000 + new_rid)[0]
-            mixed = 0.35 * base + 0.65 * shift
-            mixed[3] = base[3]
-            new_color_rows.append(mixed.astype(np.float32))
+            new_color_rows.append(_contrast_color(base, offset_index))
 
     region_count = int(ids.max()) + 1 if np.any(ids >= 0) else 0
     if new_color_rows:
