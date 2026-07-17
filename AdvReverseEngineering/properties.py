@@ -130,6 +130,26 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         description="下次点击将使用的摆正策略",
         default="PCA 主方向",
     )
+    orientation_status: StringProperty(
+        name="摆正状态",
+        description="最近一次使用的方案序号与名称",
+        default="",
+    )
+    orientation_status_detail: StringProperty(
+        name="底面高亮状态",
+        description="最近一次识别并高亮的底面数量",
+        default="",
+    )
+    orientation_status_next: StringProperty(
+        name="下一摆正方案",
+        description="再次点击时将使用的方案",
+        default="",
+    )
+    orientation_object_name: StringProperty(
+        name="摆正对象",
+        description="当前循环方案所对应的对象名称",
+        default="",
+    )
     highlight_object: PointerProperty(
         name="高亮对象",
         description="底面高亮显示的目标对象",

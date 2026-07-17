@@ -165,3 +165,38 @@ def apply_rotation_to_object(
     translation = Matrix.Translation(pivot_vec)
     translation_inv = Matrix.Translation(-pivot_vec)
     obj.matrix_world = translation @ rot_mat @ translation_inv @ obj.matrix_world
+
+
+def set_object_origin_world(
+    obj: "bpy.types.Object",
+    world_point: np.ndarray,
+) -> None:
+    """
+    在不改变网格世界位置的前提下，将对象原点设置到指定世界坐标。
+
+    编辑模式直接平移 BMesh 顶点；对象模式变换 Mesh datablock。
+    """
+    import bmesh
+    from mathutils import Matrix, Vector
+
+    target = Vector(world_point.tolist())
+    local_offset = obj.matrix_world.inverted() @ target
+
+    if obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(obj.data)
+        translation = Matrix.Translation(-local_offset)
+        bmesh.ops.transform(
+            bm,
+            matrix=translation,
+            verts=bm.verts,
+        )
+        bmesh.update_edit_mesh(
+            obj.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+    else:
+        obj.data.transform(Matrix.Translation(-local_offset))
+        obj.data.update()
+
+    obj.matrix_world.translation = target

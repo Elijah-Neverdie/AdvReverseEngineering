@@ -12,7 +12,6 @@ from ..utils.mesh import MeshData
 
 def detect_bottom_face_indices(
     mesh_data: MeshData,
-    mesh_polygons,
     z_tolerance_ratio: float = 0.02,
     normal_threshold: float = 0.75,
 ) -> list[int]:
@@ -23,32 +22,25 @@ def detect_bottom_face_indices(
     """
     vertices = mesh_data["vertices"]
     normals = mesh_data["normals"]
+    centers = mesh_data["face_centers"]
 
-    if len(vertices) == 0 or len(mesh_polygons) == 0:
+    if len(vertices) == 0 or len(centers) == 0:
         return []
 
     min_z = float(vertices[:, 2].min())
     z_range = float(vertices[:, 2].max() - min_z)
     z_tolerance = max(z_range * z_tolerance_ratio, 1e-5)
 
-    bottom_faces: list[int] = []
+    center_z = centers[:, 2]
+    down_alignment = -normals[:, 2]
 
-    for face_index, polygon in enumerate(mesh_polygons):
-        vert_indices = polygon.vertices
-        face_vertices = vertices[vert_indices]
-        face_z_max = float(face_vertices[:, 2].max())
-        face_z_mean = float(face_vertices[:, 2].mean())
-        # 法线朝下程度（越接近 -Z 越大）
-        normal_alignment = float(-normals[face_index][2])
-
-        # 位于最低高度带内的面
-        if face_z_max <= min_z + z_tolerance:
-            bottom_faces.append(face_index)
-            continue
-
-        # 法线朝下且接近底面
-        if normal_alignment >= normal_threshold:
-            if face_z_mean <= min_z + z_tolerance * 3.0:
-                bottom_faces.append(face_index)
-
-    return bottom_faces
+    # 批量筛选：最低高度带内的近水平面，或略高但法线明确朝下的面。
+    lowest_band = (
+        (center_z <= min_z + z_tolerance)
+        & (down_alignment >= 0.25)
+    )
+    downward_band = (
+        (center_z <= min_z + z_tolerance * 3.0)
+        & (down_alignment >= normal_threshold)
+    )
+    return np.flatnonzero(lowest_band | downward_band).tolist()

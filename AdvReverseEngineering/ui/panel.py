@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import bpy
 
-from ..registration import TAB_CATEGORY
+from ..registration import SCENE_PROP_NAME, TAB_CATEGORY
 
 
 def _prefs(context: bpy.types.Context):
@@ -42,6 +42,16 @@ class ARE_PT_main(bpy.types.Panel):
             text="自动摆正",
             icon="ORIENTATION_GLOBAL",
         )
+
+        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        if scene_props is not None and scene_props.orientation_status:
+            status_box = layout.box()
+            status_box.label(
+                text=scene_props.orientation_status,
+                icon="INFO",
+            )
+            status_box.label(text=scene_props.orientation_status_detail)
+            status_box.label(text=scene_props.orientation_status_next)
 
         layout.separator()
         box = layout.box()

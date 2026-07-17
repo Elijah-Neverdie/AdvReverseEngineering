@@ -13,6 +13,7 @@ from ..registration import SCENE_PROP_NAME
 
 # 视口绘制句柄
 _DRAW_HANDLE = None
+_OVERLAY_CACHE: dict[int, list[tuple[float, float, float]]] = {}
 
 # 紫色半透明 (R, G, B, A)
 HIGHLIGHT_COLOR = (0.78, 0.22, 1.0, 0.45)
@@ -28,6 +29,10 @@ def set_bottom_face_highlight(
 ) -> None:
     """保存底面索引并绑定到场景，触发视口重绘。"""
     obj[BOTTOM_FACES_ATTR] = face_indices
+    _OVERLAY_CACHE[obj.as_pointer()] = _collect_bottom_face_coords(
+        obj,
+        face_indices,
+    )
     scene_props = getattr(context.scene, SCENE_PROP_NAME)
     scene_props.highlight_object = obj
 
@@ -43,6 +48,7 @@ def clear_bottom_face_highlight(context: bpy.types.Context) -> None:
     old_obj = scene_props.highlight_object
     if old_obj and BOTTOM_FACES_ATTR in old_obj:
         del old_obj[BOTTOM_FACES_ATTR]
+        _OVERLAY_CACHE.pop(old_obj.as_pointer(), None)
     scene_props.highlight_object = None
 
 
@@ -54,11 +60,11 @@ def _collect_bottom_face_coords(
     mesh = obj.data
     matrix = obj.matrix_world
     coords: list[tuple[float, float, float]] = []
-    index_set = set(face_indices)
-
-    for face_index, polygon in enumerate(mesh.polygons):
-        if face_index not in index_set:
+    polygon_count = len(mesh.polygons)
+    for face_index in face_indices:
+        if face_index < 0 or face_index >= polygon_count:
             continue
+        polygon = mesh.polygons[face_index]
 
         vert_indices = polygon.vertices
         if len(vert_indices) < 3:
@@ -95,7 +101,10 @@ def draw_bottom_faces_overlay() -> None:
     if not face_indices:
         return
 
-    coords = _collect_bottom_face_coords(obj, face_indices)
+    coords = _OVERLAY_CACHE.get(obj.as_pointer())
+    if coords is None:
+        coords = _collect_bottom_face_coords(obj, list(face_indices))
+        _OVERLAY_CACHE[obj.as_pointer()] = coords
     if not coords:
         return
 
@@ -131,3 +140,4 @@ def unregister_draw_handler() -> None:
         return
     bpy.types.SpaceView3D.draw_handler_remove(_DRAW_HANDLE, "WINDOW")
     _DRAW_HANDLE = None
+    _OVERLAY_CACHE.clear()

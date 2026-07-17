@@ -16,6 +16,7 @@ class MeshData(TypedDict):
     vertices: np.ndarray
     normals: np.ndarray
     areas: np.ndarray
+    face_centers: np.ndarray
     centroid: np.ndarray
 
 
@@ -68,10 +69,16 @@ def extract_mesh_data(obj: "bpy.types.Object") -> MeshData:
     face_count = len(mesh.polygons)
     normals = np.empty(face_count * 3, dtype=np.float64)
     areas = np.empty(face_count, dtype=np.float64)
+    face_centers = np.empty(face_count * 3, dtype=np.float64)
     mesh.polygons.foreach_get("normal", normals)
     mesh.polygons.foreach_get("area", areas)
+    mesh.polygons.foreach_get("center", face_centers)
     normals = normals.reshape(face_count, 3)
+    face_centers = face_centers.reshape(face_count, 3)
     normals = (rotation @ normals.T).T
+    center_ones = np.ones((face_count, 1), dtype=np.float64)
+    homogeneous_centers = np.hstack((face_centers, center_ones))
+    face_centers = (matrix @ homogeneous_centers.T).T[:, :3]
 
     lengths = np.linalg.norm(normals, axis=1, keepdims=True)
     lengths = np.maximum(lengths, 1e-12)
@@ -81,5 +88,52 @@ def extract_mesh_data(obj: "bpy.types.Object") -> MeshData:
         vertices=vertices,
         normals=normals,
         areas=areas,
+        face_centers=face_centers,
         centroid=vertices.mean(axis=0),
     )
+
+
+def extract_selected_world_points(
+    obj: "bpy.types.Object",
+) -> np.ndarray:
+    """
+    读取编辑模式下选中的点、边或面所包含的唯一顶点。
+
+    直接访问当前 EditMesh，确保尚未提交到 Mesh datablock 的选择状态
+    也能被正确读取。
+    """
+    import bmesh
+
+    if obj.mode != "EDIT":
+        return np.empty((0, 3), dtype=np.float64)
+
+    mesh = obj.data
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+
+    selected_indices: set[int] = {
+        vertex.index for vertex in bm.verts if vertex.select
+    }
+    for edge in bm.edges:
+        if edge.select:
+            selected_indices.update(vertex.index for vertex in edge.verts)
+    for face in bm.faces:
+        if face.select:
+            selected_indices.update(vertex.index for vertex in face.verts)
+
+    if not selected_indices:
+        return np.empty((0, 3), dtype=np.float64)
+
+    ordered_indices = np.fromiter(
+        sorted(selected_indices),
+        dtype=np.int64,
+    )
+    local = np.empty((len(ordered_indices), 3), dtype=np.float64)
+    for row, vertex_index in enumerate(ordered_indices):
+        local[row] = bm.verts[int(vertex_index)].co
+
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    ones = np.ones((len(local), 1), dtype=np.float64)
+    homogeneous = np.hstack((local, ones))
+    return (matrix @ homogeneous.T).T[:, :3]
