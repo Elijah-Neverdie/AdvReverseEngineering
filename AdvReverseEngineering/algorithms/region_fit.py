@@ -26,6 +26,8 @@ _MAX_CORNER_CANDIDATES = 12
 _STRONG_CONCAVE_ANGLE_DEG = 35.0
 # 调试边：按折角拆分时允许的最大角点数（不再压成 3/4 边）
 _MAX_SPLIT_CORNERS = 64
+# 相对闭环周长过短的碎段（常见于 T 接缝锯齿）并入邻边
+_MIN_SEGMENT_LOOP_FRAC = 0.025
 # 锯齿边界：隔 2/4/8/16 点取弦，多尺度共识判定真尖角
 _CORNER_SAMPLE_STRIDES = (2, 4, 8, 16)
 _CORNER_STRIDE_MIN_VOTES = 2
@@ -1769,6 +1771,82 @@ def split_polyline_at_significant_folds(
     return segments if segments else [pts.copy()]
 
 
+def resplit_sides_at_interior_folds(
+    sides: Sequence[np.ndarray],
+    origin: np.ndarray,
+    axis_u: np.ndarray,
+    axis_v: np.ndarray,
+    fold_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+) -> list[np.ndarray]:
+    """
+    在已拆边的中段再检凸/凹折角并断开。
+
+    解决「整段同色却含明显折弯」：首轮角点漏检时，中段折角仍应拆段。
+    """
+    result: list[np.ndarray] = []
+    for side in sides:
+        pts = _as_float_array(side)
+        if len(pts) < 5:
+            result.append(pts.copy())
+            continue
+        side_2d = project_points_to_plane(pts, origin, axis_u, axis_v)
+        folds = detect_side_fold_indices(
+            side_2d,
+            fold_angle_deg=fold_angle_deg,
+            min_separation_frac=0.08,
+        )
+        if not folds:
+            result.append(pts.copy())
+            continue
+        cuts = sorted({0, len(pts) - 1, *[int(i) for i in folds]})
+        for start, end in zip(cuts[:-1], cuts[1:]):
+            if end > start:
+                result.append(pts[start : end + 1].copy())
+    return result
+
+
+def merge_short_boundary_sides(
+    sides: Sequence[np.ndarray],
+    min_length: float,
+    min_sides: int = 2,
+) -> list[np.ndarray]:
+    """
+    把过短碎段并入邻边（优先并向转角更平的一侧）。
+
+    抑制 T 接缝处网格锯齿造成的短色段。
+    """
+    result = [np.asarray(side, dtype=np.float64).copy() for side in sides]
+    threshold = float(max(min_length, 0.0))
+    guard = 0
+    while len(result) > int(min_sides):
+        lengths = [float(polyline_length(side)) for side in result]
+        short_i = int(np.argmin(lengths))
+        if lengths[short_i] >= threshold:
+            break
+        left = (short_i - 1) % len(result)
+        right = (short_i + 1) % len(result)
+        turn_left = _junction_turn_deg(result[left], result[short_i])
+        turn_right = _junction_turn_deg(result[short_i], result[right])
+        if turn_left <= turn_right:
+            merge_a, merge_b = left, short_i
+        else:
+            merge_a, merge_b = short_i, right
+        merged = np.vstack((result[merge_a][:-1], result[merge_b]))
+        if merge_b > merge_a:
+            result[merge_a] = merged
+            del result[merge_b]
+        else:
+            result = [merged] + [
+                result[index]
+                for index in range(len(result))
+                if index not in {merge_a, merge_b}
+            ]
+        guard += 1
+        if guard > len(sides) + 8:
+            break
+    return result
+
+
 def make_segment_color(seed: int) -> tuple[float, float, float, float]:
     """由种子生成饱和、互异感强的 RGBA（确定性随机）。"""
     rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
@@ -1972,25 +2050,44 @@ def extract_island_longest_sides(
             max_turn_deg=corner_angle_deg,
             min_sides=2,
         )
-        # 强制相邻边共享端点，消除数值缝隙
-        for index in range(len(sides_3d)):
-            nxt = (index + 1) % len(sides_3d)
-            shared = 0.5 * (sides_3d[index][-1] + sides_3d[nxt][0])
-            sides_3d[index] = sides_3d[index].copy()
-            sides_3d[nxt] = sides_3d[nxt].copy()
-            sides_3d[index][-1] = shared
-            sides_3d[nxt][0] = shared
 
-        # 合并后仍留在边中段的凹折也要标记
+        def _share_side_endpoints(sides: list[np.ndarray]) -> list[np.ndarray]:
+            shared_sides = [side.copy() for side in sides]
+            for index in range(len(shared_sides)):
+                nxt = (index + 1) % len(shared_sides)
+                shared = 0.5 * (shared_sides[index][-1] + shared_sides[nxt][0])
+                shared_sides[index][-1] = shared
+                shared_sides[nxt][0] = shared
+            return shared_sides
+
+        sides_3d = _share_side_endpoints(sides_3d)
+        # 中段凸/凹折角再拆（避免左侧折弯仍整段同色）
+        sides_3d = resplit_sides_at_interior_folds(
+            sides_3d,
+            origin,
+            axis_u,
+            axis_v,
+            fold_angle_deg=corner_angle_deg,
+        )
+        sides_3d = _share_side_endpoints(sides_3d)
+        loop_len = float(polyline_length(np.vstack((loop_rs, loop_rs[:1]))))
+        # 吃掉 T 接缝等造成的过短碎段
+        sides_3d = merge_short_boundary_sides(
+            sides_3d,
+            min_length=max(loop_len * _MIN_SEGMENT_LOOP_FRAC, 1e-4),
+            min_sides=2,
+        )
+        sides_3d = _share_side_endpoints(sides_3d)
+
+        # 凹折标记（含中段）
         for side in sides_3d:
             if len(side) < 5:
                 continue
             side_2d = project_points_to_plane(side, origin, axis_u, axis_v)
-            mid_folds = detect_concave_fold_indices(
+            mid_folds = detect_side_fold_indices(
                 side_2d,
                 fold_angle_deg=corner_angle_deg,
-                closed=False,
-                max_folds=_MAX_CONCAVE_FOLDS,
+                min_separation_frac=0.08,
             )
             for fold_index in mid_folds:
                 island_folds.append(side[int(fold_index)].copy())
@@ -1998,9 +2095,6 @@ def extract_island_longest_sides(
         # 去重：过近的折角只留一个
         if island_folds:
             deduped: list[np.ndarray] = []
-            loop_len = float(
-                polyline_length(np.vstack((loop_rs, loop_rs[:1])))
-            )
             min_fold_dist = max(loop_len * 0.015, 1e-4)
             for point in island_folds:
                 if all(

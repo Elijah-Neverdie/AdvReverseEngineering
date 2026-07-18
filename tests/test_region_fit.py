@@ -25,10 +25,12 @@ from AdvReverseEngineering.algorithms.region_fit import (
     filter_significant_boundary_loops,
     fit_cubic_bezier_controls,
     fit_region_surface,
+    merge_short_boundary_sides,
     point_to_polyline_distance,
     polyline_length,
     resample_closed_polyline,
     resample_polyline,
+    resplit_sides_at_interior_folds,
     sample_cubic_bezier,
     select_primary_boundary_loop,
     side_interior_max_turn_deg,
@@ -1006,6 +1008,51 @@ class FitRegionSurfaceTests(unittest.TestCase):
         np.testing.assert_allclose(segments[0][-1], pts[3])
         np.testing.assert_allclose(segments[1][0], pts[3])
         np.testing.assert_allclose(segments[1][-1], pts[-1])
+
+    def test_resplit_mid_kink_and_merge_t_junction_stub(self) -> None:
+        """中段折弯应再拆；T 接缝短碎段应并回。"""
+        # 长边中段 90° 折弯（模拟左侧漏检后仍整段）
+        kinked = np.vstack(
+            (
+                np.column_stack(
+                    (np.linspace(0.0, 1.0, 20), np.zeros(20), np.zeros(20))
+                ),
+                np.column_stack(
+                    (np.ones(19), np.linspace(0.0, 1.0, 20)[1:], np.zeros(19))
+                ),
+            )
+        )
+        origin = np.zeros(3)
+        axis_u = np.array([1.0, 0.0, 0.0])
+        axis_v = np.array([0.0, 1.0, 0.0])
+        resplit = resplit_sides_at_interior_folds(
+            [kinked],
+            origin,
+            axis_u,
+            axis_v,
+            fold_angle_deg=35.0,
+        )
+        self.assertGreaterEqual(len(resplit), 2)
+
+        # 竖直长边中间夹一段极短水平 stub（T 接缝）
+        top = np.column_stack(
+            (np.zeros(12), np.linspace(1.0, 0.55, 12), np.zeros(12))
+        )
+        stub = np.array(
+            [[0.0, 0.55, 0.0], [0.04, 0.55, 0.0], [0.0, 0.50, 0.0]],
+            dtype=np.float64,
+        )
+        bottom = np.column_stack(
+            (np.zeros(12), np.linspace(0.50, 0.0, 12), np.zeros(12))
+        )
+        merged = merge_short_boundary_sides(
+            [top, stub, bottom],
+            min_length=0.2,
+            min_sides=2,
+        )
+        self.assertEqual(len(merged), 2)
+        self.assertGreater(polyline_length(merged[0]), 0.2)
+        self.assertGreater(polyline_length(merged[1]), 0.2)
 
     def test_detect_side_fold_indices_keeps_sharp_turns(self) -> None:
         pts = []
