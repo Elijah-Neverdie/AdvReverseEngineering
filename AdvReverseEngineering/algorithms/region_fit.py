@@ -976,12 +976,8 @@ def merge_nearby_loops_to_outer_contours(
                     }
                 )
                 continue
-            # 单环深凹口：外包络消去内缝
-            envelope, _band_sides, _samples = combine_boundary_islands(
-                cluster_loops,
-                verts,
-                prefer_outer_envelope=True,
-            )
+            # 单环深凹口：并集外轮廓消去内缝
+            envelope = outer_contour_from_boundary_loops(cluster_loops, verts)
             items.append(
                 {
                     "points": _as_float_array(envelope).copy(),
@@ -990,12 +986,8 @@ def merge_nearby_loops_to_outer_contours(
                 }
             )
             continue
-        envelope, _band_sides, _samples = combine_boundary_islands(
-            cluster_loops,
-            verts,
-            prefer_outer_envelope=True,
-        )
-        # 外轮廓即新孤岛；岛间内边在包络过程中已被消去
+        envelope = outer_contour_from_boundary_loops(cluster_loops, verts)
+        # 外轮廓即新孤岛；岛间内边在凸包外轮廓中已被消去
         items.append(
             {
                 "points": _as_float_array(envelope).copy(),
@@ -1004,6 +996,94 @@ def merge_nearby_loops_to_outer_contours(
             }
         )
     return items
+
+
+def _convex_hull_2d(points_2d: np.ndarray) -> np.ndarray:
+    """Andrew 单调链凸包，返回逆时针顶点（不重复首点）。"""
+    pts = _as_float_array(points_2d)
+    if len(pts) == 0:
+        return pts.reshape(0, 2)
+    # 去重
+    rounded = np.round(pts, decimals=9)
+    _, unique_idx = np.unique(rounded, axis=0, return_index=True)
+    pts = pts[np.sort(unique_idx)]
+    if len(pts) <= 2:
+        return pts.copy()
+
+    order = np.lexsort((pts[:, 1], pts[:, 0]))
+    ordered = pts[order]
+
+    def _cross(o, a, b) -> float:
+        return float((a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
+
+    lower: list[np.ndarray] = []
+    for point in ordered:
+        while len(lower) >= 2 and _cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    upper: list[np.ndarray] = []
+    for point in ordered[::-1]:
+        while len(upper) >= 2 and _cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    hull = np.asarray(lower[:-1] + upper[:-1], dtype=np.float64)
+    if len(hull) >= 3 and _signed_area_2d(hull) < 0.0:
+        hull = hull[::-1]
+    return hull
+
+
+def outer_contour_from_boundary_loops(
+    loops: Sequence[Sequence[int]],
+    vertices: np.ndarray,
+    bridge_gap_frac: float = 0.05,
+    grid_size: int = 192,
+) -> np.ndarray:
+    """
+    将多岛/深凹口边界提取为真正外轮廓。
+
+    策略：
+      1) PCA 平面上对所有边界采样点做凸包（消掉岛间梯子/内缝）
+      2) 若凸包退化，再回退栅格并集轮廓 / 条带包络
+    """
+    _ = bridge_gap_frac, grid_size  # 保留参数兼容；凸包路径不需要
+    verts = _as_float_array(vertices)
+    loop_pts = [
+        verts[np.asarray(loop, dtype=np.int32)]
+        for loop in loops
+        if len(loop) >= 3
+    ]
+    if not loop_pts:
+        raise RegionFitError("没有可提取外轮廓的边界环")
+    if len(loop_pts) == 1 and not loop_has_internal_corridor(loop_pts[0]):
+        return loop_pts[0].copy()
+
+    all_pts = np.vstack(loop_pts)
+    centroid = all_pts.mean(axis=0)
+    _, _, vh = np.linalg.svd(all_pts - centroid, full_matrices=False)
+    axis_u = _normalize(vh[0])
+    axis_v = _normalize(vh[1])
+
+    samples_2d = []
+    for pts in loop_pts:
+        sampled = resample_closed_polyline(
+            pts,
+            int(np.clip(len(pts) * 2, 48, 160)),
+        )
+        samples_2d.append(
+            project_points_to_plane(sampled, centroid, axis_u, axis_v)
+        )
+    stacked_2d = np.vstack(samples_2d)
+    hull_2d = _convex_hull_2d(stacked_2d)
+    if len(hull_2d) >= 3:
+        return unproject_points_from_plane(hull_2d, centroid, axis_u, axis_v)
+
+    # 退化：退回条带外包络
+    envelope, _, _ = combine_boundary_islands(
+        loops,
+        verts,
+        prefer_outer_envelope=True,
+    )
+    return _as_float_array(envelope).copy()
 
 
 def _label_face_components(
@@ -2643,13 +2723,9 @@ def extract_island_longest_sides(
     if not loops:
         raise RegionFitError("过滤极小碎环后无可用边界")
 
-    # 同一领域全部融为一条外轮廓新孤岛（与曲面拟合一致；消去岛间/内缝边）
+    # 同一领域全部融为一条外轮廓新孤岛（凸包外轮廓，消去岛间/内缝「梯子」边）
     if len(loops) >= 2:
-        envelope, _band, _samples = combine_boundary_islands(
-            loops,
-            verts,
-            prefer_outer_envelope=True,
-        )
+        envelope = outer_contour_from_boundary_loops(loops, verts)
         work_items = [
             {
                 "points": _as_float_array(envelope).copy(),
@@ -2661,11 +2737,7 @@ def extract_island_longest_sides(
         ids = [int(v) for v in loops[0]]
         pts = verts[np.asarray(ids, dtype=np.int32)]
         if loop_has_internal_corridor(pts):
-            envelope, _band, _samples = combine_boundary_islands(
-                [ids],
-                verts,
-                prefer_outer_envelope=True,
-            )
+            envelope = outer_contour_from_boundary_loops([ids], verts)
             work_items = [
                 {
                     "points": _as_float_array(envelope).copy(),
@@ -4075,6 +4147,7 @@ __all__ = (
     "merge_nearby_loops_to_outer_contours",
     "cluster_nearby_boundary_loops",
     "loop_has_internal_corridor",
+    "outer_contour_from_boundary_loops",
     "point_to_polyline_distance",
     "sample_cubic_bezier",
     "polyline_length",

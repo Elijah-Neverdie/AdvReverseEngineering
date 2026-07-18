@@ -23,6 +23,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     extract_island_longest_sides,
     loop_has_internal_corridor,
     merge_nearby_loops_to_outer_contours,
+    outer_contour_from_boundary_loops,
     extract_polyline_keypoints,
     extract_region_boundary_loops,
     filter_handle_outliers,
@@ -1284,7 +1285,7 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertTrue(all(item["loop_ids"] is not None for item in items))
 
     def test_prefer_outer_envelope_keeps_full_bbox(self) -> None:
-        """prefer_outer_envelope 始终保留覆盖全部 island 的外包络。"""
+        """栅格外轮廓覆盖全部 island，不留下岛间内边。"""
         vertices = np.array(
             [
                 [0.0, 0.0, 0.0],
@@ -1299,14 +1300,49 @@ class FitRegionSurfaceTests(unittest.TestCase):
             dtype=np.float64,
         )
         loops = [[0, 1, 2, 3], [4, 5, 6, 7]]
-        envelope, sides, _band = combine_boundary_islands(
-            loops,
-            vertices,
-            prefer_outer_envelope=True,
-        )
-        self.assertGreaterEqual(float(envelope[:, 0].max()), 2.35)
+        envelope = outer_contour_from_boundary_loops(loops, vertices)
+        self.assertAlmostEqual(float(envelope[:, 0].max()), 2.4, places=5)
         self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=5)
-        self.assertIsNotNone(sides)
+        mid_interior = envelope[
+            (envelope[:, 0] > 1.95)
+            & (envelope[:, 0] < 2.15)
+            & (envelope[:, 1] > 0.25)
+            & (envelope[:, 1] < 0.75)
+        ]
+        self.assertEqual(len(mid_interior), 0)
+
+    def test_stacked_strip_islands_no_ladder_interior(self) -> None:
+        """多层水平条带岛融并后不得出现梯子状内边。"""
+        # 4 条水平带，竖向间隙 0.05
+        vertices = []
+        loops = []
+        for index in range(4):
+            y0 = index * 0.35
+            y1 = y0 + 0.30
+            base = len(vertices)
+            vertices.extend(
+                [
+                    [0.0, y0, 0.0],
+                    [2.0, y0, 0.0],
+                    [2.0, y1, 0.0],
+                    [0.0, y1, 0.0],
+                ]
+            )
+            loops.append([base, base + 1, base + 2, base + 3])
+        vertices = np.asarray(vertices, dtype=np.float64)
+        envelope = outer_contour_from_boundary_loops(loops, vertices)
+        self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(envelope[:, 0].max()), 2.0, places=5)
+        self.assertAlmostEqual(float(envelope[:, 1].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(envelope[:, 1].max()), 1.35, places=5)
+        # 条带间隙高度上不应残留水平内边点
+        for gap_y in (0.325, 0.675, 1.025):
+            rung = envelope[
+                (np.abs(envelope[:, 1] - gap_y) < 0.04)
+                & (envelope[:, 0] > 0.15)
+                & (envelope[:, 0] < 1.85)
+            ]
+            self.assertEqual(len(rung), 0, msg=f"gap_y={gap_y}")
 
     def test_notched_loop_corridor_uses_outer_envelope(self) -> None:
         """单环深凹口应识别为内缝，外包络后凹口内边消失。"""
