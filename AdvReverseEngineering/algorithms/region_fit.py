@@ -629,20 +629,150 @@ def combine_boundary_islands(
     return envelope, band_sides, band_samples
 
 
+def _label_face_components(
+    face_indices: np.ndarray,
+    adjacency_offsets: np.ndarray,
+    adjacency_indices: np.ndarray,
+) -> dict[int, int]:
+    """将面集合按共享边邻接划分为连通块，返回 face -> component_id。"""
+    faces = [int(f) for f in face_indices]
+    index = {f: i for i, f in enumerate(faces)}
+    seen = np.zeros(len(faces), dtype=bool)
+    comp_of: dict[int, int] = {}
+    comp_id = 0
+    off = adjacency_offsets
+    adj = adjacency_indices
+    for i, start in enumerate(faces):
+        if seen[i]:
+            continue
+        stack = [start]
+        seen[i] = True
+        while stack:
+            cur = stack.pop()
+            comp_of[cur] = comp_id
+            a = int(off[cur])
+            b = int(off[cur + 1])
+            for n in adj[a:b]:
+                n = int(n)
+                j = index.get(n)
+                if j is None or seen[j]:
+                    continue
+                seen[j] = True
+                stack.append(n)
+        comp_id += 1
+    return comp_of
+
+
+def select_bridgeable_region_mask(
+    region_ids: np.ndarray,
+    target_id,
+    adjacency_offsets: np.ndarray,
+    adjacency_indices: np.ndarray,
+    corridor_hops: int = 80,
+) -> tuple[np.ndarray, int, int]:
+    """
+    选取同编号下「可通过 -1 碎面互相到达」的最大 island 簇。
+
+    无法桥接的远岛若强行并包络，延长段会变成空间弦线、视觉上不相接。
+    返回 (face_mask, kept_component_count, dropped_component_count)。
+    """
+    ids = _as_int_array(region_ids)
+    targets = _normalize_target_ids(target_id)
+    mask = np.isin(ids, np.asarray(targets, dtype=np.int32))
+    if not np.any(mask):
+        return mask, 0, 0
+
+    off = _as_int_array(adjacency_offsets)
+    adj = _as_int_array(adjacency_indices)
+    target_faces = np.flatnonzero(mask)
+    comp_of = _label_face_components(target_faces, off, adj)
+    if not comp_of:
+        return mask, 0, 0
+
+    faces_by: dict[int, list[int]] = {}
+    for face, cid in comp_of.items():
+        faces_by.setdefault(cid, []).append(face)
+    comp_ids = list(faces_by.keys())
+    if len(comp_ids) == 1:
+        return mask, 1, 0
+
+    parent = {cid: cid for cid in comp_ids}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def unite(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    hop_limit = max(int(corridor_hops), 1)
+    for i, ca in enumerate(comp_ids):
+        for cb in comp_ids[i + 1 :]:
+            seeds = faces_by[ca]
+            goal = set(faces_by[cb])
+            queue: list[tuple[int, int]] = [(s, 0) for s in seeds]
+            seen = set(seeds)
+            head = 0
+            linked = False
+            while head < len(queue):
+                face, hops = queue[head]
+                head += 1
+                if face in goal and hops > 0:
+                    linked = True
+                    break
+                if hops >= hop_limit:
+                    continue
+                a = int(off[face])
+                b = int(off[face + 1])
+                for n in adj[a:b]:
+                    n = int(n)
+                    if n in seen:
+                        continue
+                    nid = int(ids[n])
+                    if nid < 0 or bool(mask[n]):
+                        seen.add(n)
+                        queue.append((n, hops + 1))
+            if linked:
+                unite(ca, cb)
+
+    groups: dict[int, list[int]] = {}
+    for cid in comp_ids:
+        groups.setdefault(find(cid), []).append(cid)
+
+    def group_face_count(members: list[int]) -> int:
+        return sum(len(faces_by[c]) for c in members)
+
+    best_root = max(groups.keys(), key=lambda r: group_face_count(groups[r]))
+    keep_comps = set(groups[best_root])
+    keep_faces = []
+    for cid in keep_comps:
+        keep_faces.extend(faces_by[cid])
+    kept_mask = np.zeros(len(ids), dtype=bool)
+    kept_mask[np.asarray(keep_faces, dtype=np.int32)] = True
+    dropped = len(comp_ids) - len(keep_comps)
+    return kept_mask, len(keep_comps), dropped
+
+
 def collect_island_bridge_interiors(
     region_ids: np.ndarray,
     target_id,
     face_centers: np.ndarray,
     adjacency_offsets: np.ndarray | None = None,
     adjacency_indices: np.ndarray | None = None,
-    max_hops: int = 10,
+    max_hops: int = 12,
+    corridor_hops: int = 80,
 ) -> np.ndarray:
     """
-    收集用于 island 延伸的内部采样点：目标领域面心 + 邻近的未标注面
-    （region_id < 0，分割时忽略的离散碎面）。
+    收集用于 island 延伸的内部采样点：目标领域面心 + 桥接碎面心。
 
-    跨岛空隙常被标成 -1。从目标面沿邻接、仅穿过 -1 做有限跳数 BFS
-    （默认 10），避免连通整个忽略层；并入包络后拟合面才能盖住断口/角部。
+    两类 -1 面会并入包络，使孤岛之间能靠「延长段」相接：
+      1) 近邻层：从目标面有限跳数 BFS（角部/薄断口）
+      2) 走廊层：可被两个及以上同编号 island 共同到达的 -1 面
+         （跨岛空隙主路径，跳数上限更大）
     """
     ids = _as_int_array(region_ids)
     targets = _normalize_target_ids(target_id)
@@ -650,6 +780,7 @@ def collect_island_bridge_interiors(
     centers = _as_float_array(face_centers)
     parts = [centers[mask]]
     hop_limit = max(int(max_hops), 0)
+    corridor_limit = max(int(corridor_hops), hop_limit)
 
     if (
         hop_limit > 0
@@ -660,12 +791,14 @@ def collect_island_bridge_interiors(
     ):
         off = _as_int_array(adjacency_offsets)
         adj = _as_int_array(adjacency_indices)
-        # (face, hops_from_target)；只记录 -1 面
-        queue: list[tuple[int, int]] = [
-            (int(f), 0) for f in np.flatnonzero(mask)
-        ]
-        bridge_ids: set[int] = set()
+        target_faces = np.flatnonzero(mask)
+        comp_of = _label_face_components(target_faces, off, adj)
+        n_comp = (max(comp_of.values()) + 1) if comp_of else 0
+
+        # 近邻层：任意目标出发、跳数受限
+        near_ids: set[int] = set()
         best_hop: dict[int, int] = {}
+        queue: list[tuple[int, int]] = [(int(f), 0) for f in target_faces]
         head = 0
         while head < len(queue):
             f, hops = queue[head]
@@ -683,8 +816,48 @@ def collect_island_bridge_interiors(
                 if prev is not None and prev <= next_hops:
                     continue
                 best_hop[n] = next_hops
-                bridge_ids.add(n)
+                near_ids.add(n)
                 queue.append((n, next_hops))
+
+        # 走廊层：只从「贴着 -1」的目标边界面出发，记录 -1 被哪些
+        # island 分量触及；被 ≥2 个分量触及的即为跨岛延长走廊。
+        reach: dict[int, set[int]] = {}
+        if n_comp >= 2:
+            seeds_by_comp: dict[int, list[int]] = {}
+            for seed, cid in comp_of.items():
+                a = int(off[seed])
+                b = int(off[seed + 1])
+                if any(int(ids[int(n)]) < 0 for n in adj[a:b]):
+                    seeds_by_comp.setdefault(cid, []).append(seed)
+
+            for cid, seeds in seeds_by_comp.items():
+                q2: list[tuple[int, int]] = [(s, 0) for s in seeds]
+                seen_neg: dict[int, int] = {}
+                h = 0
+                while h < len(q2):
+                    f, hops = q2[h]
+                    h += 1
+                    if hops >= corridor_limit:
+                        continue
+                    a = int(off[f])
+                    b = int(off[f + 1])
+                    for n in adj[a:b]:
+                        n = int(n)
+                        if int(ids[n]) >= 0:
+                            continue
+                        next_hops = hops + 1
+                        prev = seen_neg.get(n)
+                        if prev is not None and prev <= next_hops:
+                            continue
+                        seen_neg[n] = next_hops
+                        bucket = reach.setdefault(n, set())
+                        bucket.add(cid)
+                        q2.append((n, next_hops))
+
+        corridor_ids = {
+            face for face, comps in reach.items() if len(comps) >= 2
+        }
+        bridge_ids = near_ids | corridor_ids
         if bridge_ids:
             parts.append(
                 centers[np.asarray(sorted(bridge_ids), dtype=np.int32)]
@@ -1387,16 +1560,39 @@ def analyze_region_fit_topology(
     adjacency_indices: np.ndarray | None = None,
 ) -> dict:
     """分析领域边界并返回拟合拓扑描述；target_id 可为编号集合。"""
+    work_ids = _as_int_array(region_ids)
+    dropped_islands = 0
+    kept_islands = 0
+    if (
+        adjacency_offsets is not None
+        and adjacency_indices is not None
+        and len(adjacency_offsets) > 1
+    ):
+        keep_mask, kept_islands, dropped_islands = select_bridgeable_region_mask(
+            work_ids,
+            target_id,
+            adjacency_offsets,
+            adjacency_indices,
+        )
+        if dropped_islands > 0 and np.any(keep_mask):
+            # 无法经 -1 走廊连通的远岛不参与包络，避免假延长弦
+            work_ids = work_ids.copy()
+            targets = _normalize_target_ids(target_id)
+            target_mask = np.isin(
+                work_ids, np.asarray(targets, dtype=np.int32)
+            )
+            work_ids[target_mask & ~keep_mask] = -2
+
     loops = extract_region_boundary_loops(
-        region_ids,
+        work_ids,
         target_id,
         loop_start,
         loop_total,
         loop_vertex_indices,
     )
-    # 目标面心 + 邻接的 -1 碎面，供跨岛包络向外延伸
+    # 目标面心 + 邻接/-走廊 -1 碎面，供跨岛包络延长相接
     interior = collect_island_bridge_interiors(
-        region_ids,
+        work_ids,
         target_id,
         face_centers,
         adjacency_offsets=adjacency_offsets,
@@ -1410,7 +1606,7 @@ def analyze_region_fit_topology(
     _, normal, _, _ = compute_region_frame(
         face_normals,
         face_areas,
-        region_ids,
+        work_ids,
         target_id,
         face_centers,
     )
@@ -1481,6 +1677,8 @@ def analyze_region_fit_topology(
         "corner_count": corner_count,
         "shared_param": shared_param,
         "surface_samples": interior,
+        "dropped_islands": int(dropped_islands),
+        "kept_islands": int(kept_islands),
     }
 
 
@@ -1521,10 +1719,17 @@ def fit_region_surface(
     sides = analysis["sides"]
     normal = analysis["normal"]
     warnings: list[str] = []
-    if int(analysis["loop_count"]) > 1:
+    kept = int(analysis.get("kept_islands", 0))
+    loops_n = int(analysis["loop_count"])
+    island_n = kept if kept > 0 else loops_n
+    if island_n > 1:
         warnings.append(
-            f"检测到 {int(analysis['loop_count'])} 个 island，"
-            "已连接为完整拟合域"
+            f"检测到 {island_n} 个可连通 island，已沿碎面走廊延长相接"
+        )
+    dropped = int(analysis.get("dropped_islands", 0))
+    if dropped > 0:
+        warnings.append(
+            f"另有 {dropped} 个 island 无法经碎面连通，已排除以免假延长"
         )
 
     seg_u = int(np.clip(segments_u, MIN_SEGMENTS, MAX_SEGMENTS))
@@ -1541,13 +1746,16 @@ def fit_region_surface(
             segments_base=seg_u,
         )
     else:
-        # 多 island：包络已并入目标面心与邻接 -1 桥接碎面；
-        # 表面吸附易引入折角，默认关闭，仅靠延伸后的包络 + Coons。
+        shared = bool(analysis.get("shared_param", False))
+        # 多 island：用走廊采样把 Coons 弦段吸回表面，使孤岛延长段相接
+        samples = analysis.get("surface_samples") if shared else None
         mesh_verts, faces = build_quad_patch(
             sides,
             seg_u,
             seg_v,
-            shared_param=bool(analysis.get("shared_param", False)),
+            shared_param=shared,
+            surface_samples=samples,
+            snap_strength=0.9 if shared else 0.0,
         )
 
     faces = _orient_faces(mesh_verts, faces, normal)
@@ -1577,6 +1785,7 @@ __all__ = (
     "classify_tri_or_quad",
     "collect_island_bridge_interiors",
     "combine_boundary_islands",
+    "select_bridgeable_region_mask",
     "coons_patch",
     "detect_corner_indices",
     "extract_region_boundary_loops",
