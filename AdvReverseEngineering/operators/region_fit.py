@@ -108,6 +108,10 @@ def _schedule_force_exit_check() -> None:
         )
         if stuck:
             scene_props.fit_confirm_requested = False
+            scene_props.fit_advance_requested = False
+            scene_props.fit_retreat_requested = False
+            scene_props.fit_stage_rebuild_requested = False
+            scene_props.fit_preview_requested = False
             scene_props.fit_mode_active = False
             scene_props.fit_target_id = -1
             scene_props.fit_hover_id = -1
@@ -665,15 +669,20 @@ class ARE_OT_fit_step_next(bpy.types.Operator):
         )
 
     def execute(self, context: bpy.types.Context):
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
         op = _get_active_fit_op()
-        if op is None:
-            self.report({"ERROR"}, "拟合模态未运行")
-            return {"CANCELLED"}
-        if op.advance_stage(context):
-            self.report({"INFO"}, "已进入下一步")
-            return {"FINISHED"}
-        self.report({"ERROR"}, "无法进入下一步")
-        return {"CANCELLED"}
+        if op is not None:
+            try:
+                if op.advance_stage(context):
+                    self.report({"INFO"}, scene_props.fit_status or "已进入下一步")
+                    return {"FINISHED"}
+                self.report({"ERROR"}, "无法进入下一步")
+                return {"CANCELLED"}
+            except Exception as exc:
+                self.report({"ERROR"}, f"下一步失败: {exc}")
+        # 后备：置位由模态 TIMER 消费（避免侧栏点击被模态吞掉后无响应）
+        scene_props.fit_advance_requested = True
+        return {"FINISHED"}
 
 
 class ARE_OT_fit_step_back(bpy.types.Operator):
@@ -694,15 +703,19 @@ class ARE_OT_fit_step_back(bpy.types.Operator):
         )
 
     def execute(self, context: bpy.types.Context):
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
         op = _get_active_fit_op()
-        if op is None:
-            self.report({"ERROR"}, "拟合模态未运行")
-            return {"CANCELLED"}
-        if op.retreat_stage(context):
-            self.report({"INFO"}, "已返回上一步")
-            return {"FINISHED"}
-        self.report({"ERROR"}, "无法返回上一步")
-        return {"CANCELLED"}
+        if op is not None:
+            try:
+                if op.retreat_stage(context):
+                    self.report({"INFO"}, scene_props.fit_status or "已返回上一步")
+                    return {"FINISHED"}
+                self.report({"ERROR"}, "无法返回上一步")
+                return {"CANCELLED"}
+            except Exception as exc:
+                self.report({"ERROR"}, f"上一步失败: {exc}")
+        scene_props.fit_retreat_requested = True
+        return {"FINISHED"}
 
 
 class ARE_OT_build_fit_surface(bpy.types.Operator):
@@ -723,18 +736,18 @@ class ARE_OT_build_fit_surface(bpy.types.Operator):
         )
 
     def execute(self, context: bpy.types.Context):
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
         op = _get_active_fit_op()
-        if op is None:
-            self.report({"ERROR"}, "拟合模态未运行")
-            return {"CANCELLED"}
-        try:
-            if op.advance_to_preview(context):
-                self.report({"INFO"}, "已生成拟合曲面预览")
-            else:
+        if op is not None:
+            try:
+                if op.advance_to_preview(context):
+                    self.report({"INFO"}, "已生成拟合曲面预览")
+                    return {"FINISHED"}
                 self.report({"ERROR"}, "拟合成面失败")
-        except Exception as exc:
-            self.report({"ERROR"}, f"拟合成面失败: {exc}")
-            return {"CANCELLED"}
+                return {"CANCELLED"}
+            except Exception as exc:
+                self.report({"ERROR"}, f"拟合成面失败: {exc}")
+        scene_props.fit_preview_requested = True
         return {"FINISHED"}
 
 
@@ -802,6 +815,10 @@ class ARE_OT_fit_region(bpy.types.Operator):
         set_merge_label_session(None)
         scene_props.fit_mode_active = False
         scene_props.fit_confirm_requested = False
+        scene_props.fit_advance_requested = False
+        scene_props.fit_retreat_requested = False
+        scene_props.fit_stage_rebuild_requested = False
+        scene_props.fit_preview_requested = False
         scene_props.fit_target_id = -1
         scene_props.fit_hover_id = -1
         scene_props.fit_phase = "IDLE"
@@ -1228,6 +1245,10 @@ class ARE_OT_fit_region(bpy.types.Operator):
 
         scene_props.fit_mode_active = True
         scene_props.fit_confirm_requested = False
+        scene_props.fit_advance_requested = False
+        scene_props.fit_retreat_requested = False
+        scene_props.fit_stage_rebuild_requested = False
+        scene_props.fit_preview_requested = False
         scene_props.fit_target_id = -1
         scene_props.fit_hover_id = -1
         scene_props.fit_phase = "SELECT"
@@ -1271,6 +1292,31 @@ class ARE_OT_fit_region(bpy.types.Operator):
             if self._commit_fit(context):
                 self.report({"INFO"}, scene_props.fit_status)
                 return self._finish_mode(context, cancelled=False)
+            return {"RUNNING_MODAL"}
+
+        # 面板按钮 / 参数滑块通过标志与模态通信（避免侧栏点击被吞）
+        if scene_props.fit_advance_requested:
+            scene_props.fit_advance_requested = False
+            if self.advance_stage(context):
+                self.report({"INFO"}, scene_props.fit_status)
+            return {"RUNNING_MODAL"}
+        if scene_props.fit_retreat_requested:
+            scene_props.fit_retreat_requested = False
+            if self.retreat_stage(context):
+                self.report({"INFO"}, scene_props.fit_status)
+            return {"RUNNING_MODAL"}
+        if scene_props.fit_preview_requested:
+            scene_props.fit_preview_requested = False
+            if self.advance_to_preview(context):
+                self.report({"INFO"}, "已生成拟合曲面预览")
+            return {"RUNNING_MODAL"}
+        if scene_props.fit_stage_rebuild_requested:
+            scene_props.fit_stage_rebuild_requested = False
+            phase = str(scene_props.fit_phase)
+            if phase in FIT_CURVE_STAGES:
+                self._rebuild_stage_preview(context, stage=phase)
+            elif phase == "PREVIEW":
+                self._rebuild_preview(context)
             return {"RUNNING_MODAL"}
 
         if event.type == "TIMER":
@@ -1350,7 +1396,8 @@ class ARE_OT_fit_region(bpy.types.Operator):
                 LABEL_RADIUS_PX,
             )
             if hit is None:
-                return {"RUNNING_MODAL"}
+                # 未点中编号：放行，让侧栏按钮/滑块能收到点击
+                return {"PASS_THROUGH"}
 
             rid = int(hit)
             current = [

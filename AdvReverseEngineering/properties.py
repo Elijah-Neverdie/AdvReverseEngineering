@@ -34,11 +34,13 @@ def _on_fit_segments_update(self, context) -> None:
         from .operators.region_fit import _get_active_fit_op
 
         op = _get_active_fit_op()
-        if op is None or getattr(op, "_updating_segments", False):
+        if op is not None and not getattr(op, "_updating_segments", False):
+            op._rebuild_preview(context)
             return
-        op._rebuild_preview(context)
     except Exception:
         pass
+    # 模态实例不可用时，置位由 TIMER 消费
+    self.fit_stage_rebuild_requested = True
 
 
 def _on_fit_stage_params_update(self, context) -> None:
@@ -52,11 +54,12 @@ def _on_fit_stage_params_update(self, context) -> None:
         from .operators.region_fit import _get_active_fit_op
 
         op = _get_active_fit_op()
-        if op is None or getattr(op, "_updating_stage_params", False):
+        if op is not None and not getattr(op, "_updating_stage_params", False):
+            op._rebuild_stage_preview(context)
             return
-        op._rebuild_stage_preview(context)
     except Exception:
         pass
+    self.fit_stage_rebuild_requested = True
 
 
 class ARE_SceneProperties(bpy.types.PropertyGroup):
@@ -486,6 +489,26 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     fit_confirm_requested: BoolProperty(
         name="请求确认拟合",
         description="面板确认按钮通知模态算子提交拟合",
+        default=False,
+    )
+    fit_advance_requested: BoolProperty(
+        name="请求拟合下一步",
+        description="面板「下一步」通知模态算子前进",
+        default=False,
+    )
+    fit_retreat_requested: BoolProperty(
+        name="请求拟合上一步",
+        description="面板「上一步」通知模态算子回退",
+        default=False,
+    )
+    fit_stage_rebuild_requested: BoolProperty(
+        name="请求重建拟合阶段预览",
+        description="侧栏参数变化后由模态 TIMER 重建预览",
+        default=False,
+    )
+    fit_preview_requested: BoolProperty(
+        name="请求拟合成面",
+        description="面板「拟合成面」通知模态进入曲面预览",
         default=False,
     )
     fit_target_id: IntProperty(
