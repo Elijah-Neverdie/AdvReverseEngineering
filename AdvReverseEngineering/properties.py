@@ -542,7 +542,10 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
     fit_stitch_gap: FloatProperty(
         name="缝合间隙",
-        description="相对领域包围盒对角线的比例；小于该间隙的孤岛在第 2 步缝合",
+        description=(
+            "相对领域包围盒对角线的比例；邻近折角连线平均距离小于该阈值时，"
+            "把折角之间的相向边链当作缝合曲线删除并合并外轮廓"
+        ),
         default=8.0,
         min=0.5,
         max=40.0,

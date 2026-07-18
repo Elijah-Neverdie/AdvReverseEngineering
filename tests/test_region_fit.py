@@ -1376,6 +1376,41 @@ class FitRegionSurfaceTests(unittest.TestCase):
         ]
         self.assertEqual(len(mid_interior), 0)
 
+    def test_corner_seam_stitch_removes_facing_sides(self) -> None:
+        """折角配对缝合：平均间距合格后删除缝合边，只留外轮廓。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            stitch_two_loops_by_corner_seams,
+        )
+
+        pts_a = np.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float64,
+        )
+        pts_b = np.array(
+            [
+                [1.05, 0.0, 0.0],
+                [2.05, 0.0, 0.0],
+                [2.05, 1.0, 0.0],
+                [1.05, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        result = stitch_two_loops_by_corner_seams(pts_a, pts_b, max_gap=0.2)
+        self.assertIsNotNone(result)
+        assert result is not None
+        outer, seams, avg_gap = result
+        self.assertLessEqual(avg_gap, 0.2)
+        self.assertEqual(len(seams), 2)
+        self.assertAlmostEqual(float(outer[:, 0].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(outer[:, 0].max()), 2.05, places=5)
+        mid = outer[
+            (outer[:, 0] > 0.98)
+            & (outer[:, 0] < 1.07)
+            & (outer[:, 1] > 0.05)
+            & (outer[:, 1] < 0.95)
+        ]
+        self.assertEqual(len(mid), 0)
+
     def test_nearby_islands_merge_to_outer_contour(self) -> None:
         """间隙很小的两岛融并为外轮廓，岛间内边被消去。"""
         # 两矩形间距 0.05；extent≈2.7 → gap 阈值约 0.13，应融并

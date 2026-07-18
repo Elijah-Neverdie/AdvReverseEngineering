@@ -1412,41 +1412,255 @@ def bridge_reentrant_corners_closed_loop(
     return pts
 
 
+def _loop_corner_indices_3d(
+    points: np.ndarray,
+    angle_threshold_deg: float,
+) -> list[int]:
+    """在闭环上检测折角下标（含直角）；短环用局部转角，长环用多尺度检测。"""
+    pts = _as_float_array(points)
+    count = len(pts)
+    if count < 3:
+        return []
+    origin, axis_u, axis_v = _loop_pca_basis(pts)
+    pts2 = project_points_to_plane(pts, origin, axis_u, axis_v)
+    threshold = float(max(angle_threshold_deg, 1.0))
+    if count <= 32:
+        corners: list[int] = []
+        for index in range(count):
+            prev_p = pts2[(index - 1) % count]
+            cur_p = pts2[index]
+            next_p = pts2[(index + 1) % count]
+            vin = cur_p - prev_p
+            vout = next_p - cur_p
+            in_len = float(np.linalg.norm(vin))
+            out_len = float(np.linalg.norm(vout))
+            if in_len < 1e-12 or out_len < 1e-12:
+                continue
+            cos_angle = float(
+                np.clip(vin.dot(vout) / (in_len * out_len), -1.0, 1.0)
+            )
+            turn = float(np.degrees(np.arccos(cos_angle)))
+            if turn >= threshold:
+                corners.append(index)
+        if len(corners) >= 2:
+            return corners
+        step = max(count // 4, 1)
+        return sorted({(i * step) % count for i in range(4)})
+
+    corners = detect_corner_indices(
+        pts2,
+        threshold,
+        max_corners=_MAX_SPLIT_CORNERS,
+        convex_only=False,
+        include_strong_concave=True,
+    )
+    return list(corners) if corners else [0, count // 2]
+
+
+def _closed_arc_indices(count: int, start: int, end: int, forward: bool) -> list[int]:
+    """闭环从 start 到 end 的下标链（含两端）。"""
+    if count <= 0:
+        return []
+    start = int(start) % count
+    end = int(end) % count
+    indices = [start]
+    if start == end:
+        return indices
+    step = 1 if forward else -1
+    cursor = start
+    for _ in range(count):
+        cursor = (cursor + step) % count
+        indices.append(cursor)
+        if cursor == end:
+            break
+    return indices
+
+
+def _mean_polyline_gap(a: np.ndarray, b: np.ndarray) -> float:
+    """两条开链之间的平均间隙（双向采样）。"""
+    pa = _as_float_array(a)
+    pb = _as_float_array(b)
+    if len(pa) < 2 or len(pb) < 2:
+        return float("inf")
+    closed_b = np.vstack((pb, pb[:1]))
+    closed_a = np.vstack((pa, pa[:1]))
+    step_a = max(1, len(pa) // 16)
+    step_b = max(1, len(pb) // 16)
+    d_ab = [
+        point_to_polyline_distance(point, closed_b) for point in pa[::step_a]
+    ]
+    d_ba = [
+        point_to_polyline_distance(point, closed_a) for point in pb[::step_b]
+    ]
+    return float(0.5 * (float(np.mean(d_ab)) + float(np.mean(d_ba))))
+
+
+def stitch_two_loops_by_corner_seams(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    max_gap: float,
+    corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+) -> tuple[np.ndarray, list[np.ndarray], float] | None:
+    """
+    用邻近折角定义缝合曲线并合并两岛外轮廓。
+
+    1) 检测各岛折角
+    2) 配对邻近折角，连线距离取平均
+    3) 均值 <= max_gap 时，折角之间相向边链视为缝合曲线并删除
+    4) 剩余边链在折角处相接 → 外轮廓
+    """
+    pts_a = _as_float_array(points_a)
+    pts_b = _as_float_array(points_b)
+    if len(pts_a) < 3 or len(pts_b) < 3:
+        return None
+
+    corners_a = _loop_corner_indices_3d(pts_a, corner_angle_deg)
+    corners_b = _loop_corner_indices_3d(pts_b, corner_angle_deg)
+    if len(corners_a) < 2 or len(corners_b) < 2:
+        return None
+
+    prox = float(max(max_gap, 1e-6))
+    pair_candidates: list[tuple[float, int, int]] = []
+    for ia in corners_a:
+        for ib in corners_b:
+            dist = float(np.linalg.norm(pts_a[ia] - pts_b[ib]))
+            if dist <= prox * 1.35:
+                pair_candidates.append((dist, int(ia), int(ib)))
+    if len(pair_candidates) < 2:
+        return None
+    pair_candidates.sort(key=lambda item: item[0])
+
+    used_a: set[int] = set()
+    used_b: set[int] = set()
+    matched: list[tuple[int, int, float]] = []
+    for dist, ia, ib in pair_candidates:
+        if ia in used_a or ib in used_b:
+            continue
+        used_a.add(ia)
+        used_b.add(ib)
+        matched.append((ia, ib, dist))
+    if len(matched) < 2:
+        return None
+
+    avg_corner_gap = float(np.mean([item[2] for item in matched]))
+    if avg_corner_gap > prox:
+        return None
+
+    n_a = len(pts_a)
+    n_b = len(pts_b)
+    ordered = sorted(matched, key=lambda item: item[0])
+
+    best = None
+    best_score = float("inf")
+    for index in range(len(ordered)):
+        ia0, ib0, _d0 = ordered[index]
+        ia1, ib1, _d1 = ordered[(index + 1) % len(ordered)]
+        if ia0 == ia1:
+            continue
+        for fwd_a in (True, False):
+            arc_a_idx = _closed_arc_indices(n_a, ia0, ia1, fwd_a)
+            if len(arc_a_idx) < 2 or len(arc_a_idx) >= n_a:
+                continue
+            arc_a = pts_a[np.asarray(arc_a_idx, dtype=np.int32)]
+            for fwd_b in (True, False):
+                arc_b_idx = _closed_arc_indices(n_b, ib0, ib1, fwd_b)
+                if len(arc_b_idx) < 2 or len(arc_b_idx) >= n_b:
+                    continue
+                arc_b = pts_b[np.asarray(arc_b_idx, dtype=np.int32)]
+                mean_gap = _mean_polyline_gap(arc_a, arc_b)
+                if mean_gap > prox * 1.25:
+                    continue
+                score = mean_gap + 0.01 * (
+                    polyline_length(arc_a) + polyline_length(arc_b)
+                )
+                if score < best_score:
+                    best_score = score
+                    best = (
+                        ia0,
+                        ia1,
+                        ib0,
+                        ib1,
+                        fwd_a,
+                        fwd_b,
+                        arc_a_idx,
+                        arc_b_idx,
+                        mean_gap,
+                    )
+
+    if best is None:
+        return None
+
+    ia0, ia1, ib0, ib1, fwd_a, fwd_b, arc_a_idx, arc_b_idx, mean_gap = best
+    # 外轮廓 = 去掉缝合弧后的互补弧：沿同一绕向从缝合终点走回起点
+    outer_a_idx = _closed_arc_indices(n_a, ia1, ia0, forward=fwd_a)
+    # B 侧从配对起点 ib0 走到 ib1 的非缝合弧（与缝合方向相反）
+    outer_b_idx = _closed_arc_indices(n_b, ib0, ib1, forward=not fwd_b)
+    # 外弧至少要有一个中间点（三点含端点），且不能与整环重合于「未删缝」
+    if len(outer_a_idx) < 3 or len(outer_b_idx) < 3:
+        return None
+    if len(arc_a_idx) >= n_a or len(arc_b_idx) >= n_b:
+        return None
+    if len(arc_a_idx) < 2 or len(arc_b_idx) < 2:
+        return None
+
+    outer_a = pts_a[np.asarray(outer_a_idx, dtype=np.int32)]
+    outer_b = pts_b[np.asarray(outer_b_idx, dtype=np.int32)]
+    # 端点对齐：outer_a 终点应靠近 outer_b 起点
+    if float(np.linalg.norm(outer_a[-1] - outer_b[0])) > float(
+        np.linalg.norm(outer_a[-1] - outer_b[-1])
+    ):
+        outer_b = outer_b[::-1].copy()
+
+    parts = [outer_a]
+    if float(np.linalg.norm(outer_a[-1] - outer_b[0])) > 1e-9:
+        parts.append(np.asarray([outer_a[-1], outer_b[0]], dtype=np.float64))
+    parts.append(outer_b[1:] if len(outer_b) > 1 else outer_b)
+    if float(np.linalg.norm(parts[-1][-1] - outer_a[0])) > 1e-9:
+        parts.append(
+            np.asarray([parts[-1][-1], outer_a[0]], dtype=np.float64)
+        )
+    outer = np.vstack(parts)
+    if len(outer) >= 2 and float(np.linalg.norm(outer[0] - outer[-1])) < 1e-9:
+        outer = outer[:-1]
+    if len(outer) < 3:
+        return None
+
+    stitch_seams = [
+        pts_a[np.asarray(arc_a_idx, dtype=np.int32)].copy(),
+        pts_b[np.asarray(arc_b_idx, dtype=np.int32)].copy(),
+    ]
+    outer = bridge_reentrant_corners_closed_loop(outer)
+    return outer, stitch_seams, float(mean_gap)
+
+
 def _outer_contour_for_nearby_cluster(
     cluster_loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
     max_gap: float,
     allow_band_fallback: bool = False,
-) -> np.ndarray | None:
+    corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+) -> tuple[np.ndarray | None, list[np.ndarray]]:
     """
-    邻近簇外轮廓：消对向内边后切除内阴角。
+    邻近簇外轮廓：优先折角缝合曲线；失败再消对向内边。
 
-    allow_band_fallback=True 时（远岛桥接阶段）才允许条带外包络回退。
+    返回 (envelope, stitch_seams)。
     """
     verts = _as_float_array(vertices)
     loops = [list(int(v) for v in loop) for loop in cluster_loops if len(loop) >= 3]
+    empty: list[np.ndarray] = []
     if len(loops) < 2:
-        return None
+        return None, empty
+
+    working: list[np.ndarray] = [
+        verts[np.asarray(loop, dtype=np.int32)].copy() for loop in loops
+    ]
+    all_seams: list[np.ndarray] = []
 
     def _finalize(envelope: np.ndarray | None) -> np.ndarray | None:
         if envelope is None or len(envelope) < 3:
             return None
         return bridge_reentrant_corners_closed_loop(_as_float_array(envelope))
 
-    working: list[np.ndarray] = [
-        verts[np.asarray(loop, dtype=np.int32)].copy() for loop in loops
-    ]
-    id_loops = list(loops)
-    envelope = outer_contour_by_dissolving_facing_edges(
-        id_loops,
-        verts,
-        proximity=float(max_gap),
-    )
-    finalized = _finalize(envelope)
-    if finalized is not None:
-        return finalized
-
-    # 层级：反复融并间隙最小的一对
     max_rounds = max(len(working) - 1, 0)
     for _ in range(max_rounds):
         if len(working) < 2:
@@ -1459,9 +1673,25 @@ def _outer_contour_for_nearby_cluster(
                 if gap < best_gap:
                     best_gap = gap
                     best_pair = (i, j)
-        if best_pair is None or best_gap > float(max_gap) * 1.25:
+        if best_pair is None or best_gap > float(max_gap) * 1.35:
             break
         i, j = best_pair
+        corner_hit = stitch_two_loops_by_corner_seams(
+            working[i],
+            working[j],
+            max_gap=float(max_gap),
+            corner_angle_deg=corner_angle_deg,
+        )
+        if corner_hit is not None:
+            envelope, seams, _avg = corner_hit
+            all_seams.extend(seams)
+            working = [
+                pts
+                for index, pts in enumerate(working)
+                if index not in best_pair
+            ] + [envelope.copy()]
+            continue
+
         base = len(verts)
         merged_verts = np.vstack((verts, working[i], working[j]))
         n_a = len(working[i])
@@ -1486,10 +1716,30 @@ def _outer_contour_for_nearby_cluster(
         verts = merged_verts
 
     if len(working) == 1 and len(working[0]) >= 3:
-        return _finalize(working[0])
+        return _finalize(working[0]), all_seams
+
+    if len(loops) == 2:
+        direct = stitch_two_loops_by_corner_seams(
+            verts[np.asarray(loops[0], dtype=np.int32)],
+            verts[np.asarray(loops[1], dtype=np.int32)],
+            max_gap=float(max_gap),
+            corner_angle_deg=corner_angle_deg,
+        )
+        if direct is not None:
+            envelope, seams, _avg = direct
+            return _finalize(envelope), seams
+
+    envelope = outer_contour_by_dissolving_facing_edges(
+        loops,
+        verts,
+        proximity=float(max_gap),
+    )
+    finalized = _finalize(envelope)
+    if finalized is not None:
+        return finalized, all_seams
 
     if not allow_band_fallback:
-        return None
+        return None, all_seams
 
     try:
         envelope, _, _ = combine_boundary_islands(
@@ -1498,20 +1748,20 @@ def _outer_contour_for_nearby_cluster(
             prefer_outer_envelope=True,
         )
     except RegionFitError:
-        return None
-    return _finalize(envelope)
+        return None, all_seams
+    return _finalize(envelope), all_seams
 
 
 def merge_nearby_loops_to_outer_contours(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
     max_gap: float,
+    corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
 ) -> list[dict]:
     """
-    邻近孤岛融并为新孤岛（消对向内边 / 邻近条带包络）；远岛保持独立。
+    邻近孤岛融并为新孤岛（折角缝合曲线优先）；远岛保持独立。
 
-    单环直接保留网格外轮廓，不用条带/凸包改写。
-    返回工作项: points / loop_ids / merged_from。
+    返回工作项: points / loop_ids / merged_from / stitch_seams。
     """
     verts = _as_float_array(vertices)
     if not loops:
@@ -1527,13 +1777,16 @@ def merge_nearby_loops_to_outer_contours(
                     "points": verts[np.asarray(ids, dtype=np.int32)].copy(),
                     "loop_ids": ids,
                     "merged_from": 1,
+                    "stitch_seams": [],
                 }
             )
             continue
-        envelope = _outer_contour_for_nearby_cluster(
+        envelope, seams = _outer_contour_for_nearby_cluster(
             cluster_loops,
             verts,
             max_gap=float(max_gap),
+            allow_band_fallback=False,
+            corner_angle_deg=corner_angle_deg,
         )
         if envelope is None or len(envelope) < 3:
             for ids in cluster_loops:
@@ -1542,6 +1795,7 @@ def merge_nearby_loops_to_outer_contours(
                         "points": verts[np.asarray(ids, dtype=np.int32)].copy(),
                         "loop_ids": ids,
                         "merged_from": 1,
+                        "stitch_seams": [],
                     }
                 )
             continue
@@ -1550,6 +1804,7 @@ def merge_nearby_loops_to_outer_contours(
                 "points": _as_float_array(envelope).copy(),
                 "loop_ids": None,
                 "merged_from": int(len(cluster_loops)),
+                "stitch_seams": seams,
             }
         )
     return items
@@ -3251,15 +3506,24 @@ def build_fit_work_items(
         return items, meta
 
     if stage_key == "STITCH":
-        return merge_nearby_loops_to_outer_contours(
+        items = merge_nearby_loops_to_outer_contours(
             valid, verts, max_gap=stitch_gap
-        ), meta
+        )
+        seam_links: list[tuple[np.ndarray, np.ndarray]] = []
+        for item in items:
+            for seam in item.get("stitch_seams") or []:
+                pts = _as_float_array(seam)
+                for index in range(len(pts) - 1):
+                    seam_links.append((pts[index].copy(), pts[index + 1].copy()))
+        meta["bridge_links"] = seam_links
+        return items, meta
 
-    # BRIDGE：用更大间隙聚簇；簇内优先消对边，失败再条带外包络
+    # BRIDGE：用更大间隙聚簇；簇内优先折角缝合，失败再条带外包络
     if not bridge_enabled:
-        return merge_nearby_loops_to_outer_contours(
+        items = merge_nearby_loops_to_outer_contours(
             valid, verts, max_gap=stitch_gap
-        ), meta
+        )
+        return items, meta
 
     clusters = cluster_nearby_boundary_loops(valid, verts, max_gap=bridge_gap)
     items: list[dict] = []
@@ -3284,13 +3548,16 @@ def build_fit_work_items(
             bridge_links.append(
                 (centroids[index].copy(), centroids[index + 1].copy())
             )
-        # 先按缝合间隙消对边并切除内阴角；失败再用桥接外包络
-        envelope = _outer_contour_for_nearby_cluster(
+        # 先折角缝合 / 消对边；失败再用桥接外包络
+        envelope, seams = _outer_contour_for_nearby_cluster(
             cluster_loops,
             verts,
             max_gap=stitch_gap,
             allow_band_fallback=True,
         )
+        for seam in seams:
+            if len(seam) >= 2:
+                bridge_links.append((seam[0].copy(), seam[-1].copy()))
         if envelope is None or len(envelope) < 3:
             try:
                 envelope, _, _ = combine_boundary_islands(
@@ -4823,6 +5090,7 @@ __all__ = (
     "analyze_region_fit_topology",
     "bridge_concave_notches",
     "bridge_reentrant_corners_closed_loop",
+    "stitch_two_loops_by_corner_seams",
     "build_fit_work_items",
     "build_quad_patch",
     "build_triangular_patch",

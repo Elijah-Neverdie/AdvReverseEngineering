@@ -340,11 +340,11 @@ class ARE_PT_main(bpy.types.Panel):
                         text="碎岛周长阈值 (%)",
                     )
                 elif phase == "STITCH":
-                    tip.label(text="② 缝合邻近孤岛")
+                    tip.label(text="② 缝合邻近孤岛（折角配对）")
                     tip.prop(
                         scene_props,
                         "fit_stitch_gap",
-                        text="缝合间隙 (%)",
+                        text="缝合间隙阈值 (%)",
                     )
                 elif phase == "BRIDGE":
                     tip.label(text="③ 桥接远距离孤岛")
