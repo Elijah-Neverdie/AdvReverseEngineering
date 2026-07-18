@@ -325,21 +325,54 @@ class ARE_PT_main(bpy.types.Panel):
 
             if fitting:
                 tip = region_box.box()
-                tip.label(text="拟合模式", icon="INFO")
+                tip.label(text="拟合模式（分步）", icon="INFO")
                 if scene_props.fit_status:
                     tip.label(text=scene_props.fit_status)
                 if scene_props.fit_status_detail:
                     tip.label(text=scene_props.fit_status_detail)
-                if scene_props.fit_phase == "DEBUG_EDGES":
-                    tip.label(text="Debug：闭环边 + 青色凹折圆球")
-                    build_row = tip.row()
-                    build_row.scale_y = 1.2
-                    build_row.operator(
-                        "are.build_fit_surface",
-                        text="拟合成面",
-                        icon="MESH_GRID",
+
+                phase = scene_props.fit_phase
+                if phase == "ISLANDS":
+                    tip.label(text="① 各孤岛封闭外围曲线")
+                    tip.prop(
+                        scene_props,
+                        "fit_island_min_perimeter",
+                        text="碎岛周长阈值 (%)",
                     )
-                if scene_props.fit_phase == "PREVIEW":
+                elif phase == "STITCH":
+                    tip.label(text="② 缝合邻近孤岛")
+                    tip.prop(
+                        scene_props,
+                        "fit_stitch_gap",
+                        text="缝合间隙 (%)",
+                    )
+                elif phase == "BRIDGE":
+                    tip.label(text="③ 桥接远距离孤岛")
+                    tip.prop(
+                        scene_props,
+                        "fit_bridge_enabled",
+                        text="启用远岛桥接",
+                    )
+                    tip.prop(
+                        scene_props,
+                        "fit_bridge_gap",
+                        text="桥接间隙 (%)",
+                    )
+
+                if phase in {"ISLANDS", "STITCH", "BRIDGE"}:
+                    nav = tip.row(align=True)
+                    nav.operator("are.fit_step_back", text="上一步", icon="BACK")
+                    nav.operator("are.fit_step_next", text="下一步", icon="FORWARD")
+                    if phase == "BRIDGE":
+                        build_row = tip.row()
+                        build_row.scale_y = 1.2
+                        build_row.operator(
+                            "are.build_fit_surface",
+                            text="拟合成面",
+                            icon="MESH_GRID",
+                        )
+
+                if phase == "PREVIEW":
                     tip.label(
                         text=(
                             "三边曲面"
@@ -365,6 +398,12 @@ class ARE_PT_main(bpy.types.Panel):
                             else "V 向段数"
                         ),
                     )
+                    back_row = tip.row(align=True)
+                    back_row.operator(
+                        "are.fit_step_back",
+                        text="返回桥接",
+                        icon="BACK",
+                    )
                     confirm_row = tip.row()
                     confirm_row.scale_y = 1.2
                     confirm_row.operator(
@@ -379,11 +418,12 @@ class ARE_PT_main(bpy.types.Panel):
                     "操作说明",
                 ):
                     help_box = tip.box()
-                    help_box.label(text="1. 点击编号：显示各孤岛最长边")
-                    help_box.label(text="2. 核对边线后点「拟合成面」或 Enter")
-                    help_box.label(text="3. 滚轮 / Page 调节控制点")
-                    help_box.label(text="4. 确认或 Enter 写入「拟合面」集合")
-                    help_box.label(text="Esc 取消")
+                    help_box.label(text="1. 点击编号 → ① 各孤岛外围曲线")
+                    help_box.label(text="2. Enter/下一步 → ② 缝合邻近")
+                    help_box.label(text="3. Enter/下一步 → ③ 桥接远岛")
+                    help_box.label(text="4. 拟合成面后滚轮/Page 调段数")
+                    help_box.label(text="Backspace 返回上一步 · Esc 取消")
+                    help_box.label(text="Shift+点击多选领域并集")
 
             if scene_props.region_status:
                 region_box.label(

@@ -5,6 +5,8 @@ from .region_fit import (
     ARE_OT_build_fit_surface,
     ARE_OT_confirm_fit_region,
     ARE_OT_fit_region,
+    ARE_OT_fit_step_back,
+    ARE_OT_fit_step_next,
 )
 from .regions import (
     ARE_OT_clear_regions,
@@ -33,6 +35,8 @@ classes = (
     ARE_OT_split_regions,
     ARE_OT_confirm_split_regions,
     ARE_OT_fit_region,
+    ARE_OT_fit_step_next,
+    ARE_OT_fit_step_back,
     ARE_OT_build_fit_surface,
     ARE_OT_confirm_fit_region,
     ARE_OT_check_github_update,

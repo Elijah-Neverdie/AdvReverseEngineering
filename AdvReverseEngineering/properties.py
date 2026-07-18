@@ -41,6 +41,24 @@ def _on_fit_segments_update(self, context) -> None:
         pass
 
 
+def _on_fit_stage_params_update(self, context) -> None:
+    """分步参数变化时按当前阶段实时重建曲线预览。"""
+    if not getattr(self, "fit_mode_active", False):
+        return
+    phase = str(getattr(self, "fit_phase", "") or "")
+    if phase not in {"ISLANDS", "STITCH", "BRIDGE"}:
+        return
+    try:
+        from .operators.region_fit import _get_active_fit_op
+
+        op = _get_active_fit_op()
+        if op is None or getattr(op, "_updating_stage_params", False):
+            return
+        op._rebuild_stage_preview(context)
+    except Exception:
+        pass
+
+
 class ARE_SceneProperties(bpy.types.PropertyGroup):
     """场景级插件属性，供 UI 面板与 Operator 读写。"""
 
@@ -484,8 +502,50 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
     fit_phase: StringProperty(
         name="拟合阶段",
-        description="SELECT / DEBUG_EDGES / PREVIEW / IDLE",
+        description="SELECT / ISLANDS / STITCH / BRIDGE / PREVIEW / IDLE",
         default="IDLE",
+    )
+    fit_island_min_perimeter: FloatProperty(
+        name="碎岛周长阈值",
+        description="相对最长孤岛周长的比例，更短的碎环不参与第 1 步外围曲线",
+        default=12.0,
+        min=1.0,
+        max=50.0,
+        soft_min=5.0,
+        soft_max=30.0,
+        precision=1,
+        subtype="PERCENTAGE",
+        update=_on_fit_stage_params_update,
+    )
+    fit_stitch_gap: FloatProperty(
+        name="缝合间隙",
+        description="相对领域包围盒对角线的比例；小于该间隙的孤岛在第 2 步缝合",
+        default=8.0,
+        min=0.5,
+        max=40.0,
+        soft_min=2.0,
+        soft_max=20.0,
+        precision=1,
+        subtype="PERCENTAGE",
+        update=_on_fit_stage_params_update,
+    )
+    fit_bridge_gap: FloatProperty(
+        name="桥接间隙",
+        description="相对领域包围盒对角线的比例；第 3 步把更远孤岛纳入桥接包络",
+        default=25.0,
+        min=1.0,
+        max=80.0,
+        soft_min=8.0,
+        soft_max=50.0,
+        precision=1,
+        subtype="PERCENTAGE",
+        update=_on_fit_stage_params_update,
+    )
+    fit_bridge_enabled: BoolProperty(
+        name="启用远岛桥接",
+        description="第 3 步是否桥接距离更远的同领域孤岛",
+        default=True,
+        update=_on_fit_stage_params_update,
     )
     fit_segments_u: IntProperty(
         name="U 向段数",

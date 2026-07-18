@@ -3038,6 +3038,131 @@ def harmonize_multi_island_sides(
     return result, suppress
 
 
+def build_fit_work_items(
+    loops: Sequence[Sequence[int]],
+    vertices: np.ndarray,
+    stage: str,
+    stitch_gap_frac: float = _MULTI_ISLAND_MERGE_GAP_FRAC,
+    bridge_gap_frac: float = 0.25,
+    bridge_enabled: bool = True,
+    interior_points: np.ndarray | None = None,
+) -> tuple[list[dict], dict]:
+    """
+    按拟合阶段生成工作项（points / loop_ids / merged_from）。
+
+    stage:
+      ISLANDS — 每岛独立外围闭环
+      STITCH  — 仅缝合邻近孤岛
+      BRIDGE  — 在缝合基础上桥接更远的孤岛（条带外包络）
+    """
+    verts = _as_float_array(vertices)
+    valid = [list(int(v) for v in loop) for loop in loops if len(loop) >= 3]
+    meta: dict = {
+        "stage": str(stage),
+        "bridge_links": [],
+        "stitch_gap": 0.0,
+        "bridge_gap": 0.0,
+        "extent": 0.0,
+    }
+    if not valid:
+        return [], meta
+
+    stacked = np.vstack(
+        [verts[np.asarray(loop, dtype=np.int32)] for loop in valid]
+    )
+    extent = float(np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0)))
+    stitch_gap = max(extent * float(max(stitch_gap_frac, 0.0)), 1e-4)
+    bridge_gap = max(
+        extent * float(max(bridge_gap_frac, stitch_gap_frac, 0.0)),
+        stitch_gap,
+    )
+    meta["extent"] = extent
+    meta["stitch_gap"] = stitch_gap
+    meta["bridge_gap"] = bridge_gap
+
+    stage_key = str(stage).upper()
+    if stage_key == "ISLANDS":
+        items = [
+            {
+                "points": verts[np.asarray(loop, dtype=np.int32)].copy(),
+                "loop_ids": loop,
+                "merged_from": 1,
+            }
+            for loop in valid
+        ]
+        return items, meta
+
+    if stage_key == "STITCH":
+        return merge_nearby_loops_to_outer_contours(
+            valid, verts, max_gap=stitch_gap
+        ), meta
+
+    # BRIDGE：用更大间隙聚簇；簇内优先消对边，失败再条带外包络
+    if not bridge_enabled:
+        return merge_nearby_loops_to_outer_contours(
+            valid, verts, max_gap=stitch_gap
+        ), meta
+
+    clusters = cluster_nearby_boundary_loops(valid, verts, max_gap=bridge_gap)
+    items: list[dict] = []
+    bridge_links: list[tuple[np.ndarray, np.ndarray]] = []
+    for cluster in clusters:
+        cluster_loops = [valid[index] for index in cluster]
+        if len(cluster_loops) == 1:
+            ids = cluster_loops[0]
+            items.append(
+                {
+                    "points": verts[np.asarray(ids, dtype=np.int32)].copy(),
+                    "loop_ids": ids,
+                    "merged_from": 1,
+                }
+            )
+            continue
+        centroids = []
+        for loop in cluster_loops:
+            pts = verts[np.asarray(loop, dtype=np.int32)]
+            centroids.append(pts.mean(axis=0))
+        for index in range(len(centroids) - 1):
+            bridge_links.append(
+                (centroids[index].copy(), centroids[index + 1].copy())
+            )
+        # 先按缝合间隙尝试消对边；失败再用桥接外包络
+        envelope = _outer_contour_for_nearby_cluster(
+            cluster_loops,
+            verts,
+            max_gap=stitch_gap,
+        )
+        if envelope is None or len(envelope) < 3:
+            try:
+                envelope, _, _ = combine_boundary_islands(
+                    cluster_loops,
+                    verts,
+                    interior_points=interior_points,
+                    prefer_outer_envelope=True,
+                )
+            except RegionFitError:
+                for ids in cluster_loops:
+                    items.append(
+                        {
+                            "points": verts[
+                                np.asarray(ids, dtype=np.int32)
+                            ].copy(),
+                            "loop_ids": ids,
+                            "merged_from": 1,
+                        }
+                    )
+                continue
+        items.append(
+            {
+                "points": _as_float_array(envelope).copy(),
+                "loop_ids": None,
+                "merged_from": int(len(cluster_loops)),
+            }
+        )
+    meta["bridge_links"] = bridge_links
+    return items, meta
+
+
 def extract_island_longest_sides(
     region_ids: np.ndarray,
     target_id,
@@ -3048,13 +3173,17 @@ def extract_island_longest_sides(
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
     max_sides: int = 4,
     bezier_samples: int = 24,
+    stage: str = "STITCH",
+    stitch_gap_frac: float = _MULTI_ISLAND_MERGE_GAP_FRAC,
+    bridge_gap_frac: float = 0.25,
+    bridge_enabled: bool = True,
+    min_perimeter_frac: float = _MIN_ISLAND_PERIMETER_FRAC,
+    interior_points: np.ndarray | None = None,
 ) -> dict:
     """
     对领域内每个 island 边界环按折角拆成段并拟合。
 
-    不按长短合并到固定边数；只在明显折角处断开。
-    多岛时：仅邻近孤岛消对向内边融为外轮廓；远岛保持独立（禁止弦线桥接）。
-    外轮廓取网格边界，不用条带/凸包改写。
+    stage 控制多岛策略：ISLANDS / STITCH / BRIDGE。
     每条平滑折线段或曲线段分配独立随机颜色（segment_colors）。
     max_sides 保留兼容，调试拆分不再使用它压边数。
     """
@@ -3072,29 +3201,22 @@ def extract_island_longest_sides(
         loop_total,
         loop_vertex_indices,
     )
-    # 忽略离散极小边界环，避免面内出现极短拟合边
-    loops = filter_significant_boundary_loops(loops, verts)
+    loops = filter_significant_boundary_loops(
+        loops,
+        verts,
+        min_perimeter_frac=min_perimeter_frac,
+    )
     if not loops:
         raise RegionFitError("过滤极小碎环后无可用边界")
 
-    # 按间隙分簇：近岛融外轮廓，远岛各管各的
-    all_loop_pts = [
-        verts[np.asarray(loop, dtype=np.int32)]
-        for loop in loops
-        if len(loop) >= 3
-    ]
-    if all_loop_pts:
-        stacked = np.vstack(all_loop_pts)
-        extent0 = float(
-            np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0))
-        )
-        merge_gap = max(extent0 * _MULTI_ISLAND_MERGE_GAP_FRAC, 1e-4)
-    else:
-        merge_gap = 1e-4
-    work_items = merge_nearby_loops_to_outer_contours(
+    work_items, stage_meta = build_fit_work_items(
         loops,
         verts,
-        max_gap=merge_gap,
+        stage=stage,
+        stitch_gap_frac=stitch_gap_frac,
+        bridge_gap_frac=bridge_gap_frac,
+        bridge_enabled=bridge_enabled,
+        interior_points=interior_points,
     )
     if not work_items:
         raise RegionFitError("过滤极小碎环后无可用边界")
@@ -3449,6 +3571,11 @@ def extract_island_longest_sides(
         "bevel_depth": bevel_depth,
         "control_radius": control_radius,
         "fold_radius": fold_radius,
+        "stage": stage_meta.get("stage", stage),
+        "stitch_gap": float(stage_meta.get("stitch_gap", 0.0)),
+        "bridge_gap": float(stage_meta.get("bridge_gap", 0.0)),
+        "bridge_links": stage_meta.get("bridge_links", []),
+        "extent": float(stage_meta.get("extent", extent)),
     }
 
 
@@ -4243,6 +4370,10 @@ def analyze_region_fit_topology(
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
     adjacency_offsets: np.ndarray | None = None,
     adjacency_indices: np.ndarray | None = None,
+    stitch_gap_frac: float = _MULTI_ISLAND_MERGE_GAP_FRAC,
+    bridge_gap_frac: float = 0.25,
+    bridge_enabled: bool = True,
+    min_perimeter_frac: float = _MIN_ISLAND_PERIMETER_FRAC,
 ) -> dict:
     """分析领域边界并返回拟合拓扑描述；target_id 可为编号集合。"""
     work_ids = _as_int_array(region_ids)
@@ -4254,25 +4385,53 @@ def analyze_region_fit_topology(
         loop_total,
         loop_vertex_indices,
     )
-    loops = filter_significant_boundary_loops(loops, vertices)
+    loops = filter_significant_boundary_loops(
+        loops,
+        vertices,
+        min_perimeter_frac=min_perimeter_frac,
+    )
     if not loops:
         raise RegionFitError("过滤极小碎环后无可用边界")
-    # 只融并邻近孤岛：远岛不拉弦线；多岛簇强制保留外包络（禁止退回最长单环）
+    # 目标面心 + 邻接/-走廊 -1 碎面，供跨岛包络延长相接
+    interior = collect_island_bridge_interiors(
+        work_ids,
+        target_id,
+        face_centers,
+        adjacency_offsets=adjacency_offsets,
+        adjacency_indices=adjacency_indices,
+    )
+    # 成面默认走桥接阶段：邻近缝合 + 远岛条带包络（可由参数关闭）
+    work_items, stage_meta = build_fit_work_items(
+        loops,
+        vertices,
+        stage="BRIDGE" if bridge_enabled else "STITCH",
+        stitch_gap_frac=stitch_gap_frac,
+        bridge_gap_frac=bridge_gap_frac,
+        bridge_enabled=bridge_enabled,
+        interior_points=interior,
+    )
+    if not work_items:
+        raise RegionFitError("过滤极小碎环后无可用边界")
+    primary = max(
+        work_items,
+        key=lambda item: float(
+            polyline_length(
+                np.vstack(
+                    (
+                        _as_float_array(item["points"]),
+                        _as_float_array(item["points"])[:1],
+                    )
+                )
+            )
+        ),
+    )
     verts = _as_float_array(vertices)
-    all_loop_pts = [
-        verts[np.asarray(loop, dtype=np.int32)]
-        for loop in loops
-        if len(loop) >= 3
-    ]
-    if all_loop_pts:
-        stacked = np.vstack(all_loop_pts)
-        extent0 = float(
-            np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0))
-        )
-        merge_gap = max(extent0 * _MULTI_ISLAND_MERGE_GAP_FRAC, 1e-4)
-    else:
-        merge_gap = 1e-4
-    clusters = cluster_nearby_boundary_loops(loops, verts, max_gap=merge_gap)
+    gap = (
+        float(stage_meta["bridge_gap"])
+        if bridge_enabled
+        else float(stage_meta["stitch_gap"])
+    )
+    clusters = cluster_nearby_boundary_loops(loops, verts, max_gap=gap)
     if not clusters:
         raise RegionFitError("过滤极小碎环后无可用边界")
 
@@ -4285,20 +4444,16 @@ def analyze_region_fit_topology(
 
     primary_cluster = max(clusters, key=_cluster_perimeter)
     fit_loops = [list(loops[index]) for index in primary_cluster]
-    # 目标面心 + 邻接/-走廊 -1 碎面，供跨岛包络延长相接
-    interior = collect_island_bridge_interiors(
-        work_ids,
-        target_id,
-        face_centers,
-        adjacency_offsets=adjacency_offsets,
-        adjacency_indices=adjacency_indices,
-    )
-    loop_pts, band_sides, _band_samples = combine_boundary_islands(
-        fit_loops,
-        vertices,
-        interior_points=interior,
-        prefer_outer_envelope=len(fit_loops) > 1,
-    )
+    try:
+        loop_pts, band_sides, _band_samples = combine_boundary_islands(
+            fit_loops,
+            vertices,
+            interior_points=interior,
+            prefer_outer_envelope=len(fit_loops) > 1,
+        )
+    except RegionFitError:
+        loop_pts = _as_float_array(primary["points"])
+        band_sides = None
     _, normal, _, _ = compute_region_frame(
         face_normals,
         face_areas,
@@ -4404,6 +4559,8 @@ def analyze_region_fit_topology(
         "surface_samples": interior,
         "cluster_count": len(clusters),
         "skipped_far_loops": max(len(loops) - len(fit_loops), 0),
+        "stitch_gap": float(stage_meta.get("stitch_gap", 0.0)),
+        "bridge_gap": float(stage_meta.get("bridge_gap", 0.0)),
     }
 
 
@@ -4423,6 +4580,10 @@ def fit_region_surface(
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
     adjacency_offsets: np.ndarray | None = None,
     adjacency_indices: np.ndarray | None = None,
+    stitch_gap_frac: float = _MULTI_ISLAND_MERGE_GAP_FRAC,
+    bridge_gap_frac: float = 0.25,
+    bridge_enabled: bool = True,
+    min_perimeter_frac: float = _MIN_ISLAND_PERIMETER_FRAC,
 ) -> RegionFitResult:
     """拟合指定领域（或多个领域并集）为三边或四边规则网格。"""
     analysis = analyze_region_fit_topology(
@@ -4439,6 +4600,10 @@ def fit_region_surface(
         corner_angle_deg=corner_angle_deg,
         adjacency_offsets=adjacency_offsets,
         adjacency_indices=adjacency_indices,
+        stitch_gap_frac=stitch_gap_frac,
+        bridge_gap_frac=bridge_gap_frac,
+        bridge_enabled=bridge_enabled,
+        min_perimeter_frac=min_perimeter_frac,
     )
     topology = str(analysis["topology"])
     sides = analysis["sides"]
@@ -4507,6 +4672,7 @@ __all__ = (
     "detect_corner_indices",
     "detect_concave_fold_indices",
     "extend_quad_corners_by_tangents",
+    "build_fit_work_items",
     "extract_island_longest_sides",
     "extract_region_boundary_loops",
     "build_edge_face_adjacency",

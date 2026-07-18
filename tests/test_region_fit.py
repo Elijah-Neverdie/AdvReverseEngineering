@@ -939,7 +939,7 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertAlmostEqual(float(result.vertices[:, 0].max()), 2.0, places=6)
 
     def test_fit_disconnected_far_islands_keeps_primary_only(self) -> None:
-        """远岛不拉弦线：只拟合主簇，不跨越 0.5 断口。"""
+        """关闭桥接时：远岛不拉弦线，只拟合主簇。"""
         mesh = _disconnected_same_region_strip()
         result = fit_region_surface(
             region_ids=mesh["region_ids"],
@@ -953,6 +953,7 @@ class FitRegionSurfaceTests(unittest.TestCase):
             face_centers=mesh["centers"],
             segments_u=5,
             segments_v=2,
+            bridge_enabled=False,
         )
         self.assertEqual(result.topology, "QUAD")
         # 主簇是单侧 1x1 方岛，不应被弦线拉到 x=2.5
@@ -1265,7 +1266,53 @@ class FitRegionSurfaceTests(unittest.TestCase):
             color_ids = [int(b["color_id"]) for b in island["beziers"]]
             self.assertEqual(len(color_ids), len(set(color_ids)))
 
-    def test_nearby_islands_merge_to_outer_contour(self) -> None:
+    def test_fit_stage_work_items_islands_stitch_bridge(self) -> None:
+        """三步工作项：ISLANDS 分岛、STITCH 近并、BRIDGE 远并。"""
+        from AdvReverseEngineering.algorithms.region_fit import build_fit_work_items
+
+        # 三矩形：0-1 近(0.05)，1-2 远(0.5)
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.05, 0.0, 0.0],
+                [2.05, 0.0, 0.0],
+                [2.05, 1.0, 0.0],
+                [1.05, 1.0, 0.0],
+                [2.55, 0.0, 0.0],
+                [3.55, 0.0, 0.0],
+                [3.55, 1.0, 0.0],
+                [2.55, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        loops = [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]
+        islands, _ = build_fit_work_items(
+            loops, vertices, stage="ISLANDS", stitch_gap_frac=0.08
+        )
+        self.assertEqual(len(islands), 3)
+        stitch, _ = build_fit_work_items(
+            loops,
+            vertices,
+            stage="STITCH",
+            stitch_gap_frac=0.08,
+            bridge_gap_frac=0.25,
+        )
+        self.assertEqual(len(stitch), 2)
+        self.assertEqual(int(stitch[0]["merged_from"]) + int(stitch[1]["merged_from"]), 3)
+        bridge, meta = build_fit_work_items(
+            loops,
+            vertices,
+            stage="BRIDGE",
+            stitch_gap_frac=0.08,
+            bridge_gap_frac=0.35,
+            bridge_enabled=True,
+        )
+        self.assertEqual(len(bridge), 1)
+        self.assertEqual(int(bridge[0]["merged_from"]), 3)
+        self.assertGreaterEqual(len(meta.get("bridge_links") or []), 1)
         """间隙很小的两岛融并为外轮廓，岛间内边被消去。"""
         # 两矩形间距 0.05；extent≈2.7 → gap 阈值约 0.13，应融并
         vertices = np.array(
