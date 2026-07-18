@@ -21,6 +21,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     detect_corner_indices,
     detect_side_fold_indices,
     extract_island_longest_sides,
+    loop_has_internal_corridor,
     merge_nearby_loops_to_outer_contours,
     extract_polyline_keypoints,
     extract_region_boundary_loops,
@@ -1196,6 +1197,7 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertAlmostEqual(float(sampled[-1, 0]), 3.0, places=6)
 
     def test_extract_disconnected_islands_longest_sides(self) -> None:
+        """同一领域多岛调试边应融成一条外轮廓，不再各画一套内边。"""
         mesh = _disconnected_same_region_strip()
         debug = extract_island_longest_sides(
             region_ids=mesh["region_ids"],
@@ -1205,15 +1207,23 @@ class FitRegionSurfaceTests(unittest.TestCase):
             loop_total=mesh["loop_total"],
             loop_vertex_indices=mesh["loop_vertex_indices"],
         )
-        self.assertEqual(debug["island_count"], 2)
-        for island in debug["islands"]:
-            self.assertEqual(len(island["sides"]), 4)
-            self.assertEqual(len(island["lengths"]), 4)
-            color_ids = [int(b["color_id"]) for b in island["beziers"]]
-            self.assertEqual(len(color_ids), len(set(color_ids)))
-            for index, side in enumerate(island["sides"]):
-                nxt = island["sides"][(index + 1) % 4]
-                np.testing.assert_allclose(side[-1], nxt[0], atol=1e-9)
+        self.assertEqual(debug["island_count"], 1)
+        self.assertEqual(int(debug["islands"][0]["merged_from"]), 2)
+        island = debug["islands"][0]
+        self.assertGreaterEqual(len(island["sides"]), 2)
+        color_ids = [int(b["color_id"]) for b in island["beziers"]]
+        self.assertEqual(len(color_ids), len(set(color_ids)))
+        # 外轮廓应盖住两岛整体包围盒，中缝不应再出现贯穿内边
+        all_pts = np.vstack(island["sides"])
+        self.assertAlmostEqual(float(all_pts[:, 0].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(all_pts[:, 0].max()), 2.5, places=5)
+        mid_interior = all_pts[
+            (all_pts[:, 0] > 0.95)
+            & (all_pts[:, 0] < 1.55)
+            & (all_pts[:, 1] > 0.1)
+            & (all_pts[:, 1] < 0.9)
+        ]
+        self.assertEqual(len(mid_interior), 0)
 
     def test_nearby_islands_merge_to_outer_contour(self) -> None:
         """间隙很小的两岛融并为外轮廓，岛间内边被消去。"""
@@ -1255,7 +1265,7 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertEqual(len(mid_interior), 0)
 
     def test_far_islands_stay_separate_after_merge_pass(self) -> None:
-        """间距较大的两岛保持各自独立。"""
+        """间距较大的两岛在按间隙聚类时保持各自独立。"""
         mesh = _disconnected_same_region_strip()
         loops = extract_region_boundary_loops(
             mesh["region_ids"],
@@ -1272,6 +1282,65 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertEqual(len(items), 2)
         self.assertTrue(all(item["merged_from"] == 1 for item in items))
         self.assertTrue(all(item["loop_ids"] is not None for item in items))
+
+    def test_prefer_outer_envelope_keeps_full_bbox(self) -> None:
+        """prefer_outer_envelope 始终保留覆盖全部 island 的外包络。"""
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [2.05, 0.2, 0.0],
+                [2.4, 0.2, 0.0],
+                [2.4, 0.8, 0.0],
+                [2.05, 0.8, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        loops = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        envelope, sides, _band = combine_boundary_islands(
+            loops,
+            vertices,
+            prefer_outer_envelope=True,
+        )
+        self.assertGreaterEqual(float(envelope[:, 0].max()), 2.35)
+        self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=5)
+        self.assertIsNotNone(sides)
+
+    def test_notched_loop_corridor_uses_outer_envelope(self) -> None:
+        """单环深凹口应识别为内缝，外包络后凹口内边消失。"""
+        # U 形：顶部中间开口向下的深凹口
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [3.0, 2.0, 0.0],
+                [2.0, 2.0, 0.0],
+                [2.0, 0.15, 0.0],
+                [1.0, 0.15, 0.0],
+                [1.0, 2.0, 0.0],
+                [0.0, 2.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        loop = [0, 1, 2, 3, 4, 5, 6, 7]
+        self.assertTrue(loop_has_internal_corridor(vertices[loop]))
+        items = merge_nearby_loops_to_outer_contours(
+            [loop],
+            vertices,
+            max_gap=0.1,
+        )
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0]["loop_ids"])
+        envelope = items[0]["points"]
+        notch_interior = envelope[
+            (envelope[:, 0] > 1.05)
+            & (envelope[:, 0] < 1.95)
+            & (envelope[:, 1] > 0.2)
+            & (envelope[:, 1] < 1.8)
+        ]
+        self.assertEqual(len(notch_interior), 0)
 
 
 if __name__ == "__main__":

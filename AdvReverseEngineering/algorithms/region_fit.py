@@ -30,6 +30,8 @@ _MAX_SPLIT_CORNERS = 64
 _MIN_SEGMENT_LOOP_FRAC = 0.025
 # 多岛：线/点邻近判定相对包围盒对角线的比例
 _MULTI_ISLAND_PROXIMITY_FRAC = 0.05
+# 单环自贴近（深凹口/内缝）判定：非邻接点间距相对包围盒对角线
+_LOOP_CORRIDOR_GAP_FRAC = 0.06
 # 近平行判定：方向点积绝对值下限
 _MULTI_ISLAND_PARALLEL_DOT = 0.85
 # 投影重叠占较长段比例下限
@@ -706,6 +708,7 @@ def combine_boundary_islands(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
     interior_points: np.ndarray | None = None,
+    prefer_outer_envelope: bool = False,
 ) -> tuple[np.ndarray, list[np.ndarray] | None, dict | None]:
     """
     将同一领域内互不连通的 island 边界合成为一个连续外包络。
@@ -717,16 +720,19 @@ def combine_boundary_islands(
     interior_points（通常为领域面心）会并入分箱极值，使包络向外
     延伸覆盖角部/凹口。
 
+    prefer_outer_envelope=True 时：
+      - 单环也走条带外包络（消去深凹口/内缝）
+      - 条带不对称时仍返回外包络，不退回最长单环
+
     返回 (envelope, band_sides, band_samples)：
       - envelope: 有序 3D 闭环（不重复首点）
-      - band_sides: 多 island 时为共享 u 参数的四边；单环时为 None
-      - band_samples: 多 island 时含 points/param_u/param_v，供表面采样；
-        单环时为 None
+      - band_sides: 形成条带包络时为共享 u 参数的四边；否则为 None
+      - band_samples: 条带包络时含 points/param_u/param_v；否则为 None
     """
     if not loops:
         raise RegionFitError("没有边界环可合并")
     verts = _as_float_array(vertices)
-    if len(loops) == 1:
+    if len(loops) == 1 and not prefer_outer_envelope:
         return verts[np.asarray(loops[0], dtype=np.int32)].copy(), None, None
 
     loop_points = [
@@ -793,8 +799,13 @@ def combine_boundary_islands(
             force_axis = True
 
     # 对边长弧长度相差过大，或 island 过于碎散：说明并非同一条带，
-    # 强行并包络会产生扭曲；回退为最长单环。
-    if band_sides is not None and len(band_sides) == 4:
+    # 强行并包络会产生扭曲；曲面拟合可回退最长单环。
+    # 调试外轮廓必须保留包络，否则会「只剩一部分」。
+    if (
+        not prefer_outer_envelope
+        and band_sides is not None
+        and len(band_sides) == 4
+    ):
         long_a = polyline_length(band_sides[0])
         long_b = polyline_length(band_sides[2])
         shorter = min(long_a, long_b)
@@ -821,6 +832,37 @@ def combine_boundary_islands(
         "param_v": param_v,
     }
     return envelope, band_sides, band_samples
+
+
+def loop_has_internal_corridor(
+    points: np.ndarray,
+    gap_frac: float = _LOOP_CORRIDOR_GAP_FRAC,
+) -> bool:
+    """
+    判断闭环是否存在深凹口/内缝：非邻接边界点彼此贴近。
+
+    此类环若直接按原边界拆边，会把内缝当成外轮廓的一部分画出来。
+    """
+    pts = _as_float_array(points)
+    if len(pts) < 8:
+        return False
+    sample_n = int(np.clip(len(pts), 32, 96))
+    rs = resample_closed_polyline(pts, sample_n)
+    extent = float(np.linalg.norm(rs.max(axis=0) - rs.min(axis=0)))
+    if extent < 1e-12:
+        return False
+    gap = max(extent * float(gap_frac), 1e-6)
+    # 沿环至少隔开 1/6 周长，避免把相邻折角当成内缝
+    min_sep = max(sample_n // 6, 3)
+    max_sep = sample_n - min_sep
+    for i in range(sample_n):
+        for offset in range(min_sep, max_sep + 1):
+            j = (i + offset) % sample_n
+            if j <= i:
+                continue
+            if float(np.linalg.norm(rs[i] - rs[j])) <= gap:
+                return True
+    return False
 
 
 def approx_closed_polyline_gap(
@@ -907,9 +949,12 @@ def merge_nearby_loops_to_outer_contours(
     """
     邻近孤岛融并为新孤岛，只保留外轮廓。
 
+    多环簇：条带外包络（prefer_outer_envelope，不退回最长单环）。
+    单环若存在深凹口/内缝：同样外包络，去掉内缝边。
+
     返回工作项列表，每项含:
       - points: (N,3) 外轮廓点（不重复首点）
-      - loop_ids: 原始顶点环（单岛时有值；融并外轮廓为 None）
+      - loop_ids: 原始顶点环（未改写的单岛有值；外轮廓为 None）
       - merged_from: 融并前孤岛数
     """
     verts = _as_float_array(vertices)
@@ -921,10 +966,26 @@ def merge_nearby_loops_to_outer_contours(
         cluster_loops = [list(int(v) for v in loops[index]) for index in cluster]
         if len(cluster_loops) == 1:
             ids = cluster_loops[0]
+            pts = verts[np.asarray(ids, dtype=np.int32)]
+            if not loop_has_internal_corridor(pts):
+                items.append(
+                    {
+                        "points": pts.copy(),
+                        "loop_ids": ids,
+                        "merged_from": 1,
+                    }
+                )
+                continue
+            # 单环深凹口：外包络消去内缝
+            envelope, _band_sides, _samples = combine_boundary_islands(
+                cluster_loops,
+                verts,
+                prefer_outer_envelope=True,
+            )
             items.append(
                 {
-                    "points": verts[np.asarray(ids, dtype=np.int32)].copy(),
-                    "loop_ids": ids,
+                    "points": _as_float_array(envelope).copy(),
+                    "loop_ids": None,
                     "merged_from": 1,
                 }
             )
@@ -932,6 +993,7 @@ def merge_nearby_loops_to_outer_contours(
         envelope, _band_sides, _samples = combine_boundary_islands(
             cluster_loops,
             verts,
+            prefer_outer_envelope=True,
         )
         # 外轮廓即新孤岛；岛间内边在包络过程中已被消去
         items.append(
@@ -2558,7 +2620,7 @@ def extract_island_longest_sides(
     对领域内每个 island 边界环按折角拆成段并拟合。
 
     不按长短合并到固定边数；只在明显折角处断开。
-    多岛时：邻近孤岛先融并为外轮廓新孤岛（消去岛间内边），再对轮廓拆分拟合。
+    多岛时：同一领域全部融为一条外轮廓新孤岛（消去岛间/内缝边），再拆分拟合。
     每条平滑折线段或曲线段分配独立随机颜色（segment_colors）。
     max_sides 保留兼容，调试拆分不再使用它压边数。
     """
@@ -2581,27 +2643,44 @@ def extract_island_longest_sides(
     if not loops:
         raise RegionFitError("过滤极小碎环后无可用边界")
 
-    # 邻近孤岛融并为外轮廓新孤岛（去掉岛间内边）
-    all_loop_pts = [
-        verts[np.asarray(loop, dtype=np.int32)]
-        for loop in loops
-        if len(loop) >= 3
-    ]
-    if all_loop_pts:
-        stacked_loops = np.vstack(all_loop_pts)
-        extent0 = float(
-            np.linalg.norm(stacked_loops.max(axis=0) - stacked_loops.min(axis=0))
+    # 同一领域全部融为一条外轮廓新孤岛（与曲面拟合一致；消去岛间/内缝边）
+    if len(loops) >= 2:
+        envelope, _band, _samples = combine_boundary_islands(
+            loops,
+            verts,
+            prefer_outer_envelope=True,
         )
-        merge_gap = max(extent0 * _MULTI_ISLAND_PROXIMITY_FRAC, 1e-4)
+        work_items = [
+            {
+                "points": _as_float_array(envelope).copy(),
+                "loop_ids": None,
+                "merged_from": int(len(loops)),
+            }
+        ]
     else:
-        merge_gap = 1e-4
-    work_items = merge_nearby_loops_to_outer_contours(
-        loops,
-        verts,
-        max_gap=merge_gap,
-    )
-    if not work_items:
-        raise RegionFitError("过滤极小碎环后无可用边界")
+        ids = [int(v) for v in loops[0]]
+        pts = verts[np.asarray(ids, dtype=np.int32)]
+        if loop_has_internal_corridor(pts):
+            envelope, _band, _samples = combine_boundary_islands(
+                [ids],
+                verts,
+                prefer_outer_envelope=True,
+            )
+            work_items = [
+                {
+                    "points": _as_float_array(envelope).copy(),
+                    "loop_ids": None,
+                    "merged_from": 1,
+                }
+            ]
+        else:
+            work_items = [
+                {
+                    "points": pts.copy(),
+                    "loop_ids": ids,
+                    "merged_from": 1,
+                }
+            ]
 
     sample_n = max(int(bezier_samples), 4)
     island_drafts: list[dict] = []
@@ -3995,6 +4074,7 @@ __all__ = (
     "merge_collinear_adjacent_sides",
     "merge_nearby_loops_to_outer_contours",
     "cluster_nearby_boundary_loops",
+    "loop_has_internal_corridor",
     "point_to_polyline_distance",
     "sample_cubic_bezier",
     "polyline_length",
