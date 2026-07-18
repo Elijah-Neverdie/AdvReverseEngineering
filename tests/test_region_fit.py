@@ -351,6 +351,48 @@ class TopologyClassificationTests(unittest.TestCase):
         corners = detect_corner_indices(pts, angle_threshold_deg=20.0)
         self.assertEqual(len(corners), 4)
 
+    def test_multi_stride_ignores_edge_sawtooth(self) -> None:
+        """
+        边上锯齿只在小尺度显尖角；2/4/8/16 共识应抓住四角，不把边中锯齿当角。
+        """
+        corners_xy = np.array(
+            [
+                [0.0, 0.0],
+                [4.0, 0.0],
+                [4.0, 3.0],
+                [0.0, 3.0],
+            ],
+            dtype=np.float64,
+        )
+        dense: list[np.ndarray] = []
+        for index in range(len(corners_xy)):
+            a = corners_xy[index]
+            b = corners_xy[(index + 1) % len(corners_xy)]
+            for t in np.linspace(0.0, 1.0, 40, endpoint=False):
+                dense.append(a * (1.0 - t) + b * t)
+        pts = np.asarray(dense, dtype=np.float64)
+        # 底边中段加入垂直锯齿（小尺度尖、大尺度仍接近直线）
+        mid = 20
+        pts[mid] = pts[mid] + np.array([0.0, 0.35])
+        pts[mid - 1] = pts[mid - 1] + np.array([0.0, 0.18])
+        pts[mid + 1] = pts[mid + 1] + np.array([0.0, 0.18])
+
+        found = detect_corner_indices(
+            pts,
+            angle_threshold_deg=35.0,
+            max_corners=8,
+            sample_strides=(2, 4, 8, 16),
+        )
+        self.assertGreaterEqual(len(found), 4)
+        # 不应把锯齿点收成主角：主角应靠近四角坐标
+        corner_pts = pts[np.asarray(found[:4], dtype=np.int32)]
+        for target in corners_xy:
+            dist = np.min(np.linalg.norm(corner_pts - target, axis=1))
+            self.assertLess(dist, 0.35)
+        # 锯齿点本身不应进入最终角点集
+        self.assertNotIn(mid, found)
+        self.assertEqual(len(found), 4)
+
     def test_l_shape_corner_not_merged_into_one_side(self) -> None:
         """
         L 形闭环：尖角过多时不应强行并成带折角的「四边」。

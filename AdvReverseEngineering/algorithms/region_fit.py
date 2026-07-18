@@ -24,6 +24,9 @@ _BOUNDARY_SAMPLES_MAX = 384
 # 先多取角点候选，再按最短边合并到三/四边，避免尖角被 NMS 挤掉后并成长边
 _MAX_CORNER_CANDIDATES = 12
 _STRONG_CONCAVE_ANGLE_DEG = 55.0
+# 锯齿边界：隔 2/4/8/16 点取弦，多尺度共识判定真尖角
+_CORNER_SAMPLE_STRIDES = (2, 4, 8, 16)
+_CORNER_STRIDE_MIN_VOTES = 2
 
 
 class RegionFitError(ValueError):
@@ -997,13 +1000,14 @@ def detect_corner_indices(
     min_separation_frac: float = 0.025,
     convex_only: bool = True,
     include_strong_concave: bool = True,
+    sample_strides: Sequence[int] | None = None,
 ) -> list[int]:
     """
-    在均匀采样的闭环折线上按窗口化转角检测角点。
+    在均匀采样的闭环折线上检测角点。
 
-    使用多尺度 ±window 弦向量取最大转角，避免单一大窗口抹掉尖角；
-    按转角强度做非极大值抑制。默认优先凸角，但保留足够锐的凹角，
-    以免凹口尖角漏检后把折线并成一条伪最长边。
+    默认隔 2/4/8/16 个点取弦做多重采样：真尖角在多个尺度都呈大转角，
+    锯齿噪声通常只在小尺度突出。以中位数转角 + 尺度投票抑制假角，
+    再按强度做非极大值抑制。
     要求闭环为逆时针方向（凸/凹判定依赖叉积符号）。
     """
     pts = _as_float_array(points_2d)
@@ -1011,28 +1015,32 @@ def detect_corner_indices(
     if count < 3:
         return []
 
+    max_span = max((count - 1) // 2, 1)
     if window is not None:
-        window_list = [max(1, min(int(window), max((count - 1) // 2, 1)))]
-    else:
-        base = max(1, count // 32)
-        window_list = sorted(
+        strides = [max(1, min(int(window), max_span))]
+    elif sample_strides is not None:
+        strides = sorted(
             {
-                max(1, base),
-                max(1, base // 2),
-                max(1, base // 4),
-                1,
+                max(1, min(int(stride), max_span))
+                for stride in sample_strides
+                if int(stride) > 0
             }
         )
-        window_list = [
-            min(w, max((count - 1) // 2, 1)) for w in window_list
+    else:
+        strides = [
+            stride
+            for stride in _CORNER_SAMPLE_STRIDES
+            if stride <= max_span
         ]
+        if not strides:
+            strides = [1]
 
-    angles = np.zeros(count, dtype=np.float64)
-    cross = np.zeros(count, dtype=np.float64)
     indices = np.arange(count)
-    for w in window_list:
-        prev_pts = pts[(indices - w) % count]
-        next_pts = pts[(indices + w) % count]
+    angle_stack: list[np.ndarray] = []
+    cross_stack: list[np.ndarray] = []
+    for stride in strides:
+        prev_pts = pts[(indices - stride) % count]
+        next_pts = pts[(indices + stride) % count]
         incoming = pts - prev_pts
         outgoing = next_pts - pts
         in_len = np.linalg.norm(incoming, axis=1)
@@ -1050,24 +1058,60 @@ def detect_corner_indices(
         cross_w = (
             incoming[:, 0] * outgoing[:, 1] - incoming[:, 1] * outgoing[:, 0]
         )
-        better = angles_w > angles
-        angles = np.where(better, angles_w, angles)
-        cross = np.where(better, cross_w, cross)
+        cross_w[~valid] = 0.0
+        angle_stack.append(angles_w)
+        cross_stack.append(cross_w)
 
+    angle_mat = np.vstack(angle_stack)
+    cross_mat = np.vstack(cross_stack)
+    # 中位数抑制单尺度锯齿尖峰；大尺度也参与投票
+    robust_angles = np.median(angle_mat, axis=0)
     threshold = float(max(angle_threshold_deg, 1.0))
-    candidates = angles >= threshold
+    votes = np.sum(angle_mat >= threshold, axis=0)
+    min_votes = min(int(_CORNER_STRIDE_MIN_VOTES), len(strides))
+    # 大步长必须全部过阈值：真尖角在 8/16 仍接近直角，锯齿通常只在小尺度尖
+    large_strides = [
+        index
+        for index, stride in enumerate(strides)
+        if stride >= 8
+    ]
+    if large_strides:
+        large_ok = np.all(
+            angle_mat[np.asarray(large_strides, dtype=np.int32)] >= threshold,
+            axis=0,
+        )
+    else:
+        large_ok = np.ones(count, dtype=bool)
+
+    candidates = (robust_angles >= threshold) & (votes >= min_votes) & large_ok
+
+    # 叉积取「过阈值尺度」的符号和，稳定凸/凹判定
+    pass_mask = angle_mat >= threshold
+    cross_votes = np.sum(
+        np.where(pass_mask, np.sign(cross_mat), 0.0),
+        axis=0,
+    )
     if convex_only:
-        keep = cross > 0.0
+        keep = cross_votes > 0.0
         if include_strong_concave:
-            keep |= (cross < 0.0) & (
-                angles >= float(max(threshold, _STRONG_CONCAVE_ANGLE_DEG))
+            keep |= (cross_votes < 0.0) & (
+                robust_angles
+                >= float(max(threshold, _STRONG_CONCAVE_ANGLE_DEG))
             )
         candidates &= keep
+
     candidate_idx = np.flatnonzero(candidates)
     if len(candidate_idx) == 0:
         return []
 
-    order = candidate_idx[np.argsort(angles[candidate_idx])[::-1]]
+    # 强度：中位转角 + 大尺度加成，真直角优先于局部锯齿
+    strength = robust_angles.copy()
+    if large_strides:
+        strength += 0.25 * np.max(
+            angle_mat[np.asarray(large_strides, dtype=np.int32)],
+            axis=0,
+        )
+    order = candidate_idx[np.argsort(strength[candidate_idx])[::-1]]
     min_sep = max(1, int(round(count * float(min_separation_frac))))
     kept: list[int] = []
     for index in order.tolist():
@@ -1082,6 +1126,7 @@ def detect_corner_indices(
         if len(kept) >= int(max_corners):
             break
     return sorted(kept)
+
 
 
 def side_interior_max_turn_deg(points: np.ndarray) -> float:
