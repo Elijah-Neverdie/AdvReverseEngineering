@@ -23,13 +23,14 @@ _BOUNDARY_SAMPLES_MIN = 96
 _BOUNDARY_SAMPLES_MAX = 384
 # 先多取角点候选，再按最短边合并到三/四边，避免尖角被 NMS 挤掉后并成长边
 _MAX_CORNER_CANDIDATES = 12
-_STRONG_CONCAVE_ANGLE_DEG = 55.0
+_STRONG_CONCAVE_ANGLE_DEG = 35.0
 # 锯齿边界：隔 2/4/8/16 点取弦，多尺度共识判定真尖角
 _CORNER_SAMPLE_STRIDES = (2, 4, 8, 16)
 _CORNER_STRIDE_MIN_VOTES = 2
 # 凹折角判定阈值（度）；控制手柄偏离边线超过该比例视为离散噪声并忽略
-_CONCAVE_FOLD_ANGLE_DEG = 55.0
+_CONCAVE_FOLD_ANGLE_DEG = 35.0
 _HANDLE_OUTLIER_FRAC = 0.03
+_MAX_CONCAVE_FOLDS = 32
 
 
 class RegionFitError(ValueError):
@@ -1181,6 +1182,7 @@ def detect_corner_indices(
 def _multi_stride_turn_fields(
     points_2d: np.ndarray,
     sample_strides: Sequence[int] | None = None,
+    closed: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[int]]:
     """计算多尺度转角 / 叉积，返回 (angle_mat, cross_mat, robust_angles, strides)。"""
     pts = _as_float_array(points_2d)
@@ -1209,13 +1211,23 @@ def _multi_stride_turn_fields(
     angle_stack: list[np.ndarray] = []
     cross_stack: list[np.ndarray] = []
     for stride in strides:
-        prev_pts = pts[(indices - stride) % count]
-        next_pts = pts[(indices + stride) % count]
+        if closed:
+            prev_idx = (indices - stride) % count
+            next_idx = (indices + stride) % count
+            valid = np.ones(count, dtype=bool)
+        else:
+            prev_idx = indices - stride
+            next_idx = indices + stride
+            valid = (prev_idx >= 0) & (next_idx < count)
+            prev_idx = np.clip(prev_idx, 0, count - 1)
+            next_idx = np.clip(next_idx, 0, count - 1)
+        prev_pts = pts[prev_idx]
+        next_pts = pts[next_idx]
         incoming = pts - prev_pts
         outgoing = next_pts - pts
         in_len = np.linalg.norm(incoming, axis=1)
         out_len = np.linalg.norm(outgoing, axis=1)
-        valid = (in_len > 1e-12) & (out_len > 1e-12)
+        valid = valid & (in_len > 1e-12) & (out_len > 1e-12)
         cos_angle = np.zeros(count, dtype=np.float64)
         cos_angle[valid] = np.clip(
             np.einsum("ij,ij->i", incoming[valid], outgoing[valid])
@@ -1276,13 +1288,15 @@ def detect_concave_fold_indices(
     points_2d: np.ndarray,
     fold_angle_deg: float = _CONCAVE_FOLD_ANGLE_DEG,
     sample_strides: Sequence[int] | None = None,
-    min_separation_frac: float = 0.03,
-    max_folds: int = 16,
+    min_separation_frac: float = 0.02,
+    max_folds: int = _MAX_CONCAVE_FOLDS,
+    closed: bool = True,
 ) -> list[int]:
     """
-    检测闭环上明显的凹面折角（逆时针环：右转 / 叉积为负）。
+    检测折线上明显的凹面折角（逆时针：右转 / 叉积为负）。
 
-    使用 2/4/8/16 多重采样，并忽略离散极值噪声尖峰。
+    使用 2/4/8/16 多重采样。相对凸角检测更宽松：大步长只需多数过线，
+    避免真实凹折因锯齿在单一大尺度掉阈值而被漏标。
     """
     pts = _as_float_array(points_2d)
     count = len(pts)
@@ -1292,6 +1306,7 @@ def detect_concave_fold_indices(
     angle_mat, cross_mat, robust_angles, strides = _multi_stride_turn_fields(
         pts,
         sample_strides=sample_strides,
+        closed=closed,
     )
     if len(strides) == 0:
         return []
@@ -1303,16 +1318,19 @@ def detect_concave_fold_indices(
         index for index, stride in enumerate(strides) if stride >= 8
     ]
     if large_strides:
-        large_ok = np.all(
-            angle_mat[np.asarray(large_strides, dtype=np.int32)] >= threshold,
-            axis=0,
+        large_vals = angle_mat[np.asarray(large_strides, dtype=np.int32)]
+        # 宽松：至少一个大步长过阈值，且大步长中位数不太弱
+        large_ok = (
+            np.any(large_vals >= threshold, axis=0)
+            & (np.median(large_vals, axis=0) >= threshold * 0.65)
         )
     else:
         large_ok = np.ones(count, dtype=bool)
 
-    pass_mask = angle_mat >= threshold
+    # 凹折符号：在转角较大的尺度上统计叉积
+    soft_mask = angle_mat >= (threshold * 0.6)
     cross_votes = np.sum(
-        np.where(pass_mask, np.sign(cross_mat), 0.0),
+        np.where(soft_mask, np.sign(cross_mat), 0.0),
         axis=0,
     )
     candidates = (
@@ -1321,17 +1339,33 @@ def detect_concave_fold_indices(
         & large_ok
         & (cross_votes < 0.0)
     )
+    # 仅剔除极窄孤立尖峰，保留真实凹折
     candidates = _suppress_discrete_local_extrema(
         robust_angles,
         candidates,
-        half_width=max(2, (strides[-1] // 4) if strides else 2),
-        neighbor_ratio=0.55,
+        half_width=2,
+        neighbor_ratio=0.35,
     )
+
+    # 局部极大（闭环或开链）
     for index in np.flatnonzero(candidates).tolist():
-        left = float(robust_angles[(index - 1) % count])
-        right = float(robust_angles[(index + 1) % count])
-        if float(robust_angles[index]) + 1e-9 < max(left, right):
+        if closed:
+            left = float(robust_angles[(index - 1) % count])
+            right = float(robust_angles[(index + 1) % count])
+        else:
+            if index <= 0 or index >= count - 1:
+                candidates[index] = False
+                continue
+            left = float(robust_angles[index - 1])
+            right = float(robust_angles[index + 1])
+        peak = float(robust_angles[index])
+        if peak + 1e-9 < left and peak + 1e-9 < right:
             candidates[index] = False
+
+    if not closed:
+        # 开链端点不当折角
+        candidates[0] = False
+        candidates[-1] = False
 
     candidate_idx = np.flatnonzero(candidates)
     if len(candidate_idx) == 0:
@@ -1344,7 +1378,9 @@ def detect_concave_fold_indices(
         conflict = False
         for existing in kept:
             distance = abs(index - existing)
-            if min(distance, count - distance) < min_sep:
+            if closed:
+                distance = min(distance, count - distance)
+            if distance < min_sep:
                 conflict = True
                 break
         if not conflict:
@@ -1611,13 +1647,13 @@ def extract_island_longest_sides(
             quarter = max(sample_count // 4, 1)
             corners = [0, quarter, 2 * quarter, 3 * quarter]
 
-        # 明显凹折角（忽略离散极值噪声）
+        # 明显凹折角：阈值与凸角一致，避免 35°~55° 凹折被漏掉
         fold_indices = detect_concave_fold_indices(
             pts_2d,
-            fold_angle_deg=max(corner_angle_deg, _CONCAVE_FOLD_ANGLE_DEG),
+            fold_angle_deg=corner_angle_deg,
+            max_folds=_MAX_CONCAVE_FOLDS,
         )
-        island_folds = [loop_rs[index] for index in fold_indices]
-        concave_fold_points.extend(island_folds)
+        island_folds = [loop_rs[index].copy() for index in fold_indices]
 
         sides_3d = split_loop_into_sides(loop_rs, corners)
         # 1) 接回近共线误拆段
@@ -1641,6 +1677,36 @@ def extract_island_longest_sides(
             sides_3d[nxt] = sides_3d[nxt].copy()
             sides_3d[index][-1] = shared
             sides_3d[nxt][0] = shared
+
+        # 合并后仍留在边中段的凹折也要标记（常见于长绿边跨过凹口）
+        for side in sides_3d:
+            if len(side) < 5:
+                continue
+            side_2d = project_points_to_plane(side, origin, axis_u, axis_v)
+            mid_folds = detect_concave_fold_indices(
+                side_2d,
+                fold_angle_deg=corner_angle_deg,
+                closed=False,
+                max_folds=_MAX_CONCAVE_FOLDS,
+            )
+            for fold_index in mid_folds:
+                island_folds.append(side[int(fold_index)].copy())
+
+        # 去重：过近的折角只留一个
+        if island_folds:
+            deduped: list[np.ndarray] = []
+            loop_len = float(
+                polyline_length(np.vstack((loop_rs, loop_rs[:1])))
+            )
+            min_fold_dist = max(loop_len * 0.015, 1e-4)
+            for point in island_folds:
+                if all(
+                    float(np.linalg.norm(point - existing)) >= min_fold_dist
+                    for existing in deduped
+                ):
+                    deduped.append(point)
+            island_folds = deduped
+        concave_fold_points.extend(island_folds)
 
         beziers: list[dict] = []
         sides_sampled: list[np.ndarray] = []
@@ -1726,7 +1792,7 @@ def extract_island_longest_sides(
     extent = float(np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0)))
     bevel_depth = float(max(extent * 0.004, 1e-4))
     control_radius = float(max(extent * 0.006, bevel_depth * 1.5))
-    fold_radius = float(max(extent * 0.012, control_radius * 2.2))
+    fold_radius = float(max(extent * 0.018, control_radius * 3.0))
 
     return {
         "islands": islands,

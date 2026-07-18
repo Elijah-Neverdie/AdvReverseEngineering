@@ -461,17 +461,39 @@ class TopologyClassificationTests(unittest.TestCase):
         )
         self.assertLess(nearest, 0.4)
 
+        # 长边上的中段凹折也应检出（closed=False）
         side = np.array(
+            [[0.0, 2.0], [2.0, 2.0], [2.0, 1.0], [3.0, 1.0], [4.0, 1.0], [4.0, 2.0], [6.0, 2.0]],
+            dtype=np.float64,
+        )
+        # 加密
+        dense_side: list[np.ndarray] = []
+        for index in range(len(side) - 1):
+            a = side[index]
+            b = side[index + 1]
+            for t in np.linspace(0.0, 1.0, 16, endpoint=False):
+                dense_side.append(a * (1.0 - t) + b * t)
+        dense_side.append(side[-1])
+        side_pts = np.asarray(dense_side, dtype=np.float64)
+        mid = detect_concave_fold_indices(
+            side_pts,
+            fold_angle_deg=35.0,
+            closed=False,
+            sample_strides=(2, 4, 8, 16),
+        )
+        self.assertGreaterEqual(len(mid), 1)
+
+        side3 = np.array(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
             dtype=np.float64,
         )
         outlier = np.array([1.0, 0.5, 0.0], dtype=np.float64)
         near = np.array([1.0, 0.01, 0.0], dtype=np.float64)
-        kept = filter_handle_outliers([outlier, near], side, max_distance=0.05)
+        kept = filter_handle_outliers([outlier, near], side3, max_distance=0.05)
         self.assertEqual(len(kept), 1)
         np.testing.assert_allclose(kept[0], near, atol=1e-9)
         self.assertGreater(
-            point_to_polyline_distance(outlier, side),
+            point_to_polyline_distance(outlier, side3),
             0.05,
         )
 
