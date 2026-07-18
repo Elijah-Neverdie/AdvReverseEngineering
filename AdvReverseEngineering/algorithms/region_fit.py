@@ -234,6 +234,99 @@ def extract_region_boundary_loops(
     return closed_loops
 
 
+def build_edge_face_adjacency(
+    loop_start: np.ndarray,
+    loop_total: np.ndarray,
+    loop_vertex_indices: np.ndarray,
+) -> dict[tuple[int, int], list[int]]:
+    """无向边 (min,max) -> 入射面索引列表。"""
+    starts = _as_int_array(loop_start)
+    totals = _as_int_array(loop_total)
+    loops = _as_int_array(loop_vertex_indices)
+    edge_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for face_index in range(len(starts)):
+        start = int(starts[face_index])
+        total = int(totals[face_index])
+        if total < 3:
+            continue
+        for offset in range(total):
+            v0 = int(loops[start + offset])
+            v1 = int(loops[start + ((offset + 1) % total)])
+            if v0 == v1:
+                continue
+            key = (v0, v1) if v0 < v1 else (v1, v0)
+            edge_faces[key].append(int(face_index))
+    return edge_faces
+
+
+def boundary_loop_neighbor_ids(
+    loop: Sequence[int],
+    region_ids: np.ndarray,
+    edge_faces: dict[tuple[int, int], list[int]],
+    target_id,
+) -> np.ndarray:
+    """
+    环上每条边 (loop[i] -> loop[i+1]) 的外侧邻域编号。
+
+    无外侧面（网格外边界）记为 -1。
+    """
+    ids = _as_int_array(region_ids)
+    targets = set(_normalize_target_ids(target_id))
+    count = len(loop)
+    neighbors = np.full(count, -1, dtype=np.int32)
+    for index in range(count):
+        v0 = int(loop[index])
+        v1 = int(loop[(index + 1) % count])
+        key = (v0, v1) if v0 < v1 else (v1, v0)
+        outside: list[int] = []
+        for face_index in edge_faces.get(key, []):
+            rid = int(ids[int(face_index)])
+            if rid not in targets:
+                outside.append(rid)
+        if outside:
+            neighbors[index] = int(max(set(outside), key=outside.count))
+    return neighbors
+
+
+def neighbor_change_vertex_indices(neighbor_ids: np.ndarray) -> list[int]:
+    """邻域 ID 在顶点处发生变化的下标（T 接缝切点）。"""
+    values = np.asarray(neighbor_ids, dtype=np.int32)
+    count = len(values)
+    if count < 2:
+        return []
+    changes: list[int] = []
+    for index in range(count):
+        prev = int(values[(index - 1) % count])
+        curr = int(values[index])
+        if prev != curr:
+            changes.append(int(index))
+    return changes
+
+
+def map_loop_indices_to_resampled(
+    loop_points: np.ndarray,
+    vertex_indices: Sequence[int],
+    sample_count: int,
+) -> list[int]:
+    """按弧长把原始环顶点下标映射到重采样环下标。"""
+    pts = _as_float_array(loop_points)
+    if len(pts) < 2 or int(sample_count) < 2:
+        return []
+    closed = np.vstack((pts, pts[:1]))
+    lengths = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    cum = np.concatenate(([0.0], np.cumsum(lengths)))
+    total = float(cum[-1])
+    if total < 1e-12:
+        return [0]
+    mapped: list[int] = []
+    n_samples = int(sample_count)
+    for vertex_index in vertex_indices:
+        idx = int(vertex_index) % len(pts)
+        param = float(cum[idx]) / total
+        mapped.append(int(round(param * n_samples)) % n_samples)
+    return sorted(set(mapped))
+
+
 def select_primary_boundary_loop(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
@@ -1805,6 +1898,109 @@ def resplit_sides_at_interior_folds(
     return result
 
 
+def resplit_sides_near_points(
+    sides: Sequence[np.ndarray],
+    points: Sequence[np.ndarray],
+    max_dist: float,
+    end_margin_frac: float = 0.05,
+) -> list[np.ndarray]:
+    """
+    若给定点贴近某边中段，则在最近点切开。
+
+    用于在共线合并之后强制恢复邻域 T 接缝切点。
+    """
+    if not points:
+        return [np.asarray(side, dtype=np.float64).copy() for side in sides]
+    limit = float(max(max_dist, 0.0))
+    result: list[np.ndarray] = []
+    for side in sides:
+        pts = _as_float_array(side)
+        if len(pts) < 3:
+            result.append(pts.copy())
+            continue
+        params = polyline_parameters(pts)
+        length = float(polyline_length(pts))
+        margin = max(float(end_margin_frac), 0.0)
+        cut_ts: list[float] = []
+        for point in points:
+            p = _as_float_array(point).reshape(3)
+            best_t = None
+            best_dist = limit + 1.0
+            for index in range(len(pts) - 1):
+                a = pts[index]
+                b = pts[index + 1]
+                ab = b - a
+                ab_len2 = float(np.dot(ab, ab))
+                if ab_len2 < 1e-18:
+                    continue
+                local_t = float(np.clip(np.dot(p - a, ab) / ab_len2, 0.0, 1.0))
+                proj = a + local_t * ab
+                dist = float(np.linalg.norm(p - proj))
+                if dist < best_dist:
+                    best_dist = dist
+                    seg_param = float(params[index])
+                    next_param = float(params[index + 1])
+                    best_t = seg_param + local_t * (next_param - seg_param)
+            if (
+                best_t is not None
+                and best_dist <= limit
+                and margin < best_t < 1.0 - margin
+            ):
+                cut_ts.append(best_t)
+        if not cut_ts:
+            result.append(pts.copy())
+            continue
+        cut_ts = sorted(set(cut_ts))
+        # 用弧长参数切开：在最近点插入并拆段
+        anchors = [0.0] + cut_ts + [1.0]
+        for start_t, end_t in zip(anchors[:-1], anchors[1:]):
+            if end_t <= start_t + 1e-9:
+                continue
+            # 在 [start_t, end_t] 间取原子点
+            mask = (params >= start_t - 1e-9) & (params <= end_t + 1e-9)
+            chunk = pts[mask]
+            if len(chunk) < 2:
+                # 退化：两端插值
+                start_pt = np.array(
+                    [
+                        np.interp(start_t, params, pts[:, axis])
+                        for axis in range(3)
+                    ],
+                    dtype=np.float64,
+                )
+                end_pt = np.array(
+                    [
+                        np.interp(end_t, params, pts[:, axis])
+                        for axis in range(3)
+                    ],
+                    dtype=np.float64,
+                )
+                chunk = np.vstack((start_pt, end_pt))
+            else:
+                chunk = chunk.copy()
+                chunk[0] = np.array(
+                    [
+                        np.interp(start_t, params, pts[:, axis])
+                        for axis in range(3)
+                    ],
+                    dtype=np.float64,
+                )
+                chunk[-1] = np.array(
+                    [
+                        np.interp(end_t, params, pts[:, axis])
+                        for axis in range(3)
+                    ],
+                    dtype=np.float64,
+                )
+            if length > 0 and polyline_length(chunk) >= limit * 0.25:
+                result.append(chunk)
+            elif result:
+                result[-1] = np.vstack((result[-1][:-1], chunk))
+            else:
+                result.append(chunk)
+    return result if result else [np.asarray(sides[0], dtype=np.float64).copy()]
+
+
 def merge_short_boundary_sides(
     sides: Sequence[np.ndarray],
     min_length: float,
@@ -1982,6 +2178,11 @@ def extract_island_longest_sides(
     """
     _ = max_sides  # 兼容旧调用签名；按折角拆分不压边数
     verts = _as_float_array(vertices)
+    edge_faces = build_edge_face_adjacency(
+        loop_start,
+        loop_total,
+        loop_vertex_indices,
+    )
     loops = extract_region_boundary_loops(
         region_ids,
         target_id,
@@ -2006,13 +2207,24 @@ def extract_island_longest_sides(
     all_points: list[np.ndarray] = []
 
     for island_index, loop in enumerate(loops):
-        loop_pts = verts[np.asarray(loop, dtype=np.int32)]
+        loop_ids = [int(v) for v in loop]
+        loop_pts = verts[np.asarray(loop_ids, dtype=np.int32)]
         if len(loop_pts) < 3:
             continue
         origin, axis_u, axis_v = _loop_pca_basis(loop_pts)
         pts_2d_raw = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
         if _signed_area_2d(pts_2d_raw) < 0.0:
+            loop_ids = list(reversed(loop_ids))
             loop_pts = loop_pts[::-1]
+
+        # 邻域 ID 沿边变化 = T 接缝；与对侧 B|C 拆分对齐
+        neighbor_ids = boundary_loop_neighbor_ids(
+            loop_ids,
+            region_ids,
+            edge_faces,
+            target_id,
+        )
+        neighbor_vertices = neighbor_change_vertex_indices(neighbor_ids)
 
         sample_count = int(
             np.clip(
@@ -2036,19 +2248,38 @@ def extract_island_longest_sides(
             fold_angle_deg=corner_angle_deg,
             max_folds=_MAX_CONCAVE_FOLDS,
         )
-        split_indices = sorted(set(corners) | set(fold_indices))
+        neighbor_splits = map_loop_indices_to_resampled(
+            loop_pts,
+            neighbor_vertices,
+            sample_count,
+        )
+        split_indices = sorted(
+            set(corners) | set(fold_indices) | set(neighbor_splits)
+        )
         if len(split_indices) < 2:
             half = max(sample_count // 2, 1)
             split_indices = [0, half]
 
         island_folds = [loop_rs[index].copy() for index in fold_indices]
 
-        sides_3d = split_loop_into_sides(loop_rs, split_indices)
+        ordered_splits = sorted(
+            {int(i) % sample_count for i in split_indices}
+        )
+        sides_3d = split_loop_into_sides(loop_rs, ordered_splits)
+        # 邻域变化接头禁止被共线合并吃掉
+        neighbor_split_set = {int(i) % sample_count for i in neighbor_splits}
+        protected = [
+            side_index
+            for side_index, start in enumerate(ordered_splits)
+            if ordered_splits[(side_index + 1) % len(ordered_splits)]
+            in neighbor_split_set
+        ]
         # 仅接回近共线误拆段，不按长短压到固定边数
         sides_3d = merge_collinear_adjacent_sides(
             sides_3d,
             max_turn_deg=corner_angle_deg,
             min_sides=2,
+            protected_junctions=protected,
         )
 
         def _share_side_endpoints(sides: list[np.ndarray]) -> list[np.ndarray]:
@@ -2078,6 +2309,18 @@ def extract_island_longest_sides(
             min_sides=2,
         )
         sides_3d = _share_side_endpoints(sides_3d)
+        # 共线合并后强制恢复邻域 T 接缝切点，保证与对侧拆分一致
+        if neighbor_vertices:
+            neighbor_points = [
+                loop_pts[int(index) % len(loop_pts)].copy()
+                for index in neighbor_vertices
+            ]
+            sides_3d = resplit_sides_near_points(
+                sides_3d,
+                neighbor_points,
+                max_dist=max(loop_len * 0.01, 1e-4),
+            )
+            sides_3d = _share_side_endpoints(sides_3d)
 
         # 凹折标记（含中段）
         for side in sides_3d:
@@ -2308,23 +2551,34 @@ def merge_collinear_adjacent_sides(
     sides: Sequence[np.ndarray],
     max_turn_deg: float = DEFAULT_CORNER_ANGLE_DEG,
     min_sides: int = 3,
+    protected_junctions: Sequence[int] | None = None,
 ) -> list[np.ndarray]:
     """
     合并转角小于阈值的邻接边，把被误拆的连续长边接回去。
 
     只合并平缓接头，保留尖角；避免「最长四边」丢掉中间短段后出现断口。
+    protected_junctions: 禁止合并的接头下标（边 i 与 i+1 之间），
+    用于保留邻域 ID 变化造成的 T 接缝切点。
     """
     result = [np.asarray(side, dtype=np.float64).copy() for side in sides]
     if len(result) <= int(min_sides):
         return result
     threshold = float(max(max_turn_deg, 1.0))
+    protected = {int(i) % max(len(result), 1) for i in (protected_junctions or [])}
     guard = 0
     while len(result) > int(min_sides):
         turns = [
             _junction_turn_deg(result[i], result[(i + 1) % len(result)])
             for i in range(len(result))
         ]
-        merge_left = int(np.argmin(turns))
+        candidates = [
+            (float(turns[i]), i)
+            for i in range(len(result))
+            if i not in protected
+        ]
+        if not candidates:
+            break
+        _turn, merge_left = min(candidates, key=lambda item: item[0])
         if turns[merge_left] >= threshold:
             break
         merge_right = (merge_left + 1) % len(result)
@@ -2332,8 +2586,18 @@ def merge_collinear_adjacent_sides(
         if merge_right > merge_left:
             result[merge_left] = merged
             del result[merge_right]
+            new_protected: set[int] = set()
+            for junction in protected:
+                if junction == merge_left:
+                    continue
+                if junction > merge_left:
+                    new_protected.add(junction - 1)
+                else:
+                    new_protected.add(junction)
+            protected = {j % max(len(result), 1) for j in new_protected}
         else:
             result = [merged] + result[1:merge_left]
+            protected = set()
         guard += 1
         if guard > len(sides) + 8:
             break
@@ -3290,6 +3554,11 @@ __all__ = (
     "extend_quad_corners_by_tangents",
     "extract_island_longest_sides",
     "extract_region_boundary_loops",
+    "build_edge_face_adjacency",
+    "boundary_loop_neighbor_ids",
+    "neighbor_change_vertex_indices",
+    "map_loop_indices_to_resampled",
+    "resplit_sides_near_points",
     "filter_handle_outliers",
     "filter_significant_boundary_loops",
     "fit_bezier_polyline_spans",

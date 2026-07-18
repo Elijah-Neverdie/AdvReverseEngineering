@@ -8,7 +8,9 @@ import numpy as np
 
 from AdvReverseEngineering.algorithms.region_fit import (
     RegionFitError,
+    boundary_loop_neighbor_ids,
     bridge_concave_notches,
+    build_edge_face_adjacency,
     build_quad_patch,
     build_triangular_patch,
     classify_side_fit_mode,
@@ -26,6 +28,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     fit_cubic_bezier_controls,
     fit_region_surface,
     merge_short_boundary_sides,
+    neighbor_change_vertex_indices,
     point_to_polyline_distance,
     polyline_length,
     resample_closed_polyline,
@@ -36,6 +39,65 @@ from AdvReverseEngineering.algorithms.region_fit import (
     side_interior_max_turn_deg,
     split_polyline_at_significant_folds,
 )
+
+
+def _t_junction_shared_edge_mesh():
+    """
+    上侧领域 A 与下侧 B|C 共线共享边，中间为 T 接缝：
+      0--1--2
+      |A |A |
+      3--4--5
+      |B |C |
+      6--7--8
+    """
+    vertices = np.array(
+        [
+            [0.0, 2.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [2.0, 2.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    # A: 0,1,4,3 与 1,2,5,4；B: 3,4,7,6；C: 4,5,8,7
+    loop_vertex_indices = np.array(
+        [
+            0, 1, 4, 3,
+            1, 2, 5, 4,
+            3, 4, 7, 6,
+            4, 5, 8, 7,
+        ],
+        dtype=np.int32,
+    )
+    loop_start = np.array([0, 4, 8, 12], dtype=np.int32)
+    loop_total = np.array([4, 4, 4, 4], dtype=np.int32)
+    region_ids = np.array([0, 0, 1, 2], dtype=np.int32)
+    normals = np.tile(np.array([[0.0, 0.0, 1.0]]), (4, 1))
+    areas = np.ones(4, dtype=np.float64)
+    centers = np.array(
+        [
+            [0.5, 1.5, 0.0],
+            [1.5, 1.5, 0.0],
+            [0.5, 0.5, 0.0],
+            [1.5, 0.5, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    return {
+        "vertices": vertices,
+        "loop_start": loop_start,
+        "loop_total": loop_total,
+        "loop_vertex_indices": loop_vertex_indices,
+        "region_ids": region_ids,
+        "normals": normals,
+        "areas": areas,
+        "centers": centers,
+    }
 
 
 def _square_mesh():
@@ -1008,6 +1070,55 @@ class FitRegionSurfaceTests(unittest.TestCase):
         np.testing.assert_allclose(segments[0][-1], pts[3])
         np.testing.assert_allclose(segments[1][0], pts[3])
         np.testing.assert_allclose(segments[1][-1], pts[-1])
+
+    def test_neighbor_t_junction_splits_shared_edge_on_both_logic(self) -> None:
+        """上侧 A 在 B|C 的 T 接缝处也应切开，避免一侧 1 段、对侧 2 段。"""
+        mesh = _t_junction_shared_edge_mesh()
+        edge_faces = build_edge_face_adjacency(
+            mesh["loop_start"],
+            mesh["loop_total"],
+            mesh["loop_vertex_indices"],
+        )
+        loops = extract_region_boundary_loops(
+            mesh["region_ids"],
+            0,
+            mesh["loop_start"],
+            mesh["loop_total"],
+            mesh["loop_vertex_indices"],
+        )
+        self.assertEqual(len(loops), 1)
+        neighbor_ids = boundary_loop_neighbor_ids(
+            loops[0],
+            mesh["region_ids"],
+            edge_faces,
+            0,
+        )
+        changes = neighbor_change_vertex_indices(neighbor_ids)
+        # 顶点 4 处邻域从 B 变为 C
+        self.assertTrue(any(int(loops[0][i]) == 4 for i in changes))
+
+        debug = extract_island_longest_sides(
+            region_ids=mesh["region_ids"],
+            target_id=0,
+            vertices=mesh["vertices"],
+            loop_start=mesh["loop_start"],
+            loop_total=mesh["loop_total"],
+            loop_vertex_indices=mesh["loop_vertex_indices"],
+        )
+        island = debug["islands"][0]
+        # 共享底边被 T 切开后，边数应多于无邻域时的 4
+        self.assertGreaterEqual(len(island["beziers"]), 5)
+        # 应存在两段贴近 y=1 的水平边（A-B 与 A-C）
+        horizontal = []
+        for bezier in island["beziers"]:
+            if bezier["fit_mode"] == "POLYLINE":
+                pts = np.asarray(bezier["polyline"], dtype=np.float64)
+            else:
+                pts = np.asarray(island["sides"][bezier["side_index"]], dtype=np.float64)
+            mid = 0.5 * (pts[0] + pts[-1])
+            if abs(float(mid[1]) - 1.0) < 0.15 and abs(float(pts[0, 1] - pts[-1, 1])) < 0.2:
+                horizontal.append(mid[0])
+        self.assertGreaterEqual(len(horizontal), 2)
 
     def test_resplit_mid_kink_and_merge_t_junction_stub(self) -> None:
         """中段折弯应再拆；T 接缝短碎段应并回。"""
