@@ -331,7 +331,7 @@ class ARE_PT_main(bpy.types.Panel):
                 if scene_props.fit_status_detail:
                     tip.label(text=scene_props.fit_status_detail)
                 if scene_props.fit_phase == "DEBUG_EDGES":
-                    tip.label(text="Debug：红/绿贝塞尔边（对边同色）")
+                    tip.label(text="Debug：闭环红/绿边（尖角保留）")
                     build_row = tip.row()
                     build_row.scale_y = 1.2
                     build_row.operator(

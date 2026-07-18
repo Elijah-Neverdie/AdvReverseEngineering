@@ -353,11 +353,8 @@ class TopologyClassificationTests(unittest.TestCase):
 
     def test_l_shape_corner_not_merged_into_one_side(self) -> None:
         """
-        L 形闭环：尖角若漏检会把竖边+横边并成伪最长边。
-        多取角点后取最长独立边时，任一边内部转角应远小于 90°。
+        L 形闭环：尖角过多时不应强行并成带折角的「四边」。
         """
-        # CCW L 形（外轮廓 6 角）：
-        # (0,0)-(3,0)-(3,1)-(1,1)-(1,2)-(0,2)
         corners_xy = np.array(
             [
                 [0.0, 0.0],
@@ -387,26 +384,21 @@ class TopologyClassificationTests(unittest.TestCase):
 
         from AdvReverseEngineering.algorithms.region_fit import (
             merge_collinear_adjacent_sides,
+            reduce_sides_to_count,
             split_loop_into_sides,
         )
 
         sides = split_loop_into_sides(pts, found)
         sides = merge_collinear_adjacent_sides(sides, max_turn_deg=35.0)
-        ranked = sorted(
-            range(len(sides)),
-            key=lambda i: polyline_length(sides[i]),
-            reverse=True,
-        )[:4]
-        longest = [sides[i] for i in sorted(ranked)]
-        self.assertEqual(len(longest), 4)
-        for side in longest:
-            self.assertLess(side_interior_max_turn_deg(side), 45.0)
-        # 最长边应是底边长度约 3，而不是竖+横折线
-        self.assertAlmostEqual(
-            max(polyline_length(side) for side in longest),
-            3.0,
-            places=1,
+        sides4 = reduce_sides_to_count(
+            sides,
+            4,
+            max_merge_turn_deg=55.0,
         )
+        # 六个直角尖角：应拒绝合并，保留多于 4 条边
+        self.assertGreater(len(sides4), 4)
+        for side in sides4:
+            self.assertLess(side_interior_max_turn_deg(side), 45.0)
 
     def test_merge_collinear_reconnects_split_long_edge(self) -> None:
         """平滑长边被误拆成三段后应接回，避免中间缺口。"""
@@ -778,25 +770,27 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertGreaterEqual(len(debug["wire_edges"]), 4)
         self.assertGreaterEqual(len(debug["wire_vertices"]), 8)
         beziers = island["beziers"]
-        side_ids = sorted({int(b["side_index"]) for b in beziers})
-        self.assertEqual(side_ids, [0, 1, 2, 3])
-        # 邻边异色、对边同色：按 side_index 取色
-        colors_by_side = {
-            int(b["side_index"]): int(b["color_id"]) for b in beziers
-        }
+        self.assertEqual(len(beziers), 4)
+        # 邻边异色、对边同色
         self.assertEqual(
-            [colors_by_side[i] for i in side_ids],
+            [int(b["color_id"]) for b in beziers],
             [0, 1, 0, 1],
         )
+        # 闭环：相邻边端点重合
+        for index, side in enumerate(island["sides"]):
+            nxt = island["sides"][(index + 1) % 4]
+            np.testing.assert_allclose(side[-1], nxt[0], atol=1e-9)
         for bezier in beziers:
-            controls = bezier["controls"]
+            spans = bezier["spans"]
+            self.assertGreaterEqual(len(spans), 1)
+            controls = spans[0]
             self.assertEqual(controls.shape, (4, 3))
             sampled = sample_cubic_bezier(controls, 8)
             self.assertEqual(len(sampled), 8)
             np.testing.assert_allclose(sampled[0], controls[0], atol=1e-9)
             np.testing.assert_allclose(sampled[-1], controls[-1], atol=1e-9)
         self.assertGreater(debug["bevel_depth"], 0.0)
-        self.assertGreaterEqual(len(debug["control_points"]), 16)
+        self.assertGreaterEqual(len(debug["control_points"]), 8)
 
     def test_fit_cubic_bezier_straight_line(self) -> None:
         pts = np.array(
@@ -824,14 +818,13 @@ class FitRegionSurfaceTests(unittest.TestCase):
         for island in debug["islands"]:
             self.assertEqual(len(island["sides"]), 4)
             self.assertEqual(len(island["lengths"]), 4)
-            colors_by_side = {
-                int(b["side_index"]): int(b["color_id"])
-                for b in island["beziers"]
-            }
             self.assertEqual(
-                [colors_by_side[i] for i in sorted(colors_by_side)],
+                [int(b["color_id"]) for b in island["beziers"]],
                 [0, 1, 0, 1],
             )
+            for index, side in enumerate(island["sides"]):
+                nxt = island["sides"][(index + 1) % 4]
+                np.testing.assert_allclose(side[-1], nxt[0], atol=1e-9)
 
 
 if __name__ == "__main__":

@@ -332,7 +332,7 @@ def _create_or_update_debug_curve_object(
     collection: bpy.types.Collection | None,
     existing: bpy.types.Object | None = None,
 ) -> bpy.types.Object:
-    """用加粗贝塞尔曲线显示拟合边：对边同色（红/绿交替）。"""
+    """用加粗贝塞尔曲线显示拟合边：对边同色（红/绿交替），每边一条连续样条。"""
     matrix = np.asarray(matrix_world, dtype=np.float64)
     mat_red = _ensure_fit_edge_material(FIT_EDGE_MAT_RED, FIT_EDGE_COLOR_RED)
     mat_green = _ensure_fit_edge_material(FIT_EDGE_MAT_GREEN, FIT_EDGE_COLOR_GREEN)
@@ -362,25 +362,43 @@ def _create_or_update_debug_curve_object(
 
     for island in debug.get("islands", []):
         for bezier in island.get("beziers", []):
-            controls = _world_to_object_local(
-                matrix,
-                np.asarray(bezier["controls"], dtype=np.float64),
-            )
+            spans = bezier.get("spans")
+            if not spans:
+                controls = bezier.get("controls")
+                if controls is None:
+                    continue
+                spans = [controls]
+            local_spans = [
+                _world_to_object_local(
+                    matrix,
+                    np.asarray(span, dtype=np.float64),
+                )
+                for span in spans
+            ]
+            # 一条边 = 一条连续多点贝塞尔，避免分段样条中间断口
             spline = curve.splines.new("BEZIER")
-            spline.bezier_points.add(1)
-            p0, p1, p2, p3 = controls
-            bp0 = spline.bezier_points[0]
-            bp1 = spline.bezier_points[1]
-            bp0.co = p0
-            bp0.handle_left_type = "FREE"
-            bp0.handle_right_type = "FREE"
-            bp0.handle_left = p0 - (p1 - p0)
-            bp0.handle_right = p1
-            bp1.co = p3
-            bp1.handle_left_type = "FREE"
-            bp1.handle_right_type = "FREE"
-            bp1.handle_left = p2
-            bp1.handle_right = p3 + (p3 - p2)
+            point_count = len(local_spans) + 1
+            if point_count > 1:
+                spline.bezier_points.add(point_count - 1)
+            for span_index, span in enumerate(local_spans):
+                p0, p1, p2, p3 = span
+                bp = spline.bezier_points[span_index]
+                bp.co = p0
+                bp.handle_left_type = "FREE"
+                bp.handle_right_type = "FREE"
+                if span_index == 0:
+                    bp.handle_left = p0 - (p1 - p0)
+                else:
+                    prev = local_spans[span_index - 1]
+                    bp.handle_left = prev[2]
+                bp.handle_right = p1
+                if span_index == len(local_spans) - 1:
+                    bp_end = spline.bezier_points[span_index + 1]
+                    bp_end.co = p3
+                    bp_end.handle_left_type = "FREE"
+                    bp_end.handle_right_type = "FREE"
+                    bp_end.handle_left = p2
+                    bp_end.handle_right = p3 + (p3 - p2)
             spline.material_index = int(bezier.get("color_id", 0)) % 2
             spline.use_smooth = True
 

@@ -1243,10 +1243,11 @@ def extract_island_longest_sides(
     bezier_samples: int = 24,
 ) -> dict:
     """
-    对领域内每个 island 边界环提取主边（默认 4），拟合成三次贝塞尔。
+    对领域内每个 island 边界环提取主边（默认目标 4），拟合成三次贝塞尔。
 
-    保持环向顺序：邻边 color_id 交替（0 红 / 1 绿），对边同色。
-    不合并 island、不生成曲面，供 debug 预览。
+    始终保持闭环：邻边共享角点，不会出现角部缺口。
+    只合并平缓接头；尖角过多时宁可多显示几条边，也不并成 L 形折边。
+    邻边 color_id 交替（0 红 / 1 绿），对边同色。
     """
     verts = _as_float_array(vertices)
     loops = extract_region_boundary_loops(
@@ -1258,6 +1259,7 @@ def extract_island_longest_sides(
     )
     keep_sides = max(int(max_sides), 3)
     sample_n = max(int(bezier_samples), 4)
+    sharp_keep = float(max(corner_angle_deg, _STRONG_CONCAVE_ANGLE_DEG))
     islands: list[dict] = []
     wire_vertices: list[np.ndarray] = []
     wire_edges: list[tuple[int, int]] = []
@@ -1296,22 +1298,27 @@ def extract_island_longest_sides(
             corners = [0, quarter, 2 * quarter, 3 * quarter]
 
         sides_3d = split_loop_into_sides(loop_rs, corners)
-        # 先接回近共线误拆段，避免长边中间出现缺口
+        # 1) 接回近共线误拆段
         sides_3d = merge_collinear_adjacent_sides(
             sides_3d,
             max_turn_deg=corner_angle_deg,
             min_sides=keep_sides,
         )
-        # 仍多于 keep_sides 时取最长独立边（尖角已保留，不会并成折边）
+        # 2) 闭环合并到目标边数；拒绝合并尖角，避免 L 形伪边与角部缺口
         if len(sides_3d) > keep_sides:
-            ranked = sorted(
-                range(len(sides_3d)),
-                key=lambda i: polyline_length(sides_3d[i]),
-                reverse=True,
-            )[:keep_sides]
-            # 按环向顺序排列，便于邻边异色 / 对边同色
-            ordered = sorted(ranked)
-            sides_3d = [sides_3d[i] for i in ordered]
+            sides_3d = reduce_sides_to_count(
+                sides_3d,
+                keep_sides,
+                max_merge_turn_deg=sharp_keep,
+            )
+        # 强制相邻边共享端点，消除数值缝隙
+        for index in range(len(sides_3d)):
+            nxt = (index + 1) % len(sides_3d)
+            shared = 0.5 * (sides_3d[index][-1] + sides_3d[nxt][0])
+            sides_3d[index] = sides_3d[index].copy()
+            sides_3d[nxt] = sides_3d[nxt].copy()
+            sides_3d[index][-1] = shared
+            sides_3d[nxt][0] = shared
 
         beziers: list[dict] = []
         sides_sampled: list[np.ndarray] = []
@@ -1320,24 +1327,29 @@ def extract_island_longest_sides(
             spans = fit_bezier_polyline_spans(side)
             color_id = int(side_index % 2)
             sampled_parts = [
-                sample_cubic_bezier(controls, max(sample_n // max(len(spans), 1), 6))
+                sample_cubic_bezier(
+                    controls,
+                    max(sample_n // max(len(spans), 1), 6),
+                )
                 for controls in spans
             ]
-            # 跨段去重点，保证一条边连续采样
             sampled_list = [sampled_parts[0]]
             for part in sampled_parts[1:]:
                 sampled_list.append(part[1:])
             sampled = np.vstack(sampled_list)
+            # 端点贴回共享角点
+            sampled = sampled.copy()
+            sampled[0] = side[0]
+            sampled[-1] = side[-1]
             length = float(polyline_length(sampled))
-            for span_controls in spans:
-                beziers.append(
-                    {
-                        "controls": span_controls,
-                        "color_id": color_id,
-                        "length": length,
-                        "side_index": int(side_index),
-                    }
-                )
+            beziers.append(
+                {
+                    "spans": spans,
+                    "color_id": color_id,
+                    "length": length,
+                    "side_index": int(side_index),
+                }
+            )
             sides_sampled.append(sampled)
             lengths.append(length)
             all_points.append(sampled)
@@ -1352,10 +1364,16 @@ def extract_island_longest_sides(
                 wire_color_ids.append(color_id)
             vertex_cursor += len(sampled)
 
+            # 控制点：角点 + 各段手柄，紧贴边线，避免漂到面心
+            control_points.append(side[0])
+            control_color_ids.append(color_id)
             for span_controls in spans:
-                for ctrl in span_controls:
-                    control_points.append(ctrl)
-                    control_color_ids.append(color_id)
+                control_points.append(span_controls[1])
+                control_color_ids.append(color_id)
+                control_points.append(span_controls[2])
+                control_color_ids.append(color_id)
+            control_points.append(side[-1])
+            control_color_ids.append(color_id)
 
         islands.append(
             {
@@ -1375,7 +1393,7 @@ def extract_island_longest_sides(
     stacked = np.vstack(all_points)
     extent = float(np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0)))
     bevel_depth = float(max(extent * 0.004, 1e-4))
-    control_radius = float(max(extent * 0.008, bevel_depth * 1.8))
+    control_radius = float(max(extent * 0.006, bevel_depth * 1.5))
 
     return {
         "islands": islands,
@@ -1492,20 +1510,29 @@ def merge_paired_collinear_adjacent_sides(
 def reduce_sides_to_count(
     sides: Sequence[np.ndarray],
     target_count: int,
+    max_merge_turn_deg: float | None = None,
 ) -> list[np.ndarray]:
     """
-    将边数降到 target_count。
+    将边数降到 target_count，保持闭环首尾相接。
 
-    优先合并转角最平缓的邻接边对，保留尖角，避免把直角拐弯并进伪最长边。
+    优先合并转角最平缓的邻接边对。若提供 max_merge_turn_deg，
+    则拒绝合并更锐的尖角，宁可保留多于 target 的边，也不制造 L 形折边。
     """
     result = [np.asarray(side, dtype=np.float64).copy() for side in sides]
     target = max(int(target_count), 3)
+    merge_limit = (
+        None
+        if max_merge_turn_deg is None
+        else float(max(max_merge_turn_deg, 1.0))
+    )
     while len(result) > target:
         turns = [
             _junction_turn_deg(result[i], result[(i + 1) % len(result)])
             for i in range(len(result))
         ]
         merge_left = int(np.argmin(turns))
+        if merge_limit is not None and turns[merge_left] >= merge_limit:
+            break
         merge_right = (merge_left + 1) % len(result)
         merged = np.vstack((result[merge_left][:-1], result[merge_right]))
         if merge_right > merge_left:
@@ -1521,6 +1548,7 @@ def reduce_paired_sides_to_count(
     sides_2d: Sequence[np.ndarray],
     sides_3d: Sequence[np.ndarray],
     target_count: int,
+    max_merge_turn_deg: float | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """按 3D 邻接转角同步合并 2D/3D 边，降到 target_count。"""
     result_2d = [np.asarray(side, dtype=np.float64).copy() for side in sides_2d]
@@ -1528,12 +1556,19 @@ def reduce_paired_sides_to_count(
     if len(result_2d) != len(result_3d):
         raise RegionFitError("2D/3D 边数不一致，无法同步合并")
     target = max(int(target_count), 3)
+    merge_limit = (
+        None
+        if max_merge_turn_deg is None
+        else float(max(max_merge_turn_deg, 1.0))
+    )
     while len(result_3d) > target:
         turns = [
             _junction_turn_deg(result_3d[i], result_3d[(i + 1) % len(result_3d)])
             for i in range(len(result_3d))
         ]
         merge_left = int(np.argmin(turns))
+        if merge_limit is not None and turns[merge_left] >= merge_limit:
+            break
         merge_right = (merge_left + 1) % len(result_3d)
         merged_2d = np.vstack(
             (result_2d[merge_left][:-1], result_2d[merge_right])
@@ -2233,6 +2268,17 @@ def analyze_region_fit_topology(
             sides_3d,
             corner_angle_deg,
         )
+        if len(sides_3d) > 4:
+            sides_2d, sides_3d = reduce_paired_sides_to_count(
+                sides_2d,
+                sides_3d,
+                4,
+                max_merge_turn_deg=max(
+                    corner_angle_deg,
+                    _STRONG_CONCAVE_ANGLE_DEG,
+                ),
+            )
+        # 拟合面仍需要三/四边；若尖角过多则再强制收到 4（成面阶段）
         if len(sides_3d) > 4:
             sides_2d, sides_3d = reduce_paired_sides_to_count(
                 sides_2d,
