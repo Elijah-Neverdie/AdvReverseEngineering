@@ -1032,6 +1032,65 @@ def _convex_hull_2d(points_2d: np.ndarray) -> np.ndarray:
     return hull
 
 
+def _collect_samples_along_hull_edge(
+    samples_2d: np.ndarray,
+    samples_3d: np.ndarray,
+    start_2d: np.ndarray,
+    end_2d: np.ndarray,
+    band: float,
+) -> list[np.ndarray]:
+    """
+    收集落在某条 2D 凸包边附近的原始 3D 边界采样，按边参数排序。
+
+    这样外轮廓沿真实曲面上的边界走，而不是 PCA 平面上的弦线。
+    """
+    a = _as_float_array(start_2d).reshape(2)
+    b = _as_float_array(end_2d).reshape(2)
+    pts2 = _as_float_array(samples_2d)
+    pts3 = _as_float_array(samples_3d)
+    edge = b - a
+    edge_len = float(np.linalg.norm(edge))
+    if edge_len < 1e-12 or len(pts2) == 0:
+        return []
+    direction = edge / edge_len
+    rel = pts2 - a
+    param = rel @ direction
+    perp = rel - param[:, None] * direction
+    dist = np.linalg.norm(perp, axis=1)
+    # 凸包逆时针：叉积 > 0 为内侧；拒绝明显靠内的点，避免收进岛间竖缝
+    inward = direction[0] * rel[:, 1] - direction[1] * rel[:, 0]
+    inward_limit = float(max(band * 0.35, 1e-6))
+    # 略微放宽端点，避免相邻边交接漏点
+    mask = (
+        (param >= -0.03 * edge_len)
+        & (param <= 1.03 * edge_len)
+        & (dist <= float(max(band, 1e-9)))
+        & (inward <= inward_limit)
+    )
+    indices = np.flatnonzero(mask)
+    if len(indices) == 0:
+        # 缝隙桥接：吸附到最近采样点的 3D 坐标
+        mid = 0.5 * (a + b)
+        nearest = int(np.argmin(np.linalg.norm(pts2 - mid, axis=1)))
+        start_i = int(np.argmin(np.linalg.norm(pts2 - a, axis=1)))
+        end_i = int(np.argmin(np.linalg.norm(pts2 - b, axis=1)))
+        out = [pts3[start_i].copy()]
+        if nearest not in (start_i, end_i):
+            out.append(pts3[nearest].copy())
+        if end_i != start_i:
+            out.append(pts3[end_i].copy())
+        return out
+
+    order = indices[np.argsort(param[indices])]
+    ordered_3d: list[np.ndarray] = []
+    for index in order:
+        point = pts3[int(index)].copy()
+        if ordered_3d and float(np.linalg.norm(point - ordered_3d[-1])) < 1e-9:
+            continue
+        ordered_3d.append(point)
+    return ordered_3d
+
+
 def outer_contour_from_boundary_loops(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
@@ -1039,13 +1098,12 @@ def outer_contour_from_boundary_loops(
     grid_size: int = 192,
 ) -> np.ndarray:
     """
-    将多岛/深凹口边界提取为真正外轮廓。
+    将多岛/深凹口边界提取为贴合曲面的外轮廓。
 
-    策略：
-      1) PCA 平面上对所有边界采样点做凸包（消掉岛间梯子/内缝）
-      2) 若凸包退化，再回退栅格并集轮廓 / 条带包络
+    在 PCA 平面上用凸包判定外周，再把每条凸包边吸附回原始 3D
+    边界采样，避免轮廓落在投影平面弦线上。
     """
-    _ = bridge_gap_frac, grid_size  # 保留参数兼容；凸包路径不需要
+    _ = bridge_gap_frac, grid_size  # 保留参数兼容
     verts = _as_float_array(vertices)
     loop_pts = [
         verts[np.asarray(loop, dtype=np.int32)]
@@ -1063,27 +1121,69 @@ def outer_contour_from_boundary_loops(
     axis_u = _normalize(vh[0])
     axis_v = _normalize(vh[1])
 
-    samples_2d = []
+    samples_3d_list: list[np.ndarray] = []
+    samples_2d_list: list[np.ndarray] = []
     for pts in loop_pts:
         sampled = resample_closed_polyline(
             pts,
             int(np.clip(len(pts) * 2, 48, 160)),
         )
-        samples_2d.append(
+        samples_3d_list.append(sampled)
+        samples_2d_list.append(
             project_points_to_plane(sampled, centroid, axis_u, axis_v)
         )
-    stacked_2d = np.vstack(samples_2d)
+    stacked_3d = np.vstack(samples_3d_list)
+    stacked_2d = np.vstack(samples_2d_list)
     hull_2d = _convex_hull_2d(stacked_2d)
-    if len(hull_2d) >= 3:
-        return unproject_points_from_plane(hull_2d, centroid, axis_u, axis_v)
+    if len(hull_2d) < 3:
+        envelope, _, _ = combine_boundary_islands(
+            loops,
+            verts,
+            prefer_outer_envelope=True,
+        )
+        return _as_float_array(envelope).copy()
 
-    # 退化：退回条带外包络
-    envelope, _, _ = combine_boundary_islands(
-        loops,
-        verts,
-        prefer_outer_envelope=True,
+    extent = float(
+        np.linalg.norm(stacked_2d.max(axis=0) - stacked_2d.min(axis=0))
     )
-    return _as_float_array(envelope).copy()
+    band = max(extent * 0.04, 1e-4)
+    contour_3d: list[np.ndarray] = []
+    hull_n = len(hull_2d)
+    for index in range(hull_n):
+        start_2d = hull_2d[index]
+        end_2d = hull_2d[(index + 1) % hull_n]
+        segment = _collect_samples_along_hull_edge(
+            stacked_2d,
+            stacked_3d,
+            start_2d,
+            end_2d,
+            band=band,
+        )
+        for point in segment:
+            if contour_3d and float(np.linalg.norm(point - contour_3d[-1])) < 1e-9:
+                continue
+            contour_3d.append(point)
+
+    if len(contour_3d) < 3:
+        envelope, _, _ = combine_boundary_islands(
+            loops,
+            verts,
+            prefer_outer_envelope=True,
+        )
+        return _as_float_array(envelope).copy()
+
+    # 去掉与首点重合的尾点，保持不重复闭环
+    if float(np.linalg.norm(contour_3d[-1] - contour_3d[0])) < 1e-9:
+        contour_3d = contour_3d[:-1]
+    result = np.asarray(contour_3d, dtype=np.float64)
+    if len(result) < 3:
+        envelope, _, _ = combine_boundary_islands(
+            loops,
+            verts,
+            prefer_outer_envelope=True,
+        )
+        return _as_float_array(envelope).copy()
+    return result
 
 
 def _label_face_components(
