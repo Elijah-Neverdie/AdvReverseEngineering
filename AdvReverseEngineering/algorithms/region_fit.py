@@ -962,9 +962,11 @@ def _segment_facing_score(
     proximity: float,
 ) -> float:
     """
-    两条线段若近平行、对向、投影重叠且垂直间隙小，返回间隙；否则 +inf。
+    两条线段若近平行、投影重叠且垂直间隙小，返回间隙；否则 +inf。
 
+    环绕向不一致时对边可能同向，故用 |ua·ub| 判定平行（不强制反向）。
     间隙用垂直于边方向的距离，避免采样相位错位时中点欧氏距离虚高。
+    间距极近时放宽平行阈值，避免弯曲条带缝两侧微折导致漏消。
     """
     da = a1 - a0
     db = b1 - b0
@@ -974,23 +976,31 @@ def _segment_facing_score(
         return float("inf")
     ua = da / la
     ub = db / lb
-    # 需近似平行且走向相反（对边）
-    if float(ua.dot(ub)) > -_MULTI_ISLAND_PARALLEL_DOT:
-        return float("inf")
     mid_a = 0.5 * (a0 + a1)
     mid_b = 0.5 * (b0 + b1)
     delta = mid_b - mid_a
     # 沿边方向的错位不计入间隙
     perp = delta - ua * float(delta.dot(ua))
     gap = float(np.linalg.norm(perp))
-    if gap > float(proximity) * 1.25:
+    prox = float(proximity)
+    if gap > prox * 1.35:
+        return float("inf")
+    abs_dot = abs(float(ua.dot(ub)))
+    # 极近缝：允许更不平行；一般缝：需明显平行
+    parallel_need = (
+        _MULTI_ISLAND_PARALLEL_DOT * 0.55
+        if gap <= prox * 0.55
+        else _MULTI_ISLAND_PARALLEL_DOT * 0.85
+    )
+    if abs_dot < parallel_need:
         return float("inf")
     # 投影到 a 方向看重叠
     t0 = float((b0 - a0).dot(ua))
     t1 = float((b1 - a0).dot(ua))
     lo, hi = (t0, t1) if t0 <= t1 else (t1, t0)
     overlap = min(la, hi) - max(0.0, lo)
-    if overlap < min(la, lb) * _MULTI_ISLAND_OVERLAP_FRAC:
+    overlap_need = _MULTI_ISLAND_OVERLAP_FRAC * (0.5 if gap <= prox * 0.55 else 1.0)
+    if overlap < min(la, lb) * overlap_need:
         return float("inf")
     return gap
 
@@ -1254,13 +1264,93 @@ def outer_contour_by_dissolving_facing_edges(
     return result
 
 
+def _outer_contour_for_nearby_cluster(
+    cluster_loops: Sequence[Sequence[int]],
+    vertices: np.ndarray,
+    max_gap: float,
+) -> np.ndarray | None:
+    """
+    邻近簇外轮廓：先消对向内边；失败再条带外包络（仅限已判定邻近的簇）。
+    """
+    verts = _as_float_array(vertices)
+    loops = [list(int(v) for v in loop) for loop in cluster_loops if len(loop) >= 3]
+    if len(loops) < 2:
+        return None
+    # 大簇先两两消边，降低一次全量配对失败概率
+    working: list[np.ndarray] = [
+        verts[np.asarray(loop, dtype=np.int32)].copy() for loop in loops
+    ]
+    id_loops = list(loops)
+    envelope = outer_contour_by_dissolving_facing_edges(
+        id_loops,
+        verts,
+        proximity=float(max_gap),
+    )
+    if envelope is not None and len(envelope) >= 3:
+        return _as_float_array(envelope)
+
+    # 层级：反复融并间隙最小的一对（用点环临时拼进顶点缓冲）
+    max_rounds = max(len(working) - 1, 0)
+    for _ in range(max_rounds):
+        if len(working) < 2:
+            break
+        best_pair: tuple[int, int] | None = None
+        best_gap = float("inf")
+        for i in range(len(working)):
+            for j in range(i + 1, len(working)):
+                gap = approx_closed_polyline_gap(working[i], working[j])
+                if gap < best_gap:
+                    best_gap = gap
+                    best_pair = (i, j)
+        if best_pair is None or best_gap > float(max_gap) * 1.25:
+            break
+        i, j = best_pair
+        # 将两点环追加到临时顶点表，再消对边
+        base = len(verts)
+        merged_verts = np.vstack((verts, working[i], working[j]))
+        n_a = len(working[i])
+        n_b = len(working[j])
+        pair_loops = [
+            list(range(base, base + n_a)),
+            list(range(base + n_a, base + n_a + n_b)),
+        ]
+        pair_env = outer_contour_by_dissolving_facing_edges(
+            pair_loops,
+            merged_verts,
+            proximity=float(max_gap),
+        )
+        if pair_env is None or len(pair_env) < 3:
+            break
+        working = [
+            pts
+            for index, pts in enumerate(working)
+            if index not in best_pair
+        ] + [_as_float_array(pair_env).copy()]
+        verts = merged_verts
+
+    if len(working) == 1 and len(working[0]) >= 3:
+        return working[0]
+
+    try:
+        envelope, _, _ = combine_boundary_islands(
+            loops,
+            vertices,
+            prefer_outer_envelope=True,
+        )
+    except RegionFitError:
+        return None
+    if envelope is None or len(envelope) < 3:
+        return None
+    return _as_float_array(envelope)
+
+
 def merge_nearby_loops_to_outer_contours(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
     max_gap: float,
 ) -> list[dict]:
     """
-    邻近孤岛融并为新孤岛（消对向内边）；远岛保持独立。
+    邻近孤岛融并为新孤岛（消对向内边 / 邻近条带包络）；远岛保持独立。
 
     单环直接保留网格外轮廓，不用条带/凸包改写。
     返回工作项: points / loop_ids / merged_from。
@@ -1282,21 +1372,10 @@ def merge_nearby_loops_to_outer_contours(
                 }
             )
             continue
-        # 簇过大时融并代价高且易失败：直接分岛，保证不卡死
-        if len(cluster_loops) > 12:
-            for ids in cluster_loops:
-                items.append(
-                    {
-                        "points": verts[np.asarray(ids, dtype=np.int32)].copy(),
-                        "loop_ids": ids,
-                        "merged_from": 1,
-                    }
-                )
-            continue
-        envelope = outer_contour_by_dissolving_facing_edges(
+        envelope = _outer_contour_for_nearby_cluster(
             cluster_loops,
             verts,
-            proximity=float(max_gap),
+            max_gap=float(max_gap),
         )
         if envelope is None or len(envelope) < 3:
             for ids in cluster_loops:
@@ -4178,6 +4257,34 @@ def analyze_region_fit_topology(
     loops = filter_significant_boundary_loops(loops, vertices)
     if not loops:
         raise RegionFitError("过滤极小碎环后无可用边界")
+    # 只融并邻近孤岛：远岛不拉弦线；多岛簇强制保留外包络（禁止退回最长单环）
+    verts = _as_float_array(vertices)
+    all_loop_pts = [
+        verts[np.asarray(loop, dtype=np.int32)]
+        for loop in loops
+        if len(loop) >= 3
+    ]
+    if all_loop_pts:
+        stacked = np.vstack(all_loop_pts)
+        extent0 = float(
+            np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0))
+        )
+        merge_gap = max(extent0 * _MULTI_ISLAND_MERGE_GAP_FRAC, 1e-4)
+    else:
+        merge_gap = 1e-4
+    clusters = cluster_nearby_boundary_loops(loops, verts, max_gap=merge_gap)
+    if not clusters:
+        raise RegionFitError("过滤极小碎环后无可用边界")
+
+    def _cluster_perimeter(members: Sequence[int]) -> float:
+        total = 0.0
+        for index in members:
+            pts = verts[np.asarray(loops[index], dtype=np.int32)]
+            total += float(polyline_length(np.vstack((pts, pts[:1]))))
+        return total
+
+    primary_cluster = max(clusters, key=_cluster_perimeter)
+    fit_loops = [list(loops[index]) for index in primary_cluster]
     # 目标面心 + 邻接/-走廊 -1 碎面，供跨岛包络延长相接
     interior = collect_island_bridge_interiors(
         work_ids,
@@ -4187,9 +4294,10 @@ def analyze_region_fit_topology(
         adjacency_indices=adjacency_indices,
     )
     loop_pts, band_sides, _band_samples = combine_boundary_islands(
-        loops,
+        fit_loops,
         vertices,
         interior_points=interior,
+        prefer_outer_envelope=len(fit_loops) > 1,
     )
     _, normal, _, _ = compute_region_frame(
         face_normals,
@@ -4290,10 +4398,12 @@ def analyze_region_fit_topology(
         "side_lengths": lengths,
         "normal": normal,
         "origin": origin,
-        "loop_count": len(loops),
+        "loop_count": len(fit_loops),
         "corner_count": corner_count,
         "shared_param": shared_param,
         "surface_samples": interior,
+        "cluster_count": len(clusters),
+        "skipped_far_loops": max(len(loops) - len(fit_loops), 0),
     }
 
 

@@ -938,7 +938,8 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertAlmostEqual(float(result.vertices[:, 0].min()), 0.0, places=6)
         self.assertAlmostEqual(float(result.vertices[:, 0].max()), 2.0, places=6)
 
-    def test_fit_disconnected_islands_of_one_region_as_full_quad(self) -> None:
+    def test_fit_disconnected_far_islands_keeps_primary_only(self) -> None:
+        """远岛不拉弦线：只拟合主簇，不跨越 0.5 断口。"""
         mesh = _disconnected_same_region_strip()
         result = fit_region_surface(
             region_ids=mesh["region_ids"],
@@ -954,12 +955,60 @@ class FitRegionSurfaceTests(unittest.TestCase):
             segments_v=2,
         )
         self.assertEqual(result.topology, "QUAD")
-        self.assertEqual(len(result.vertices), 6 * 3)
-        self.assertAlmostEqual(float(result.vertices[:, 0].min()), 0.0, places=6)
-        self.assertAlmostEqual(float(result.vertices[:, 0].max()), 2.5, places=6)
-        self.assertTrue(
-            any("island" in warning for warning in result.warnings)
+        # 主簇是单侧 1x1 方岛，不应被弦线拉到 x=2.5
+        self.assertLess(float(result.vertices[:, 0].max()), 1.25)
+        self.assertGreaterEqual(float(result.vertices[:, 0].max()), 0.9)
+
+    def test_fit_nearby_islands_merge_to_full_span(self) -> None:
+        """邻近同领域孤岛应融并后覆盖全宽。"""
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.05, 0.0, 0.0],
+                [2.05, 0.0, 0.0],
+                [2.05, 1.0, 0.0],
+                [1.05, 1.0, 0.0],
+            ],
+            dtype=np.float64,
         )
+        mesh = {
+            "vertices": vertices,
+            "loop_start": np.array([0, 4], dtype=np.int32),
+            "loop_total": np.array([4, 4], dtype=np.int32),
+            "loop_vertex_indices": np.array(
+                [0, 1, 2, 3, 4, 5, 6, 7],
+                dtype=np.int32,
+            ),
+            "region_ids": np.array([0, 0], dtype=np.int32),
+            "normals": np.array(
+                [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+                dtype=np.float64,
+            ),
+            "areas": np.array([1.0, 1.0], dtype=np.float64),
+            "centers": np.array(
+                [[0.5, 0.5, 0.0], [1.55, 0.5, 0.0]],
+                dtype=np.float64,
+            ),
+        }
+        result = fit_region_surface(
+            region_ids=mesh["region_ids"],
+            target_id=0,
+            vertices=mesh["vertices"],
+            loop_start=mesh["loop_start"],
+            loop_total=mesh["loop_total"],
+            loop_vertex_indices=mesh["loop_vertex_indices"],
+            face_normals=mesh["normals"],
+            face_areas=mesh["areas"],
+            face_centers=mesh["centers"],
+            segments_u=5,
+            segments_v=2,
+        )
+        self.assertEqual(result.topology, "QUAD")
+        self.assertAlmostEqual(float(result.vertices[:, 0].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(result.vertices[:, 0].max()), 2.05, places=5)
 
     def test_polyline_length(self) -> None:
         pts = np.array(
@@ -1300,6 +1349,41 @@ class FitRegionSurfaceTests(unittest.TestCase):
         for point in envelope:
             dist = float(np.min(np.linalg.norm(vertices - point, axis=1)))
             self.assertLess(dist, 1e-9)
+        mid_interior = envelope[
+            (envelope[:, 0] > 0.98)
+            & (envelope[:, 0] < 1.07)
+            & (envelope[:, 1] > 0.05)
+            & (envelope[:, 1] < 0.95)
+        ]
+        self.assertEqual(len(mid_interior), 0)
+
+    def test_dissolve_same_direction_facing_edges(self) -> None:
+        """对边同向（环绕向不一致）时也应消内边并融成外轮廓。"""
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.05, 0.0, 0.0],
+                [2.05, 0.0, 0.0],
+                [2.05, 1.0, 0.0],
+                [1.05, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        # 右岛反向绕行，使缝两侧边同向
+        loops = [[0, 1, 2, 3], [4, 7, 6, 5]]
+        items = merge_nearby_loops_to_outer_contours(
+            loops,
+            vertices,
+            max_gap=0.2,
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(int(items[0]["merged_from"]), 2)
+        envelope = items[0]["points"]
+        self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(envelope[:, 0].max()), 2.05, places=5)
         mid_interior = envelope[
             (envelope[:, 0] > 0.98)
             & (envelope[:, 0] < 1.07)
