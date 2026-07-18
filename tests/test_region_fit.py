@@ -15,6 +15,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     combine_boundary_islands,
     coons_patch,
     detect_corner_indices,
+    extract_island_longest_sides,
     extract_region_boundary_loops,
     fit_region_surface,
     polyline_length,
@@ -669,6 +670,40 @@ class FitRegionSurfaceTests(unittest.TestCase):
             dtype=np.float64,
         )
         self.assertAlmostEqual(polyline_length(pts), 7.0)
+
+    def test_extract_square_longest_sides(self) -> None:
+        mesh = _square_mesh()
+        debug = extract_island_longest_sides(
+            region_ids=mesh["region_ids"],
+            target_id=0,
+            vertices=mesh["vertices"],
+            loop_start=mesh["loop_start"],
+            loop_total=mesh["loop_total"],
+            loop_vertex_indices=mesh["loop_vertex_indices"],
+        )
+        self.assertEqual(debug["island_count"], 1)
+        self.assertEqual(len(debug["islands"][0]["sides"]), 4)
+        lengths = debug["islands"][0]["lengths"]
+        self.assertEqual(len(lengths), 4)
+        for length in lengths:
+            self.assertAlmostEqual(length, 1.0, places=2)
+        self.assertGreaterEqual(len(debug["wire_edges"]), 4)
+        self.assertGreaterEqual(len(debug["wire_vertices"]), 8)
+
+    def test_extract_disconnected_islands_longest_sides(self) -> None:
+        mesh = _disconnected_same_region_strip()
+        debug = extract_island_longest_sides(
+            region_ids=mesh["region_ids"],
+            target_id=0,
+            vertices=mesh["vertices"],
+            loop_start=mesh["loop_start"],
+            loop_total=mesh["loop_total"],
+            loop_vertex_indices=mesh["loop_vertex_indices"],
+        )
+        self.assertEqual(debug["island_count"], 2)
+        for island in debug["islands"]:
+            self.assertEqual(len(island["sides"]), 4)
+            self.assertEqual(len(island["lengths"]), 4)
 
 
 if __name__ == "__main__":

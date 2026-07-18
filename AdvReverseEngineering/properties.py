@@ -484,7 +484,7 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
     fit_phase: StringProperty(
         name="拟合阶段",
-        description="SELECT / PREVIEW / IDLE",
+        description="SELECT / DEBUG_EDGES / PREVIEW / IDLE",
         default="IDLE",
     )
     fit_segments_u: IntProperty(

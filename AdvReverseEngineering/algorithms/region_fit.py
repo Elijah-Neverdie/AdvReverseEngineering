@@ -1087,6 +1087,105 @@ def split_loop_into_sides(
     return sides
 
 
+def extract_island_longest_sides(
+    region_ids: np.ndarray,
+    target_id,
+    vertices: np.ndarray,
+    loop_start: np.ndarray,
+    loop_total: np.ndarray,
+    loop_vertex_indices: np.ndarray,
+    corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+    max_sides: int = 4,
+) -> dict:
+    """
+    对领域内每个 island 边界环提取最长的若干条边（默认 4）。
+
+    仅做角点分割与长度排序，不合并 island、不生成曲面，供 debug 预览。
+    返回:
+      islands: [{island_index, sides: [N,3], lengths: [...], corner_count}]
+      wire_vertices / wire_edges: 可直接建线框网格的拼接结果
+    """
+    verts = _as_float_array(vertices)
+    loops = extract_region_boundary_loops(
+        region_ids,
+        target_id,
+        loop_start,
+        loop_total,
+        loop_vertex_indices,
+    )
+    keep_sides = max(int(max_sides), 1)
+    islands: list[dict] = []
+    wire_vertices: list[np.ndarray] = []
+    wire_edges: list[tuple[int, int]] = []
+    vertex_cursor = 0
+
+    for island_index, loop in enumerate(loops):
+        loop_pts = verts[np.asarray(loop, dtype=np.int32)]
+        if len(loop_pts) < 3:
+            continue
+        origin, axis_u, axis_v = _loop_pca_basis(loop_pts)
+        pts_2d_raw = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
+        if _signed_area_2d(pts_2d_raw) < 0.0:
+            loop_pts = loop_pts[::-1]
+
+        sample_count = int(
+            np.clip(
+                len(loop_pts) * 2,
+                _BOUNDARY_SAMPLES_MIN,
+                _BOUNDARY_SAMPLES_MAX,
+            )
+        )
+        loop_rs = resample_closed_polyline(loop_pts, sample_count)
+        pts_2d = project_points_to_plane(loop_rs, origin, axis_u, axis_v)
+        corners = detect_corner_indices(
+            pts_2d,
+            corner_angle_deg,
+            max_corners=max(keep_sides, 4),
+        )
+        if len(corners) < 3:
+            quarter = max(sample_count // 4, 1)
+            corners = [0, quarter, 2 * quarter, 3 * quarter]
+
+        sides_3d = split_loop_into_sides(loop_rs, corners)
+        ranked = sorted(
+            sides_3d,
+            key=polyline_length,
+            reverse=True,
+        )[:keep_sides]
+        lengths = [float(polyline_length(side)) for side in ranked]
+        islands.append(
+            {
+                "island_index": int(island_index),
+                "sides": ranked,
+                "lengths": lengths,
+                "corner_count": int(len(corners)),
+            }
+        )
+
+        for side in ranked:
+            pts = np.asarray(side, dtype=np.float64)
+            if len(pts) < 2:
+                continue
+            wire_vertices.append(pts)
+            for offset in range(len(pts) - 1):
+                wire_edges.append(
+                    (vertex_cursor + offset, vertex_cursor + offset + 1)
+                )
+            vertex_cursor += len(pts)
+
+    if not islands:
+        raise RegionFitError("未提取到任何 island 边界边")
+    if not wire_vertices:
+        raise RegionFitError("island 边界边为空")
+
+    return {
+        "islands": islands,
+        "island_count": len(islands),
+        "wire_vertices": np.vstack(wire_vertices),
+        "wire_edges": wire_edges,
+    }
+
+
 def reduce_sides_to_count(
     sides: Sequence[np.ndarray],
     target_count: int,
@@ -1908,6 +2007,7 @@ __all__ = (
     "coons_patch",
     "detect_corner_indices",
     "extend_quad_corners_by_tangents",
+    "extract_island_longest_sides",
     "extract_region_boundary_loops",
     "fit_region_surface",
     "polyline_length",

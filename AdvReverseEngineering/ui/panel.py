@@ -330,6 +330,15 @@ class ARE_PT_main(bpy.types.Panel):
                     tip.label(text=scene_props.fit_status)
                 if scene_props.fit_status_detail:
                     tip.label(text=scene_props.fit_status_detail)
+                if scene_props.fit_phase == "DEBUG_EDGES":
+                    tip.label(text="Debug：各孤岛四条最长边")
+                    build_row = tip.row()
+                    build_row.scale_y = 1.2
+                    build_row.operator(
+                        "are.build_fit_surface",
+                        text="拟合成面",
+                        icon="MESH_GRID",
+                    )
                 if scene_props.fit_phase == "PREVIEW":
                     tip.label(
                         text=(
@@ -356,14 +365,13 @@ class ARE_PT_main(bpy.types.Panel):
                             else "V 向段数"
                         ),
                     )
-                confirm_row = tip.row()
-                confirm_row.scale_y = 1.2
-                confirm_row.enabled = scene_props.fit_phase == "PREVIEW"
-                confirm_row.operator(
-                    "are.confirm_fit_region",
-                    text="确认",
-                    icon="CHECKMARK",
-                )
+                    confirm_row = tip.row()
+                    confirm_row.scale_y = 1.2
+                    confirm_row.operator(
+                        "are.confirm_fit_region",
+                        text="确认",
+                        icon="CHECKMARK",
+                    )
                 if _draw_foldout(
                     tip,
                     scene_props,
@@ -371,12 +379,10 @@ class ARE_PT_main(bpy.types.Panel):
                     "操作说明",
                 ):
                     help_box = tip.box()
-                    help_box.label(text="1. 点击编号选择要拟合的领域")
-                    help_box.label(text="   同编号 island 会沿边沿曲率")
-                    help_box.label(text="   延长相接")
-                    help_box.label(text="2. 滚轮调节第一组控制点")
-                    help_box.label(text="3. PageUp/PageDown 调节第二组")
-                    help_box.label(text="点击确认或 Enter 写入「拟合面」集合")
+                    help_box.label(text="1. 点击编号：显示各孤岛最长边")
+                    help_box.label(text="2. 核对边线后点「拟合成面」或 Enter")
+                    help_box.label(text="3. 滚轮 / Page 调节控制点")
+                    help_box.label(text="4. 确认或 Enter 写入「拟合面」集合")
                     help_box.label(text="Esc 取消")
 
             if scene_props.region_status:

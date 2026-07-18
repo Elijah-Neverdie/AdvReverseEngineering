@@ -14,6 +14,7 @@ from ..algorithms.region_fit import (
     MAX_SEGMENTS,
     MIN_SEGMENTS,
     RegionFitError,
+    extract_island_longest_sides,
     fit_region_surface,
 )
 from ..algorithms.regions import compute_region_label_anchors
@@ -194,16 +195,19 @@ def _create_or_update_mesh_object(
     matrix_world,
     collection: bpy.types.Collection | None,
     existing: bpy.types.Object | None = None,
+    edges: list[tuple[int, int]] | None = None,
 ) -> bpy.types.Object:
     matrix = np.asarray(matrix_world, dtype=np.float64)
     local = _world_to_object_local(matrix, vertices_world)
+    edge_list = [] if edges is None else [tuple(e) for e in edges]
+    face_list = [tuple(f) for f in faces]
     if existing is not None and existing.name in bpy.data.objects:
         mesh = existing.data
         mesh.clear_geometry()
         mesh.from_pydata(
             [tuple(v) for v in local.tolist()],
-            [],
-            [tuple(f) for f in faces],
+            edge_list,
+            face_list,
         )
         mesh.update()
         existing.matrix_world = matrix_world.copy()
@@ -212,8 +216,8 @@ def _create_or_update_mesh_object(
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(
         [tuple(v) for v in local.tolist()],
-        [],
-        [tuple(f) for f in faces],
+        edge_list,
+        face_list,
     )
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
@@ -223,6 +227,39 @@ def _create_or_update_mesh_object(
     else:
         bpy.context.scene.collection.objects.link(obj)
     return obj
+
+
+class ARE_OT_build_fit_surface(bpy.types.Operator):
+    """面板按钮：从四边 debug 预览进入曲面拟合。"""
+
+    bl_idname = "are.build_fit_surface"
+    bl_label = "拟合成面"
+    bl_description = "根据已提取的四条最长边生成三边/四边拟合曲面预览"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        return (
+            scene_props is not None
+            and scene_props.fit_mode_active
+            and scene_props.fit_phase == "DEBUG_EDGES"
+        )
+
+    def execute(self, context: bpy.types.Context):
+        op = _get_active_fit_op()
+        if op is None:
+            self.report({"ERROR"}, "拟合模态未运行")
+            return {"CANCELLED"}
+        try:
+            if op.build_surface_from_panel(context):
+                self.report({"INFO"}, "已生成拟合曲面预览")
+            else:
+                self.report({"ERROR"}, "拟合成面失败")
+        except Exception as exc:
+            self.report({"ERROR"}, f"拟合成面失败: {exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
 
 
 class ARE_OT_confirm_fit_region(bpy.types.Operator):
@@ -269,14 +306,14 @@ class ARE_OT_fit_region(bpy.types.Operator):
     """
     模态拟合领域。
 
-    点击编号选择领域 → 滚轮/Page 调节控制点 → 确认写入「拟合面」集合。
+    点击编号 → 显示各 island 四条最长边（debug）→ 拟合成面 → 确认写入集合。
     """
 
     bl_idname = "are.fit_region"
     bl_label = "拟合领域"
     bl_description = (
-        "点击领域编号拟合三边/四边规则曲面；"
-        "滚轮与 PageUp/PageDown 调节控制点；确认放入「拟合面」集合"
+        "点击领域编号先显示各孤岛四条最长边；"
+        "确认后拟合成面，再用滚轮/Page 调节控制点并写入「拟合面」集合"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -308,9 +345,26 @@ class ARE_OT_fit_region(bpy.types.Operator):
             self._finish_mode(context, cancelled=False)
             self._closed = True
 
+    def build_surface_from_panel(self, context: bpy.types.Context) -> bool:
+        """面板「拟合成面」：从 DEBUG_EDGES 进入曲面预览。"""
+        if getattr(self, "_closed", False):
+            return False
+        return self._rebuild_preview(context)
+
     def _status_text(self, scene_props) -> str:
-        if scene_props.fit_phase != "PREVIEW":
-            return "点击领域编号开始拟合；同编号 island 会沿边沿曲率延长相接"
+        phase = scene_props.fit_phase
+        if phase == "DEBUG_EDGES":
+            target = int(scene_props.fit_target_id)
+            island_n = int(getattr(self, "_debug_island_count", 0))
+            return (
+                f"领域 {target} · 已提取 {island_n} 个孤岛的最长边 · "
+                f"核对后点「拟合成面」或按 Enter"
+            )
+        if phase != "PREVIEW":
+            return (
+                "点击领域编号：先显示各孤岛四条最长边，"
+                "核对后再拟合成面"
+            )
         topo = "三边" if self._topology == "TRI" else "四边"
         target = int(scene_props.fit_target_id)
         if self._topology == "TRI":
@@ -325,6 +379,72 @@ class ARE_OT_fit_region(bpy.types.Operator):
             f"U={scene_props.fit_segments_u} V={scene_props.fit_segments_v} · "
             f"滚轮调 U / Page 调 V"
         )
+
+    @staticmethod
+    def _format_debug_detail(debug: dict) -> str:
+        parts: list[str] = []
+        for island in debug.get("islands", []):
+            lengths = island.get("lengths", [])
+            length_txt = " / ".join(f"{length:.3f}" for length in lengths)
+            parts.append(
+                f"岛{island.get('island_index', '?')}: "
+                f"{len(lengths)}边 [{length_txt}]"
+            )
+        return "；".join(parts)
+
+    def _rebuild_debug_edges(self, context: bpy.types.Context) -> bool:
+        """提取并预览领域内每个孤岛的四条最长边。"""
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        target = int(scene_props.fit_target_id)
+        if target < 0:
+            return False
+        try:
+            debug = extract_island_longest_sides(
+                region_ids=self._region_ids,
+                target_id=target,
+                vertices=self._mesh_data["vertices"],
+                loop_start=self._topology_data["loop_start"],
+                loop_total=self._topology_data["loop_total"],
+                loop_vertex_indices=self._topology_data["loop_vertex_indices"],
+            )
+        except RegionFitError as exc:
+            self._discard_preview()
+            scene_props.fit_phase = "SELECT"
+            scene_props.fit_topology = ""
+            scene_props.fit_status = str(exc)
+            scene_props.fit_status_detail = ""
+            self.report({"ERROR"}, str(exc))
+            _tag_redraw(context)
+            return False
+
+        self._debug_result = debug
+        self._debug_island_count = int(debug["island_count"])
+        self._last_result = None
+        self._topology = "QUAD"
+        scene_props.fit_topology = ""
+        scene_props.fit_phase = "DEBUG_EDGES"
+        preview = _create_or_update_mesh_object(
+            FIT_PREVIEW_NAME,
+            debug["wire_vertices"],
+            [],
+            self._object.matrix_world,
+            collection=None,
+            existing=self._preview_object,
+            edges=debug["wire_edges"],
+        )
+        if preview.name not in context.scene.collection.objects:
+            try:
+                context.scene.collection.objects.link(preview)
+            except RuntimeError:
+                pass
+        preview.hide_select = True
+        preview.display_type = "WIRE"
+        preview.show_in_front = True
+        self._preview_object = preview
+        scene_props.fit_status = self._status_text(scene_props)
+        scene_props.fit_status_detail = self._format_debug_detail(debug)
+        _tag_redraw(context)
+        return True
 
     def _rebuild_preview(self, context: bpy.types.Context) -> bool:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
@@ -495,6 +615,8 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._region_ids = region_ids.copy()
         self._preview_object = None
         self._last_result = None
+        self._debug_result = None
+        self._debug_island_count = 0
         self._topology = "QUAD"
         self._committed = False
         self._closed = False
@@ -564,9 +686,14 @@ class ARE_OT_fit_region(bpy.types.Operator):
             return self._finish_mode(context, cancelled=True)
 
         if event.type in {"RET", "NUMPAD_ENTER"} and event.value == "PRESS":
-            if self._commit_fit(context):
-                self.report({"INFO"}, scene_props.fit_status)
-                return self._finish_mode(context, cancelled=False)
+            if scene_props.fit_phase == "DEBUG_EDGES":
+                if self._rebuild_preview(context):
+                    self.report({"INFO"}, "已生成拟合曲面预览")
+                return {"RUNNING_MODAL"}
+            if scene_props.fit_phase == "PREVIEW":
+                if self._commit_fit(context):
+                    self.report({"INFO"}, scene_props.fit_status)
+                    return self._finish_mode(context, cancelled=False)
             return {"RUNNING_MODAL"}
 
         # 滚轮：第一组（四边 U / 三边长边→存于 V）
@@ -625,11 +752,11 @@ class ARE_OT_fit_region(bpy.types.Operator):
             scene_props.fit_target_id = rid
             scene_props.fit_segments_u = DEFAULT_SEG_U
             scene_props.fit_segments_v = DEFAULT_SEG_V
-            if self._rebuild_preview(context):
+            if self._rebuild_debug_edges(context):
                 self.report(
                     {"INFO"},
-                    f"已选择领域 {rid}，其 island 已自动连接；"
-                    "滚轮/Page 调节控制点",
+                    f"已选择领域 {rid}：显示各孤岛四条最长边；"
+                    "核对后点「拟合成面」或按 Enter",
                 )
             return {"RUNNING_MODAL"}
 
@@ -638,6 +765,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
 
 __all__ = (
     "ARE_OT_fit_region",
+    "ARE_OT_build_fit_surface",
     "ARE_OT_confirm_fit_region",
     "FIT_COLLECTION_NAME",
 )
