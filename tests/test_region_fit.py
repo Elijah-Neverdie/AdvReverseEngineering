@@ -920,10 +920,17 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertGreaterEqual(len(debug["wire_vertices"]), 8)
         beziers = island["beziers"]
         self.assertEqual(len(beziers), 4)
-        # 邻边异色、对边同色
-        self.assertEqual(
-            [int(b["color_id"]) for b in beziers],
-            [0, 1, 0, 1],
+        # 每段独立随机色（确定性种子），不再红绿对边交替
+        color_ids = [int(b["color_id"]) for b in beziers]
+        self.assertEqual(color_ids, list(range(4)))
+        self.assertEqual(len(debug["segment_colors"]), 4)
+        for rgba in debug["segment_colors"]:
+            self.assertEqual(len(rgba), 4)
+            self.assertTrue(all(0.0 <= float(c) <= 1.0 for c in rgba))
+        # 相邻段颜色应可区分（不完全相同）
+        self.assertNotEqual(
+            debug["segment_colors"][0][:3],
+            debug["segment_colors"][1][:3],
         )
         # 闭环：相邻边端点重合
         for index, side in enumerate(island["sides"]):
@@ -1020,10 +1027,8 @@ class FitRegionSurfaceTests(unittest.TestCase):
         for island in debug["islands"]:
             self.assertEqual(len(island["sides"]), 4)
             self.assertEqual(len(island["lengths"]), 4)
-            self.assertEqual(
-                [int(b["color_id"]) for b in island["beziers"]],
-                [0, 1, 0, 1],
-            )
+            color_ids = [int(b["color_id"]) for b in island["beziers"]]
+            self.assertEqual(len(color_ids), len(set(color_ids)))
             for index, side in enumerate(island["sides"]):
                 nxt = island["sides"][(index + 1) % 4]
                 np.testing.assert_allclose(side[-1], nxt[0], atol=1e-9)

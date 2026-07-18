@@ -24,6 +24,8 @@ _BOUNDARY_SAMPLES_MAX = 384
 # 先多取角点候选，再按最短边合并到三/四边，避免尖角被 NMS 挤掉后并成长边
 _MAX_CORNER_CANDIDATES = 12
 _STRONG_CONCAVE_ANGLE_DEG = 35.0
+# 调试边：按折角拆分时允许的最大角点数（不再压成 3/4 边）
+_MAX_SPLIT_CORNERS = 64
 # 锯齿边界：隔 2/4/8/16 点取弦，多尺度共识判定真尖角
 _CORNER_SAMPLE_STRIDES = (2, 4, 8, 16)
 _CORNER_STRIDE_MIN_VOTES = 2
@@ -1714,15 +1716,44 @@ def split_loop_into_sides(
     loop_points: np.ndarray,
     corner_indices: Sequence[int],
 ) -> list[np.ndarray]:
-    """按角点将闭环拆成边链（每条含两端角点）。"""
-    if len(corner_indices) < 3:
-        raise RegionFitError("角点不足，无法形成三边/四边拓扑")
+    """按折角点将闭环拆成边链（每条含两端角点）；不少于 2 个折角。"""
+    if len(corner_indices) < 2:
+        raise RegionFitError("折角不足，无法拆分边界段")
     ordered = sorted({int(i) % len(loop_points) for i in corner_indices})
+    if len(ordered) < 2:
+        raise RegionFitError("折角不足，无法拆分边界段")
     sides: list[np.ndarray] = []
     for index, start in enumerate(ordered):
         end = ordered[(index + 1) % len(ordered)]
         sides.append(_side_from_loop(loop_points, start, end))
     return sides
+
+
+def make_segment_color(seed: int) -> tuple[float, float, float, float]:
+    """由种子生成饱和、互异感强的 RGBA（确定性随机）。"""
+    rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+    hue = float(rng.random())
+    sat = float(0.55 + 0.40 * rng.random())
+    val = float(0.72 + 0.28 * rng.random())
+    i = int(hue * 6.0)
+    f = hue * 6.0 - i
+    p = val * (1.0 - sat)
+    q = val * (1.0 - f * sat)
+    t = val * (1.0 - (1.0 - f) * sat)
+    i_mod = i % 6
+    if i_mod == 0:
+        r, g, b = val, t, p
+    elif i_mod == 1:
+        r, g, b = q, val, p
+    elif i_mod == 2:
+        r, g, b = p, val, t
+    elif i_mod == 3:
+        r, g, b = p, q, val
+    elif i_mod == 4:
+        r, g, b = t, p, val
+    else:
+        r, g, b = val, p, q
+    return (float(r), float(g), float(b), 1.0)
 
 
 def fit_cubic_bezier_controls(points: np.ndarray) -> np.ndarray:
@@ -1825,12 +1856,13 @@ def extract_island_longest_sides(
     bezier_samples: int = 24,
 ) -> dict:
     """
-    对领域内每个 island 边界环提取主边（默认目标 4），拟合成三次贝塞尔。
+    对领域内每个 island 边界环按折角拆成段并拟合。
 
-    始终保持闭环：邻边共享角点，不会出现角部缺口。
-    只合并平缓接头；尖角过多时宁可多显示几条边，也不并成 L 形折边。
-    邻边 color_id 交替（0 红 / 1 绿），对边同色。
+    不按长短合并到固定边数；只在明显折角处断开。
+    每条平滑折线段或曲线段分配独立随机颜色（segment_colors）。
+    max_sides 保留兼容，调试拆分不再使用它压边数。
     """
+    _ = max_sides  # 兼容旧调用签名；按折角拆分不压边数
     verts = _as_float_array(vertices)
     loops = extract_region_boundary_loops(
         region_ids,
@@ -1843,9 +1875,7 @@ def extract_island_longest_sides(
     loops = filter_significant_boundary_loops(loops, verts)
     if not loops:
         raise RegionFitError("过滤极小碎环后无可用边界")
-    keep_sides = max(int(max_sides), 3)
     sample_n = max(int(bezier_samples), 4)
-    sharp_keep = float(max(corner_angle_deg, _STRONG_CONCAVE_ANGLE_DEG))
     islands: list[dict] = []
     wire_vertices: list[np.ndarray] = []
     wire_edges: list[tuple[int, int]] = []
@@ -1853,6 +1883,7 @@ def extract_island_longest_sides(
     control_points: list[np.ndarray] = []
     control_color_ids: list[int] = []
     concave_fold_points: list[np.ndarray] = []
+    segment_colors: list[tuple[float, float, float, float]] = []
     vertex_cursor = 0
     all_points: list[np.ndarray] = []
 
@@ -1874,38 +1905,33 @@ def extract_island_longest_sides(
         )
         loop_rs = resample_closed_polyline(loop_pts, sample_count)
         pts_2d = project_points_to_plane(loop_rs, origin, axis_u, axis_v)
+        # 凸/凹折角都作为拆分点，不再压成 3/4 边
         corners = detect_corner_indices(
             pts_2d,
             corner_angle_deg,
-            max_corners=_MAX_CORNER_CANDIDATES,
+            max_corners=_MAX_SPLIT_CORNERS,
+            convex_only=False,
             include_strong_concave=True,
         )
-        if len(corners) < 3:
-            quarter = max(sample_count // 4, 1)
-            corners = [0, quarter, 2 * quarter, 3 * quarter]
-
-        # 明显凹折角：阈值与凸角一致，避免 35°~55° 凹折被漏掉
         fold_indices = detect_concave_fold_indices(
             pts_2d,
             fold_angle_deg=corner_angle_deg,
             max_folds=_MAX_CONCAVE_FOLDS,
         )
+        split_indices = sorted(set(corners) | set(fold_indices))
+        if len(split_indices) < 2:
+            half = max(sample_count // 2, 1)
+            split_indices = [0, half]
+
         island_folds = [loop_rs[index].copy() for index in fold_indices]
 
-        sides_3d = split_loop_into_sides(loop_rs, corners)
-        # 1) 接回近共线误拆段
+        sides_3d = split_loop_into_sides(loop_rs, split_indices)
+        # 仅接回近共线误拆段，不按长短压到固定边数
         sides_3d = merge_collinear_adjacent_sides(
             sides_3d,
             max_turn_deg=corner_angle_deg,
-            min_sides=keep_sides,
+            min_sides=2,
         )
-        # 2) 闭环合并到目标边数；拒绝合并尖角，避免 L 形伪边与角部缺口
-        if len(sides_3d) > keep_sides:
-            sides_3d = reduce_sides_to_count(
-                sides_3d,
-                keep_sides,
-                max_merge_turn_deg=sharp_keep,
-            )
         # 强制相邻边共享端点，消除数值缝隙
         for index in range(len(sides_3d)):
             nxt = (index + 1) % len(sides_3d)
@@ -1915,7 +1941,7 @@ def extract_island_longest_sides(
             sides_3d[index][-1] = shared
             sides_3d[nxt][0] = shared
 
-        # 合并后仍留在边中段的凹折也要标记（常见于长绿边跨过凹口）
+        # 合并后仍留在边中段的凹折也要标记
         for side in sides_3d:
             if len(side) < 5:
                 continue
@@ -1948,57 +1974,67 @@ def extract_island_longest_sides(
         beziers: list[dict] = []
         sides_sampled: list[np.ndarray] = []
         lengths: list[float] = []
-        for side_index, side in enumerate(sides_3d):
-            color_id = int(side_index % 2)
-            side_2d = project_points_to_plane(side, origin, axis_u, axis_v)
-            fit_mode, key_or_side, spans = classify_side_fit_mode(
-                side,
-                points_2d=side_2d,
-                fold_angle_deg=corner_angle_deg,
+
+        def _append_polyline_segment(
+            polyline: np.ndarray,
+            side_index: int,
+        ) -> None:
+            nonlocal vertex_cursor
+            poly = _as_float_array(polyline).copy()
+            if len(poly) < 2:
+                return
+            color_id = len(segment_colors)
+            seed = (
+                0xA11E0000
+                ^ (int(island_index) << 16)
+                ^ (int(side_index) << 8)
+                ^ int(color_id)
             )
-
-            if fit_mode == "POLYLINE":
-                polyline = _as_float_array(key_or_side)
-                polyline = polyline.copy()
-                polyline[0] = side[0]
-                polyline[-1] = side[-1]
-                sampled = resample_polyline(
-                    polyline,
-                    max(sample_n, len(polyline)),
+            segment_colors.append(make_segment_color(seed))
+            sampled = resample_polyline(poly, max(sample_n, len(poly)))
+            sampled = sampled.copy()
+            sampled[0] = poly[0]
+            sampled[-1] = poly[-1]
+            length = float(polyline_length(poly))
+            beziers.append(
+                {
+                    "fit_mode": "POLYLINE",
+                    "polyline": poly,
+                    "spans": None,
+                    "color_id": color_id,
+                    "length": length,
+                    "side_index": int(side_index),
+                }
+            )
+            sides_sampled.append(sampled)
+            lengths.append(length)
+            all_points.append(sampled)
+            all_points.append(poly)
+            wire_vertices.append(sampled)
+            for offset in range(len(sampled) - 1):
+                wire_edges.append(
+                    (vertex_cursor + offset, vertex_cursor + offset + 1)
                 )
-                sampled = sampled.copy()
-                sampled[0] = side[0]
-                sampled[-1] = side[-1]
-                length = float(polyline_length(polyline))
-                beziers.append(
-                    {
-                        "fit_mode": "POLYLINE",
-                        "polyline": polyline,
-                        "spans": None,
-                        "color_id": color_id,
-                        "length": length,
-                        "side_index": int(side_index),
-                    }
-                )
-                sides_sampled.append(sampled)
-                lengths.append(length)
-                all_points.append(sampled)
-                all_points.append(polyline)
+                wire_color_ids.append(color_id)
+            vertex_cursor += len(sampled)
+            for point in poly:
+                control_points.append(point)
+                control_color_ids.append(color_id)
 
-                wire_vertices.append(sampled)
-                for offset in range(len(sampled) - 1):
-                    wire_edges.append(
-                        (vertex_cursor + offset, vertex_cursor + offset + 1)
-                    )
-                    wire_color_ids.append(color_id)
-                vertex_cursor += len(sampled)
-
-                for point in polyline:
-                    control_points.append(point)
-                    control_color_ids.append(color_id)
-                continue
-
-            assert spans is not None
+        def _append_curve_segment(
+            side: np.ndarray,
+            spans: list[np.ndarray],
+            side_index: int,
+        ) -> None:
+            nonlocal vertex_cursor
+            color_id = len(segment_colors)
+            seed = (
+                0xA11E0000
+                ^ (int(island_index) << 16)
+                ^ (int(side_index) << 8)
+                ^ int(color_id)
+            )
+            segment_colors.append(make_segment_color(seed))
             sampled_parts = [
                 sample_cubic_bezier(
                     controls,
@@ -2009,9 +2045,7 @@ def extract_island_longest_sides(
             sampled_list = [sampled_parts[0]]
             for part in sampled_parts[1:]:
                 sampled_list.append(part[1:])
-            sampled = np.vstack(sampled_list)
-            # 端点贴回共享角点
-            sampled = sampled.copy()
+            sampled = np.vstack(sampled_list).copy()
             sampled[0] = side[0]
             sampled[-1] = side[-1]
             length = float(polyline_length(sampled))
@@ -2030,7 +2064,6 @@ def extract_island_longest_sides(
             all_points.append(sampled)
             for span_controls in spans:
                 all_points.append(span_controls)
-
             wire_vertices.append(sampled)
             for offset in range(len(sampled) - 1):
                 wire_edges.append(
@@ -2038,15 +2071,10 @@ def extract_island_longest_sides(
                 )
                 wire_color_ids.append(color_id)
             vertex_cursor += len(sampled)
-
-            # 控制点：角点始终保留；手柄偏离边线过远则视为离散噪声忽略
             control_points.append(side[0])
             control_color_ids.append(color_id)
             handle_limit = float(
-                max(
-                    polyline_length(side) * _HANDLE_OUTLIER_FRAC,
-                    1e-4,
-                )
+                max(polyline_length(side) * _HANDLE_OUTLIER_FRAC, 1e-4)
             )
             raw_handles = []
             for span_controls in spans:
@@ -2058,12 +2086,37 @@ def extract_island_longest_sides(
             control_points.append(side[-1])
             control_color_ids.append(color_id)
 
+        for side_index, side in enumerate(sides_3d):
+            side_2d = project_points_to_plane(side, origin, axis_u, axis_v)
+            fit_mode, key_or_side, spans = classify_side_fit_mode(
+                side,
+                points_2d=side_2d,
+                fold_angle_deg=corner_angle_deg,
+            )
+            if fit_mode == "POLYLINE":
+                polyline = _as_float_array(key_or_side).copy()
+                polyline[0] = side[0]
+                polyline[-1] = side[-1]
+                # 折线内部折角再拆成平滑直线段，每段独立着色
+                if len(polyline) >= 3:
+                    for seg_i in range(len(polyline) - 1):
+                        _append_polyline_segment(
+                            polyline[seg_i : seg_i + 2],
+                            side_index,
+                        )
+                else:
+                    _append_polyline_segment(polyline, side_index)
+                continue
+
+            assert spans is not None
+            _append_curve_segment(side, spans, side_index)
+
         islands.append(
             {
                 "island_index": int(island_index),
                 "sides": sides_sampled,
                 "lengths": lengths,
-                "corner_count": int(len(corners)),
+                "corner_count": int(len(split_indices)),
                 "beziers": beziers,
                 "concave_fold_count": int(len(island_folds)),
                 "concave_fold_points": island_folds,
@@ -2089,6 +2142,7 @@ def extract_island_longest_sides(
         "wire_color_ids": wire_color_ids,
         "control_points": np.asarray(control_points, dtype=np.float64),
         "control_color_ids": control_color_ids,
+        "segment_colors": segment_colors,
         "concave_fold_points": (
             np.asarray(concave_fold_points, dtype=np.float64)
             if concave_fold_points
@@ -2098,6 +2152,7 @@ def extract_island_longest_sides(
         "control_radius": control_radius,
         "fold_radius": fold_radius,
     }
+
 
 
 def _junction_turn_deg(side_a: np.ndarray, side_b: np.ndarray) -> float:

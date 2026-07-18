@@ -38,9 +38,14 @@ FIT_DEBUG_CTRL_NAME = "ARE_FitDebugControls"
 FIT_DEBUG_FOLD_NAME = "ARE_FitConcaveFolds"
 FIT_EDGE_MAT_RED = "ARE_FitEdge_Red"
 FIT_EDGE_MAT_GREEN = "ARE_FitEdge_Green"
+FIT_EDGE_MAT_SEG_PREFIX = "ARE_FitEdge_Seg_"
 FIT_FOLD_MAT = "ARE_FitFold_Marker"
 FIT_EDGE_COLOR_RED = (1.0, 0.12, 0.08, 1.0)
 FIT_EDGE_COLOR_GREEN = (0.1, 0.95, 0.22, 1.0)
+FIT_EDGE_COLOR_FALLBACK = (
+    FIT_EDGE_COLOR_RED,
+    FIT_EDGE_COLOR_GREEN,
+)
 FIT_FOLD_COLOR = (0.15, 0.85, 1.0, 1.0)
 MODAL_TIMER_STEP = 0.1
 _FIT_OP_KEY = "are_active_fit_op"
@@ -223,6 +228,41 @@ def _ensure_fit_edge_material(name: str, color: tuple[float, ...]) -> bpy.types.
     return mat
 
 
+def _resolve_segment_colors(debug: dict) -> list[tuple[float, float, float, float]]:
+    """从 debug 取每段 RGBA；缺省时回退红/绿交替。"""
+    raw = list(debug.get("segment_colors") or [])
+    colors: list[tuple[float, float, float, float]] = []
+    for item in raw:
+        rgba = tuple(float(v) for v in item[:4])
+        if len(rgba) < 4:
+            rgba = rgba + (1.0,) * (4 - len(rgba))
+        colors.append(rgba)  # type: ignore[arg-type]
+    if colors:
+        return colors
+    return list(FIT_EDGE_COLOR_FALLBACK)
+
+
+def _apply_segment_materials(
+    data_block,
+    colors: list[tuple[float, float, float, float]],
+) -> None:
+    """给 Curve/Mesh 挂上每段自定义材质。"""
+    data_block.materials.clear()
+    for index, color in enumerate(colors):
+        mat = _ensure_fit_edge_material(
+            f"{FIT_EDGE_MAT_SEG_PREFIX}{index}",
+            color,
+        )
+        data_block.materials.append(mat)
+    if not colors:
+        data_block.materials.append(
+            _ensure_fit_edge_material(FIT_EDGE_MAT_RED, FIT_EDGE_COLOR_RED)
+        )
+        data_block.materials.append(
+            _ensure_fit_edge_material(FIT_EDGE_MAT_GREEN, FIT_EDGE_COLOR_GREEN)
+        )
+
+
 def _link_object_to_scene(
     obj: bpy.types.Object,
     collection: bpy.types.Collection | None,
@@ -335,10 +375,9 @@ def _create_or_update_debug_curve_object(
     collection: bpy.types.Collection | None,
     existing: bpy.types.Object | None = None,
 ) -> bpy.types.Object:
-    """用加粗曲线显示拟合边：折线边用 POLY，缓弧边用贝塞尔；对边同色。"""
+    """用加粗曲线显示拟合边：折线边用 POLY，缓弧边用贝塞尔；每段自定义色。"""
     matrix = np.asarray(matrix_world, dtype=np.float64)
-    mat_red = _ensure_fit_edge_material(FIT_EDGE_MAT_RED, FIT_EDGE_COLOR_RED)
-    mat_green = _ensure_fit_edge_material(FIT_EDGE_MAT_GREEN, FIT_EDGE_COLOR_GREEN)
+    colors = _resolve_segment_colors(debug)
 
     if (
         existing is not None
@@ -359,14 +398,13 @@ def _create_or_update_debug_curve_object(
     curve.bevel_depth = float(debug.get("bevel_depth", 0.002))
     curve.bevel_resolution = 3
     curve.use_fill_caps = True
-    curve.materials.clear()
-    curve.materials.append(mat_red)
-    curve.materials.append(mat_green)
+    _apply_segment_materials(curve, colors)
+    color_mod = max(len(curve.materials), 1)
 
     for island in debug.get("islands", []):
         for bezier in island.get("beziers", []):
             fit_mode = str(bezier.get("fit_mode", "CURVE")).upper()
-            color_id = int(bezier.get("color_id", 0)) % 2
+            color_id = int(bezier.get("color_id", 0)) % color_mod
 
             if fit_mode == "POLYLINE":
                 polyline = bezier.get("polyline")
@@ -445,7 +483,7 @@ def _create_or_update_control_point_object(
     collection: bpy.types.Collection | None,
     existing: bpy.types.Object | None = None,
 ) -> bpy.types.Object | None:
-    """显示贝塞尔控制点（与所属边同色）。"""
+    """显示拟合控制点（与所属段同色）。"""
     centers = np.asarray(debug.get("control_points", []), dtype=np.float64)
     if len(centers) == 0:
         if existing is not None:
@@ -462,15 +500,13 @@ def _create_or_update_control_point_object(
         collection,
         existing=existing,
     )
-    mat_red = _ensure_fit_edge_material(FIT_EDGE_MAT_RED, FIT_EDGE_COLOR_RED)
-    mat_green = _ensure_fit_edge_material(FIT_EDGE_MAT_GREEN, FIT_EDGE_COLOR_GREEN)
+    colors = _resolve_segment_colors(debug)
     mesh = obj.data
-    mesh.materials.clear()
-    mesh.materials.append(mat_red)
-    mesh.materials.append(mat_green)
+    _apply_segment_materials(mesh, colors)
+    color_mod = max(len(mesh.materials), 1)
     if len(mesh.polygons) == len(face_colors):
         for poly, color_id in zip(mesh.polygons, face_colors):
-            poly.material_index = int(color_id) % 2
+            poly.material_index = int(color_id) % color_mod
     obj.hide_select = True
     obj.display_type = "TEXTURED"
     obj.show_in_front = True
