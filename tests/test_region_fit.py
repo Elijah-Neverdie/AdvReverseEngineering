@@ -17,10 +17,12 @@ from AdvReverseEngineering.algorithms.region_fit import (
     detect_corner_indices,
     extract_island_longest_sides,
     extract_region_boundary_loops,
+    fit_cubic_bezier_controls,
     fit_region_surface,
     polyline_length,
     resample_closed_polyline,
     resample_polyline,
+    sample_cubic_bezier,
     select_primary_boundary_loop,
 )
 
@@ -682,13 +684,42 @@ class FitRegionSurfaceTests(unittest.TestCase):
             loop_vertex_indices=mesh["loop_vertex_indices"],
         )
         self.assertEqual(debug["island_count"], 1)
-        self.assertEqual(len(debug["islands"][0]["sides"]), 4)
-        lengths = debug["islands"][0]["lengths"]
+        island = debug["islands"][0]
+        self.assertEqual(len(island["sides"]), 4)
+        lengths = island["lengths"]
         self.assertEqual(len(lengths), 4)
         for length in lengths:
             self.assertAlmostEqual(length, 1.0, places=2)
         self.assertGreaterEqual(len(debug["wire_edges"]), 4)
         self.assertGreaterEqual(len(debug["wire_vertices"]), 8)
+        beziers = island["beziers"]
+        self.assertEqual(len(beziers), 4)
+        # 邻边异色、对边同色：0/2 红，1/3 绿
+        self.assertEqual(
+            [b["color_id"] for b in beziers],
+            [0, 1, 0, 1],
+        )
+        for bezier in beziers:
+            controls = bezier["controls"]
+            self.assertEqual(controls.shape, (4, 3))
+            sampled = sample_cubic_bezier(controls, 8)
+            self.assertEqual(len(sampled), 8)
+            np.testing.assert_allclose(sampled[0], controls[0], atol=1e-9)
+            np.testing.assert_allclose(sampled[-1], controls[-1], atol=1e-9)
+        self.assertGreater(debug["bevel_depth"], 0.0)
+        self.assertEqual(len(debug["control_points"]), 16)
+
+    def test_fit_cubic_bezier_straight_line(self) -> None:
+        pts = np.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+        controls = fit_cubic_bezier_controls(pts)
+        sampled = sample_cubic_bezier(controls, 10)
+        self.assertTrue(np.allclose(sampled[:, 1], 0.0, atol=1e-6))
+        self.assertTrue(np.allclose(sampled[:, 2], 0.0, atol=1e-6))
+        self.assertAlmostEqual(float(sampled[0, 0]), 0.0, places=6)
+        self.assertAlmostEqual(float(sampled[-1, 0]), 3.0, places=6)
 
     def test_extract_disconnected_islands_longest_sides(self) -> None:
         mesh = _disconnected_same_region_strip()
@@ -704,6 +735,10 @@ class FitRegionSurfaceTests(unittest.TestCase):
         for island in debug["islands"]:
             self.assertEqual(len(island["sides"]), 4)
             self.assertEqual(len(island["lengths"]), 4)
+            self.assertEqual(
+                [b["color_id"] for b in island["beziers"]],
+                [0, 1, 0, 1],
+            )
 
 
 if __name__ == "__main__":

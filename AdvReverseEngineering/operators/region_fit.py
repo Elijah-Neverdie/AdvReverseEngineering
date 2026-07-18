@@ -34,6 +34,11 @@ from .regions import REGION_ID_ATTR, read_region_ids
 
 FIT_COLLECTION_NAME = "拟合面"
 FIT_PREVIEW_NAME = "ARE_FitPreview"
+FIT_DEBUG_CTRL_NAME = "ARE_FitDebugControls"
+FIT_EDGE_MAT_RED = "ARE_FitEdge_Red"
+FIT_EDGE_MAT_GREEN = "ARE_FitEdge_Green"
+FIT_EDGE_COLOR_RED = (1.0, 0.12, 0.08, 1.0)
+FIT_EDGE_COLOR_GREEN = (0.1, 0.95, 0.22, 1.0)
 MODAL_TIMER_STEP = 0.1
 _FIT_OP_KEY = "are_active_fit_op"
 
@@ -166,10 +171,14 @@ def _delete_object(obj: bpy.types.Object | None) -> None:
     if obj is None:
         return
     try:
-        mesh = obj.data
+        data = obj.data
         bpy.data.objects.remove(obj, do_unlink=True)
-        if mesh is not None and mesh.users == 0:
-            bpy.data.meshes.remove(mesh)
+        if data is not None and data.users == 0:
+            data_type = data.bl_rna.identifier
+            if data_type == "Mesh":
+                bpy.data.meshes.remove(data)
+            elif data_type == "Curve":
+                bpy.data.curves.remove(data)
     except ReferenceError:
         pass
 
@@ -188,6 +197,42 @@ def _as_float(values) -> np.ndarray:
     return np.asarray(values, dtype=np.float64)
 
 
+def _ensure_fit_edge_material(name: str, color: tuple[float, ...]) -> bpy.types.Material:
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+    mat.diffuse_color = color
+    # 视口加亮，避免被扫描面淹没
+    try:
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+        output = nodes.new("ShaderNodeOutputMaterial")
+        emission = nodes.new("ShaderNodeEmission")
+        emission.inputs["Color"].default_value = color
+        emission.inputs["Strength"].default_value = 1.2
+        links.new(emission.outputs["Emission"], output.inputs["Surface"])
+    except Exception:
+        pass
+    if hasattr(mat, "roughness"):
+        mat.roughness = 0.35
+    return mat
+
+
+def _link_object_to_scene(
+    obj: bpy.types.Object,
+    collection: bpy.types.Collection | None,
+) -> None:
+    if collection is not None:
+        if obj.name not in collection.objects:
+            collection.objects.link(obj)
+        return
+    scene_col = bpy.context.scene.collection
+    if obj.name not in scene_col.objects:
+        scene_col.objects.link(obj)
+
+
 def _create_or_update_mesh_object(
     name: str,
     vertices_world: np.ndarray,
@@ -201,7 +246,11 @@ def _create_or_update_mesh_object(
     local = _world_to_object_local(matrix, vertices_world)
     edge_list = [] if edges is None else [tuple(e) for e in edges]
     face_list = [tuple(f) for f in faces]
-    if existing is not None and existing.name in bpy.data.objects:
+    if (
+        existing is not None
+        and existing.name in bpy.data.objects
+        and existing.type == "MESH"
+    ):
         mesh = existing.data
         mesh.clear_geometry()
         mesh.from_pydata(
@@ -213,6 +262,9 @@ def _create_or_update_mesh_object(
         existing.matrix_world = matrix_world.copy()
         return existing
 
+    if existing is not None:
+        _delete_object(existing)
+
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(
         [tuple(v) for v in local.tolist()],
@@ -222,10 +274,159 @@ def _create_or_update_mesh_object(
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
     obj.matrix_world = matrix_world.copy()
-    if collection is not None:
-        collection.objects.link(obj)
+    _link_object_to_scene(obj, collection)
+    return obj
+
+
+def _octahedron_mesh(
+    centers: np.ndarray,
+    radius: float,
+    color_ids: list[int],
+) -> tuple[np.ndarray, list[tuple[int, ...]], list[int]]:
+    """为每个控制点生成小八面体，便于加粗点显示。"""
+    if len(centers) == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float64),
+            [],
+            [],
+        )
+    offsets = np.array(
+        [
+            [radius, 0.0, 0.0],
+            [-radius, 0.0, 0.0],
+            [0.0, radius, 0.0],
+            [0.0, -radius, 0.0],
+            [0.0, 0.0, radius],
+            [0.0, 0.0, -radius],
+        ],
+        dtype=np.float64,
+    )
+    local_faces = (
+        (0, 2, 4),
+        (2, 1, 4),
+        (1, 3, 4),
+        (3, 0, 4),
+        (2, 0, 5),
+        (1, 2, 5),
+        (3, 1, 5),
+        (0, 3, 5),
+    )
+    verts: list[np.ndarray] = []
+    faces: list[tuple[int, ...]] = []
+    face_colors: list[int] = []
+    for index, center in enumerate(centers):
+        base = len(verts)
+        for offset in offsets:
+            verts.append(center + offset)
+        color = int(color_ids[index]) if index < len(color_ids) else 0
+        for face in local_faces:
+            faces.append(tuple(base + i for i in face))
+            face_colors.append(color)
+    return np.asarray(verts, dtype=np.float64), faces, face_colors
+
+
+def _create_or_update_debug_curve_object(
+    name: str,
+    debug: dict,
+    matrix_world,
+    collection: bpy.types.Collection | None,
+    existing: bpy.types.Object | None = None,
+) -> bpy.types.Object:
+    """用加粗贝塞尔曲线显示拟合边：对边同色（红/绿交替）。"""
+    matrix = np.asarray(matrix_world, dtype=np.float64)
+    mat_red = _ensure_fit_edge_material(FIT_EDGE_MAT_RED, FIT_EDGE_COLOR_RED)
+    mat_green = _ensure_fit_edge_material(FIT_EDGE_MAT_GREEN, FIT_EDGE_COLOR_GREEN)
+
+    if (
+        existing is not None
+        and existing.name in bpy.data.objects
+        and existing.type == "CURVE"
+    ):
+        obj = existing
+        curve = obj.data
+        curve.splines.clear()
     else:
-        bpy.context.scene.collection.objects.link(obj)
+        if existing is not None:
+            _delete_object(existing)
+        curve = bpy.data.curves.new(name, type="CURVE")
+        obj = bpy.data.objects.new(name, curve)
+        _link_object_to_scene(obj, collection)
+
+    curve.dimensions = "3D"
+    curve.bevel_depth = float(debug.get("bevel_depth", 0.002))
+    curve.bevel_resolution = 3
+    curve.use_fill_caps = True
+    curve.materials.clear()
+    curve.materials.append(mat_red)
+    curve.materials.append(mat_green)
+
+    for island in debug.get("islands", []):
+        for bezier in island.get("beziers", []):
+            controls = _world_to_object_local(
+                matrix,
+                np.asarray(bezier["controls"], dtype=np.float64),
+            )
+            spline = curve.splines.new("BEZIER")
+            spline.bezier_points.add(1)
+            p0, p1, p2, p3 = controls
+            bp0 = spline.bezier_points[0]
+            bp1 = spline.bezier_points[1]
+            bp0.co = p0
+            bp0.handle_left_type = "FREE"
+            bp0.handle_right_type = "FREE"
+            bp0.handle_left = p0 - (p1 - p0)
+            bp0.handle_right = p1
+            bp1.co = p3
+            bp1.handle_left_type = "FREE"
+            bp1.handle_right_type = "FREE"
+            bp1.handle_left = p2
+            bp1.handle_right = p3 + (p3 - p2)
+            spline.material_index = int(bezier.get("color_id", 0)) % 2
+            spline.use_smooth = True
+
+    obj.matrix_world = matrix_world.copy()
+    obj.hide_select = True
+    obj.display_type = "TEXTURED"
+    obj.show_in_front = True
+    return obj
+
+
+def _create_or_update_control_point_object(
+    name: str,
+    debug: dict,
+    matrix_world,
+    collection: bpy.types.Collection | None,
+    existing: bpy.types.Object | None = None,
+) -> bpy.types.Object | None:
+    """显示贝塞尔控制点（与所属边同色）。"""
+    centers = np.asarray(debug.get("control_points", []), dtype=np.float64)
+    if len(centers) == 0:
+        if existing is not None:
+            _delete_object(existing)
+        return None
+    color_ids = list(debug.get("control_color_ids", []))
+    radius = float(debug.get("control_radius", 0.003))
+    verts, faces, face_colors = _octahedron_mesh(centers, radius, color_ids)
+    obj = _create_or_update_mesh_object(
+        name,
+        verts,
+        faces,
+        matrix_world,
+        collection,
+        existing=existing,
+    )
+    mat_red = _ensure_fit_edge_material(FIT_EDGE_MAT_RED, FIT_EDGE_COLOR_RED)
+    mat_green = _ensure_fit_edge_material(FIT_EDGE_MAT_GREEN, FIT_EDGE_COLOR_GREEN)
+    mesh = obj.data
+    mesh.materials.clear()
+    mesh.materials.append(mat_red)
+    mesh.materials.append(mat_green)
+    if len(mesh.polygons) == len(face_colors):
+        for poly, color_id in zip(mesh.polygons, face_colors):
+            poly.material_index = int(color_id) % 2
+    obj.hide_select = True
+    obj.display_type = "TEXTURED"
+    obj.show_in_front = True
     return obj
 
 
@@ -332,8 +533,11 @@ class ARE_OT_fit_region(bpy.types.Operator):
 
     def _discard_preview(self) -> None:
         preview = getattr(self, "_preview_object", None)
+        controls = getattr(self, "_debug_control_object", None)
         _delete_object(preview)
+        _delete_object(controls)
         self._preview_object = None
+        self._debug_control_object = None
 
     def confirm_from_panel(self, context: bpy.types.Context) -> None:
         if getattr(self, "_closed", False):
@@ -357,7 +561,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
             target = int(scene_props.fit_target_id)
             island_n = int(getattr(self, "_debug_island_count", 0))
             return (
-                f"领域 {target} · 已提取 {island_n} 个孤岛的最长边 · "
+                f"领域 {target} · {island_n} 孤岛贝塞尔边（红/绿对边同色）· "
                 f"核对后点「拟合成面」或按 Enter"
             )
         if phase != "PREVIEW":
@@ -423,24 +627,22 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._topology = "QUAD"
         scene_props.fit_topology = ""
         scene_props.fit_phase = "DEBUG_EDGES"
-        preview = _create_or_update_mesh_object(
+        preview = _create_or_update_debug_curve_object(
             FIT_PREVIEW_NAME,
-            debug["wire_vertices"],
-            [],
+            debug,
             self._object.matrix_world,
             collection=None,
             existing=self._preview_object,
-            edges=debug["wire_edges"],
         )
-        if preview.name not in context.scene.collection.objects:
-            try:
-                context.scene.collection.objects.link(preview)
-            except RuntimeError:
-                pass
-        preview.hide_select = True
-        preview.display_type = "WIRE"
-        preview.show_in_front = True
+        controls = _create_or_update_control_point_object(
+            FIT_DEBUG_CTRL_NAME,
+            debug,
+            self._object.matrix_world,
+            collection=None,
+            existing=getattr(self, "_debug_control_object", None),
+        )
         self._preview_object = preview
+        self._debug_control_object = controls
         scene_props.fit_status = self._status_text(scene_props)
         scene_props.fit_status_detail = self._format_debug_detail(debug)
         _tag_redraw(context)
@@ -479,6 +681,8 @@ class ARE_OT_fit_region(bpy.types.Operator):
             _tag_redraw(context)
             return False
 
+        # 曲面预览前清掉 debug 曲线/控制点，避免类型混用
+        self._discard_preview()
         self._topology = result.topology
         self._last_result = result
         scene_props.fit_topology = result.topology
@@ -489,14 +693,8 @@ class ARE_OT_fit_region(bpy.types.Operator):
             result.faces,
             self._object.matrix_world,
             collection=None,
-            existing=self._preview_object,
+            existing=None,
         )
-        # 预览先挂到场景根，确认时再移入「拟合面」
-        if preview.name not in context.scene.collection.objects:
-            try:
-                context.scene.collection.objects.link(preview)
-            except RuntimeError:
-                pass
         preview.hide_select = True
         preview.display_type = "WIRE"
         # 预览网格始终显示在扫描面之前，避免被遮挡
@@ -614,6 +812,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._topology_data = topology
         self._region_ids = region_ids.copy()
         self._preview_object = None
+        self._debug_control_object = None
         self._last_result = None
         self._debug_result = None
         self._debug_island_count = 0

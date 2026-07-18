@@ -1087,6 +1087,65 @@ def split_loop_into_sides(
     return sides
 
 
+def fit_cubic_bezier_controls(points: np.ndarray) -> np.ndarray:
+    """
+    将折线拟合成三次贝塞尔控制点 (P0,P1,P2,P3)，端点固定。
+
+    中间两点用弧长参数化最小二乘求解；退化时退回弦长三等分。
+    """
+    pts = _as_float_array(points)
+    if len(pts) < 2:
+        raise RegionFitError("折线点数不足，无法拟合贝塞尔")
+    p0 = pts[0].copy()
+    p3 = pts[-1].copy()
+    if len(pts) == 2 or polyline_length(pts) < 1e-12:
+        delta = p3 - p0
+        return np.vstack((p0, p0 + delta / 3.0, p0 + 2.0 * delta / 3.0, p3))
+
+    params = polyline_parameters(pts)
+    # 跳过端点：那里对 P1/P2 的系数为 0
+    inner = (params > 1e-9) & (params < 1.0 - 1e-9)
+    if not np.any(inner):
+        delta = p3 - p0
+        return np.vstack((p0, p0 + delta / 3.0, p0 + 2.0 * delta / 3.0, p3))
+
+    t = params[inner]
+    q = pts[inner]
+    omt = 1.0 - t
+    a1 = 3.0 * (omt ** 2) * t
+    a2 = 3.0 * omt * (t ** 2)
+    rhs = q - (omt ** 3)[:, None] * p0 - (t ** 3)[:, None] * p3
+    design = np.column_stack((a1, a2))
+    gram = design.T @ design
+    if float(np.linalg.det(gram)) < 1e-14:
+        delta = p3 - p0
+        return np.vstack((p0, p0 + delta / 3.0, p0 + 2.0 * delta / 3.0, p3))
+
+    p1 = np.empty(3, dtype=np.float64)
+    p2 = np.empty(3, dtype=np.float64)
+    for axis in range(3):
+        solved = np.linalg.solve(gram, design.T @ rhs[:, axis])
+        p1[axis] = float(solved[0])
+        p2[axis] = float(solved[1])
+    return np.vstack((p0, p1, p2, p3))
+
+
+def sample_cubic_bezier(controls: np.ndarray, count: int) -> np.ndarray:
+    """按均匀参数 t 采样三次贝塞尔曲线。"""
+    ctrl = _as_float_array(controls)
+    if ctrl.shape != (4, 3):
+        raise RegionFitError("贝塞尔控制点必须为 (4,3)")
+    target = max(int(count), 2)
+    t = np.linspace(0.0, 1.0, target, dtype=np.float64)
+    omt = 1.0 - t
+    return (
+        (omt ** 3)[:, None] * ctrl[0]
+        + (3.0 * (omt ** 2) * t)[:, None] * ctrl[1]
+        + (3.0 * omt * (t ** 2))[:, None] * ctrl[2]
+        + (t ** 3)[:, None] * ctrl[3]
+    )
+
+
 def extract_island_longest_sides(
     region_ids: np.ndarray,
     target_id,
@@ -1096,14 +1155,13 @@ def extract_island_longest_sides(
     loop_vertex_indices: np.ndarray,
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
     max_sides: int = 4,
+    bezier_samples: int = 24,
 ) -> dict:
     """
-    对领域内每个 island 边界环提取最长的若干条边（默认 4）。
+    对领域内每个 island 边界环提取主边（默认 4），拟合成三次贝塞尔。
 
-    仅做角点分割与长度排序，不合并 island、不生成曲面，供 debug 预览。
-    返回:
-      islands: [{island_index, sides: [N,3], lengths: [...], corner_count}]
-      wire_vertices / wire_edges: 可直接建线框网格的拼接结果
+    保持环向顺序：邻边 color_id 交替（0 红 / 1 绿），对边同色。
+    不合并 island、不生成曲面，供 debug 预览。
     """
     verts = _as_float_array(vertices)
     loops = extract_region_boundary_loops(
@@ -1113,11 +1171,16 @@ def extract_island_longest_sides(
         loop_total,
         loop_vertex_indices,
     )
-    keep_sides = max(int(max_sides), 1)
+    keep_sides = max(int(max_sides), 3)
+    sample_n = max(int(bezier_samples), 4)
     islands: list[dict] = []
     wire_vertices: list[np.ndarray] = []
     wire_edges: list[tuple[int, int]] = []
+    wire_color_ids: list[int] = []
+    control_points: list[np.ndarray] = []
+    control_color_ids: list[int] = []
     vertex_cursor = 0
+    all_points: list[np.ndarray] = []
 
     for island_index, loop in enumerate(loops):
         loop_pts = verts[np.asarray(loop, dtype=np.int32)]
@@ -1147,42 +1210,73 @@ def extract_island_longest_sides(
             corners = [0, quarter, 2 * quarter, 3 * quarter]
 
         sides_3d = split_loop_into_sides(loop_rs, corners)
-        ranked = sorted(
-            sides_3d,
-            key=polyline_length,
-            reverse=True,
-        )[:keep_sides]
-        lengths = [float(polyline_length(side)) for side in ranked]
-        islands.append(
-            {
-                "island_index": int(island_index),
-                "sides": ranked,
-                "lengths": lengths,
-                "corner_count": int(len(corners)),
-            }
-        )
+        # 合并最短边直到 ≤ keep_sides，保留环向次序以便对边同色
+        if len(sides_3d) > keep_sides:
+            sides_3d = reduce_sides_to_count(sides_3d, keep_sides)
 
-        for side in ranked:
-            pts = np.asarray(side, dtype=np.float64)
-            if len(pts) < 2:
-                continue
-            wire_vertices.append(pts)
-            for offset in range(len(pts) - 1):
+        beziers: list[dict] = []
+        sides_sampled: list[np.ndarray] = []
+        lengths: list[float] = []
+        for side_index, side in enumerate(sides_3d):
+            controls = fit_cubic_bezier_controls(side)
+            sampled = sample_cubic_bezier(controls, sample_n)
+            color_id = int(side_index % 2)
+            length = float(polyline_length(sampled))
+            beziers.append(
+                {
+                    "controls": controls,
+                    "color_id": color_id,
+                    "length": length,
+                    "side_index": int(side_index),
+                }
+            )
+            sides_sampled.append(sampled)
+            lengths.append(length)
+            all_points.append(sampled)
+            all_points.append(controls)
+
+            wire_vertices.append(sampled)
+            for offset in range(len(sampled) - 1):
                 wire_edges.append(
                     (vertex_cursor + offset, vertex_cursor + offset + 1)
                 )
-            vertex_cursor += len(pts)
+                wire_color_ids.append(color_id)
+            vertex_cursor += len(sampled)
+
+            for ctrl in controls:
+                control_points.append(ctrl)
+                control_color_ids.append(color_id)
+
+        islands.append(
+            {
+                "island_index": int(island_index),
+                "sides": sides_sampled,
+                "lengths": lengths,
+                "corner_count": int(len(corners)),
+                "beziers": beziers,
+            }
+        )
 
     if not islands:
         raise RegionFitError("未提取到任何 island 边界边")
     if not wire_vertices:
         raise RegionFitError("island 边界边为空")
 
+    stacked = np.vstack(all_points)
+    extent = float(np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0)))
+    bevel_depth = float(max(extent * 0.004, 1e-4))
+    control_radius = float(max(extent * 0.008, bevel_depth * 1.8))
+
     return {
         "islands": islands,
         "island_count": len(islands),
         "wire_vertices": np.vstack(wire_vertices),
         "wire_edges": wire_edges,
+        "wire_color_ids": wire_color_ids,
+        "control_points": np.asarray(control_points, dtype=np.float64),
+        "control_color_ids": control_color_ids,
+        "bevel_depth": bevel_depth,
+        "control_radius": control_radius,
     }
 
 
@@ -2009,7 +2103,9 @@ __all__ = (
     "extend_quad_corners_by_tangents",
     "extract_island_longest_sides",
     "extract_region_boundary_loops",
+    "fit_cubic_bezier_controls",
     "fit_region_surface",
+    "sample_cubic_bezier",
     "polyline_length",
     "polyline_parameters",
     "resample_closed_polyline",
