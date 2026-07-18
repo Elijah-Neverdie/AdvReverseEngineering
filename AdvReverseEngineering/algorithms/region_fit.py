@@ -1453,6 +1453,243 @@ def side_interior_max_turn_deg(points: np.ndarray) -> float:
     return max_turn
 
 
+def detect_side_fold_indices(
+    points_2d: np.ndarray,
+    fold_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+    sample_strides: Sequence[int] | None = None,
+    min_separation_frac: float = 0.02,
+    max_folds: int = _MAX_CONCAVE_FOLDS,
+) -> list[int]:
+    """
+    开链边上检测明显折角（凸/凹均计）。
+
+    与凹折检测同用多重采样，但不限制叉积符号，用于判定边应折线拟合。
+    """
+    pts = _as_float_array(points_2d)
+    count = len(pts)
+    if count < 3:
+        return []
+
+    angle_mat, _cross_mat, robust_angles, strides = _multi_stride_turn_fields(
+        pts,
+        sample_strides=sample_strides,
+        closed=False,
+    )
+    if len(strides) == 0:
+        return []
+
+    threshold = float(max(fold_angle_deg, 1.0))
+    votes = np.sum(angle_mat >= threshold, axis=0)
+    min_votes = min(int(_CORNER_STRIDE_MIN_VOTES), len(strides))
+    large_strides = [
+        index for index, stride in enumerate(strides) if stride >= 8
+    ]
+    if large_strides:
+        large_vals = angle_mat[np.asarray(large_strides, dtype=np.int32)]
+        large_ok = (
+            np.any(large_vals >= threshold, axis=0)
+            & (np.median(large_vals, axis=0) >= threshold * 0.65)
+        )
+    else:
+        large_ok = np.ones(count, dtype=bool)
+
+    candidates = (
+        (robust_angles >= threshold)
+        & (votes >= min_votes)
+        & large_ok
+    )
+    candidates = _suppress_discrete_local_extrema(
+        robust_angles,
+        candidates,
+        half_width=2,
+        neighbor_ratio=0.35,
+    )
+
+    for index in np.flatnonzero(candidates).tolist():
+        if index <= 0 or index >= count - 1:
+            candidates[index] = False
+            continue
+        left = float(robust_angles[index - 1])
+        right = float(robust_angles[index + 1])
+        peak = float(robust_angles[index])
+        if peak + 1e-9 < left and peak + 1e-9 < right:
+            candidates[index] = False
+
+    candidates[0] = False
+    candidates[-1] = False
+
+    candidate_idx = np.flatnonzero(candidates)
+    if len(candidate_idx) == 0:
+        return []
+
+    order = candidate_idx[np.argsort(robust_angles[candidate_idx])[::-1]]
+    min_sep = max(1, int(round(count * float(min_separation_frac))))
+    kept: list[int] = []
+    for index in order.tolist():
+        if any(abs(index - existing) < min_sep for existing in kept):
+            continue
+        kept.append(int(index))
+        if len(kept) >= int(max_folds):
+            break
+    return sorted(kept)
+
+
+def extract_polyline_keypoints(
+    points: np.ndarray,
+    fold_indices: Sequence[int],
+) -> np.ndarray:
+    """端点 + 折角点构成折线关键点。"""
+    pts = _as_float_array(points)
+    if len(pts) == 0:
+        return pts
+    if len(pts) == 1:
+        return pts.copy()
+    indices = {0, len(pts) - 1}
+    for index in fold_indices:
+        idx = int(index)
+        if 0 < idx < len(pts) - 1:
+            indices.add(idx)
+    ordered = sorted(indices)
+    return pts[np.asarray(ordered, dtype=np.int32)].copy()
+
+
+def douglas_peucker_indices(
+    points: np.ndarray,
+    epsilon: float,
+) -> list[int]:
+    """Douglas-Peucker 简化，返回保留点下标（含端点，升序）。"""
+    pts = _as_float_array(points)
+    count = len(pts)
+    if count <= 2:
+        return list(range(count))
+    eps = float(max(epsilon, 0.0))
+
+    def _recurse(start: int, end: int, kept: set[int]) -> None:
+        if end <= start + 1:
+            return
+        segment = pts[end] - pts[start]
+        seg_len = float(np.linalg.norm(segment))
+        max_dist = -1.0
+        max_index = start
+        for index in range(start + 1, end):
+            if seg_len < 1e-12:
+                dist = float(np.linalg.norm(pts[index] - pts[start]))
+            else:
+                dist = float(
+                    np.linalg.norm(
+                        np.cross(segment, pts[index] - pts[start])
+                    )
+                    / seg_len
+                )
+            if dist > max_dist:
+                max_dist = dist
+                max_index = index
+        if max_dist > eps:
+            kept.add(max_index)
+            _recurse(start, max_index, kept)
+            _recurse(max_index, end, kept)
+
+    kept_indices: set[int] = {0, count - 1}
+    _recurse(0, count - 1, kept_indices)
+    return sorted(kept_indices)
+
+
+def _polyline_interior_max_turn_deg(points: np.ndarray) -> float:
+    """折线关键点序列内部最大转角。"""
+    return side_interior_max_turn_deg(points)
+
+
+def _max_points_to_polyline_distance(
+    points: np.ndarray,
+    polyline: np.ndarray,
+) -> float:
+    pts = _as_float_array(points)
+    poly = _as_float_array(polyline)
+    if len(pts) == 0 or len(poly) == 0:
+        return 0.0
+    return float(
+        max(point_to_polyline_distance(point, poly) for point in pts)
+    )
+
+
+def _bezier_spans_to_polyline(
+    spans: Sequence[np.ndarray],
+    samples_per_span: int = 12,
+) -> np.ndarray:
+    """把多段三次贝塞尔采样成连续折线（段间共享端点只保留一次）。"""
+    if not spans:
+        return np.zeros((0, 3), dtype=np.float64)
+    parts: list[np.ndarray] = []
+    for index, controls in enumerate(spans):
+        sampled = sample_cubic_bezier(
+            controls,
+            max(int(samples_per_span), 4),
+        )
+        parts.append(sampled if index == 0 else sampled[1:])
+    return np.vstack(parts)
+
+
+def classify_side_fit_mode(
+    points: np.ndarray,
+    points_2d: np.ndarray | None = None,
+    fold_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+) -> tuple[str, np.ndarray, list[np.ndarray] | None]:
+    """
+    判定边为折线或平滑曲线拟合。
+
+    用 Douglas-Peucker 压锯齿；若简化后仍有明显折角则折线拟合，
+    否则近直线用两端点，缓弧用多段贝塞尔。
+    返回 (fit_mode, polyline_or_side_points, bezier_spans|None)。
+    """
+    pts = _as_float_array(points)
+    if len(pts) < 2:
+        raise RegionFitError("边点数不足，无法分类拟合")
+    if len(pts) == 2:
+        return "POLYLINE", pts.copy(), None
+
+    length = float(polyline_length(pts))
+    # 略大于典型边界锯齿幅度，避免把噪声当成折点
+    epsilon = max(length * 0.012, 1e-6)
+    simplified_idx = douglas_peucker_indices(pts, epsilon)
+    keypoints = pts[np.asarray(simplified_idx, dtype=np.int32)].copy()
+    key_turn = _polyline_interior_max_turn_deg(keypoints)
+    poly_err = _max_points_to_polyline_distance(pts, keypoints)
+
+    # 明显折线：简化后仍有大折角
+    if len(keypoints) >= 3 and key_turn >= float(fold_angle_deg):
+        return "POLYLINE", keypoints, None
+
+    # 近直线
+    ends = pts[[0, -1]]
+    if _max_points_to_polyline_distance(pts, ends) <= max(length * 0.02, 1e-6):
+        return "POLYLINE", ends.copy(), None
+
+    # 多重采样折角作补充：真折角但 DP 阈值偏宽时仍抓折线
+    side_2d = (
+        _as_float_array(points_2d)
+        if points_2d is not None
+        else pts[:, :2]
+    )
+    folds = detect_side_fold_indices(
+        side_2d,
+        fold_angle_deg=fold_angle_deg,
+        min_separation_frac=0.06,
+    )
+    if folds:
+        fold_keys = extract_polyline_keypoints(pts, folds)
+        fold_turn = _polyline_interior_max_turn_deg(fold_keys)
+        fold_err = _max_points_to_polyline_distance(pts, fold_keys)
+        if (
+            len(fold_keys) >= 3
+            and fold_turn >= float(fold_angle_deg)
+            and fold_err <= max(length * 0.04, poly_err * 1.25)
+        ):
+            return "POLYLINE", fold_keys, None
+
+    spans = fit_bezier_polyline_spans(pts)
+    return "CURVE", pts.copy(), spans
+
+
 def _side_from_loop(
     loop_points: np.ndarray,
     start_index: int,
@@ -1712,8 +1949,56 @@ def extract_island_longest_sides(
         sides_sampled: list[np.ndarray] = []
         lengths: list[float] = []
         for side_index, side in enumerate(sides_3d):
-            spans = fit_bezier_polyline_spans(side)
             color_id = int(side_index % 2)
+            side_2d = project_points_to_plane(side, origin, axis_u, axis_v)
+            fit_mode, key_or_side, spans = classify_side_fit_mode(
+                side,
+                points_2d=side_2d,
+                fold_angle_deg=corner_angle_deg,
+            )
+
+            if fit_mode == "POLYLINE":
+                polyline = _as_float_array(key_or_side)
+                polyline = polyline.copy()
+                polyline[0] = side[0]
+                polyline[-1] = side[-1]
+                sampled = resample_polyline(
+                    polyline,
+                    max(sample_n, len(polyline)),
+                )
+                sampled = sampled.copy()
+                sampled[0] = side[0]
+                sampled[-1] = side[-1]
+                length = float(polyline_length(polyline))
+                beziers.append(
+                    {
+                        "fit_mode": "POLYLINE",
+                        "polyline": polyline,
+                        "spans": None,
+                        "color_id": color_id,
+                        "length": length,
+                        "side_index": int(side_index),
+                    }
+                )
+                sides_sampled.append(sampled)
+                lengths.append(length)
+                all_points.append(sampled)
+                all_points.append(polyline)
+
+                wire_vertices.append(sampled)
+                for offset in range(len(sampled) - 1):
+                    wire_edges.append(
+                        (vertex_cursor + offset, vertex_cursor + offset + 1)
+                    )
+                    wire_color_ids.append(color_id)
+                vertex_cursor += len(sampled)
+
+                for point in polyline:
+                    control_points.append(point)
+                    control_color_ids.append(color_id)
+                continue
+
+            assert spans is not None
             sampled_parts = [
                 sample_cubic_bezier(
                     controls,
@@ -1732,6 +2017,8 @@ def extract_island_longest_sides(
             length = float(polyline_length(sampled))
             beziers.append(
                 {
+                    "fit_mode": "CURVE",
+                    "polyline": None,
                     "spans": spans,
                     "color_id": color_id,
                     "length": length,

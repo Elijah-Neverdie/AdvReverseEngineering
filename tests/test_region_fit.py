@@ -11,12 +11,15 @@ from AdvReverseEngineering.algorithms.region_fit import (
     bridge_concave_notches,
     build_quad_patch,
     build_triangular_patch,
+    classify_side_fit_mode,
     classify_tri_or_quad,
     combine_boundary_islands,
     coons_patch,
     detect_concave_fold_indices,
     detect_corner_indices,
+    detect_side_fold_indices,
     extract_island_longest_sides,
+    extract_polyline_keypoints,
     extract_region_boundary_loops,
     filter_handle_outliers,
     filter_significant_boundary_loops,
@@ -927,16 +930,69 @@ class FitRegionSurfaceTests(unittest.TestCase):
             nxt = island["sides"][(index + 1) % 4]
             np.testing.assert_allclose(side[-1], nxt[0], atol=1e-9)
         for bezier in beziers:
-            spans = bezier["spans"]
-            self.assertGreaterEqual(len(spans), 1)
-            controls = spans[0]
-            self.assertEqual(controls.shape, (4, 3))
-            sampled = sample_cubic_bezier(controls, 8)
-            self.assertEqual(len(sampled), 8)
-            np.testing.assert_allclose(sampled[0], controls[0], atol=1e-9)
-            np.testing.assert_allclose(sampled[-1], controls[-1], atol=1e-9)
+            # 正方形边接近直线，应按折线拟合
+            self.assertEqual(bezier["fit_mode"], "POLYLINE")
+            polyline = np.asarray(bezier["polyline"], dtype=np.float64)
+            self.assertGreaterEqual(len(polyline), 2)
+            self.assertIsNone(bezier["spans"])
         self.assertGreater(debug["bevel_depth"], 0.0)
         self.assertGreaterEqual(len(debug["control_points"]), 8)
+
+    def test_classify_zigzag_polyline_not_curve(self) -> None:
+        """明显折角边应折线拟合，缓弧仍可为曲线。"""
+        # 锯齿噪声叠加的折线：两处约 90° 折角
+        zig = []
+        for x in np.linspace(0.0, 1.0, 12):
+            zig.append([x, 0.02 * ((int(x * 11) % 2) - 0.5), 0.0])
+        for y in np.linspace(0.0, 1.0, 12)[1:]:
+            zig.append([1.0 + 0.02 * ((int(y * 11) % 2) - 0.5), y, 0.0])
+        for x in np.linspace(1.0, 2.0, 12)[1:]:
+            zig.append([x, 1.0 + 0.02 * ((int(x * 11) % 2) - 0.5), 0.0])
+        zig_pts = np.asarray(zig, dtype=np.float64)
+        mode, keys, spans = classify_side_fit_mode(zig_pts, fold_angle_deg=35.0)
+        self.assertEqual(mode, "POLYLINE")
+        self.assertIsNone(spans)
+        self.assertGreaterEqual(len(keys), 3)
+        # 折线关键点应贴近真实折角，不应被平滑掉
+        corner_a = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        corner_b = np.array([1.0, 1.0, 0.0], dtype=np.float64)
+        self.assertLess(
+            min(float(np.linalg.norm(p - corner_a)) for p in keys),
+            0.08,
+        )
+        self.assertLess(
+            min(float(np.linalg.norm(p - corner_b)) for p in keys),
+            0.08,
+        )
+
+        t = np.linspace(0.0, 0.5 * np.pi, 48)
+        arc = np.column_stack(
+            (np.cos(t), np.sin(t), np.zeros_like(t))
+        )
+        arc_mode, _arc_pts, arc_spans = classify_side_fit_mode(
+            arc,
+            fold_angle_deg=35.0,
+        )
+        self.assertEqual(arc_mode, "CURVE")
+        self.assertIsNotNone(arc_spans)
+        self.assertGreaterEqual(len(arc_spans), 1)
+
+    def test_detect_side_fold_indices_keeps_sharp_turns(self) -> None:
+        pts = []
+        for x in np.linspace(0.0, 1.0, 20):
+            pts.append([x, 0.0])
+        for y in np.linspace(0.0, 1.0, 20)[1:]:
+            pts.append([1.0, y])
+        for x in np.linspace(1.0, 2.0, 20)[1:]:
+            pts.append([x, 1.0])
+        pts_2d = np.asarray(pts, dtype=np.float64)
+        folds = detect_side_fold_indices(pts_2d, fold_angle_deg=35.0)
+        self.assertGreaterEqual(len(folds), 2)
+        keys = extract_polyline_keypoints(
+            np.column_stack((pts_2d, np.zeros(len(pts_2d)))),
+            folds,
+        )
+        self.assertGreaterEqual(len(keys), 4)
 
     def test_fit_cubic_bezier_straight_line(self) -> None:
         pts = np.array(

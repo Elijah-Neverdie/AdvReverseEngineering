@@ -335,7 +335,7 @@ def _create_or_update_debug_curve_object(
     collection: bpy.types.Collection | None,
     existing: bpy.types.Object | None = None,
 ) -> bpy.types.Object:
-    """用加粗贝塞尔曲线显示拟合边：对边同色（红/绿交替），每边一条连续样条。"""
+    """用加粗曲线显示拟合边：折线边用 POLY，缓弧边用贝塞尔；对边同色。"""
     matrix = np.asarray(matrix_world, dtype=np.float64)
     mat_red = _ensure_fit_edge_material(FIT_EDGE_MAT_RED, FIT_EDGE_COLOR_RED)
     mat_green = _ensure_fit_edge_material(FIT_EDGE_MAT_GREEN, FIT_EDGE_COLOR_GREEN)
@@ -365,6 +365,32 @@ def _create_or_update_debug_curve_object(
 
     for island in debug.get("islands", []):
         for bezier in island.get("beziers", []):
+            fit_mode = str(bezier.get("fit_mode", "CURVE")).upper()
+            color_id = int(bezier.get("color_id", 0)) % 2
+
+            if fit_mode == "POLYLINE":
+                polyline = bezier.get("polyline")
+                if polyline is None:
+                    continue
+                local_pts = _world_to_object_local(
+                    matrix,
+                    np.asarray(polyline, dtype=np.float64),
+                )
+                if len(local_pts) < 2:
+                    continue
+                spline = curve.splines.new("POLY")
+                spline.points.add(len(local_pts) - 1)
+                for index, point in enumerate(local_pts):
+                    spline.points[index].co = (
+                        float(point[0]),
+                        float(point[1]),
+                        float(point[2]),
+                        1.0,
+                    )
+                spline.material_index = color_id
+                spline.use_smooth = False
+                continue
+
             spans = bezier.get("spans")
             if not spans:
                 controls = bezier.get("controls")
@@ -402,7 +428,7 @@ def _create_or_update_debug_curve_object(
                     bp_end.handle_right_type = "FREE"
                     bp_end.handle_left = p2
                     bp_end.handle_right = p3 + (p3 - p2)
-            spline.material_index = int(bezier.get("color_id", 0)) % 2
+            spline.material_index = color_id
             spline.use_smooth = True
 
     obj.matrix_world = matrix_world.copy()
