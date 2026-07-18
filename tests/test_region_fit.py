@@ -386,10 +386,12 @@ class TopologyClassificationTests(unittest.TestCase):
         self.assertGreaterEqual(len(found), 5)
 
         from AdvReverseEngineering.algorithms.region_fit import (
+            merge_collinear_adjacent_sides,
             split_loop_into_sides,
         )
 
         sides = split_loop_into_sides(pts, found)
+        sides = merge_collinear_adjacent_sides(sides, max_turn_deg=35.0)
         ranked = sorted(
             range(len(sides)),
             key=lambda i: polyline_length(sides[i]),
@@ -405,6 +407,33 @@ class TopologyClassificationTests(unittest.TestCase):
             3.0,
             places=1,
         )
+
+    def test_merge_collinear_reconnects_split_long_edge(self) -> None:
+        """平滑长边被误拆成三段后应接回，避免中间缺口。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            merge_collinear_adjacent_sides,
+        )
+
+        # 近似共线的三段 + 两条短折回边，构成扁长闭环
+        bottom = np.array(
+            [[0.0, 0.0], [1.0, 0.02], [2.0, 0.0], [3.0, 0.02], [4.0, 0.0]],
+            dtype=np.float64,
+        )
+        # 人为拆成三段近共线边
+        s0 = bottom[:2]
+        s1 = bottom[1:4]
+        s2 = bottom[3:]
+        right = np.array([[4.0, 0.0], [4.0, 1.0]], dtype=np.float64)
+        top = np.array([[4.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+        left = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=np.float64)
+        sides = [s0, s1, s2, right, top, left]
+        merged = merge_collinear_adjacent_sides(sides, max_turn_deg=35.0)
+        self.assertLessEqual(len(merged), 4)
+        # 底边应被接成一条，长度接近 4
+        lengths = [polyline_length(side) for side in merged]
+        self.assertGreaterEqual(max(lengths), 3.5)
+        for side in merged:
+            self.assertLess(side_interior_max_turn_deg(side), 40.0)
 
     def test_triangle_ratio_classification(self) -> None:
         long_a = np.array([[0.0, 0.0], [0.0, 2.0]], dtype=np.float64)
@@ -749,10 +778,14 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertGreaterEqual(len(debug["wire_edges"]), 4)
         self.assertGreaterEqual(len(debug["wire_vertices"]), 8)
         beziers = island["beziers"]
-        self.assertEqual(len(beziers), 4)
-        # 邻边异色、对边同色：0/2 红，1/3 绿
+        side_ids = sorted({int(b["side_index"]) for b in beziers})
+        self.assertEqual(side_ids, [0, 1, 2, 3])
+        # 邻边异色、对边同色：按 side_index 取色
+        colors_by_side = {
+            int(b["side_index"]): int(b["color_id"]) for b in beziers
+        }
         self.assertEqual(
-            [b["color_id"] for b in beziers],
+            [colors_by_side[i] for i in side_ids],
             [0, 1, 0, 1],
         )
         for bezier in beziers:
@@ -763,7 +796,7 @@ class FitRegionSurfaceTests(unittest.TestCase):
             np.testing.assert_allclose(sampled[0], controls[0], atol=1e-9)
             np.testing.assert_allclose(sampled[-1], controls[-1], atol=1e-9)
         self.assertGreater(debug["bevel_depth"], 0.0)
-        self.assertEqual(len(debug["control_points"]), 16)
+        self.assertGreaterEqual(len(debug["control_points"]), 16)
 
     def test_fit_cubic_bezier_straight_line(self) -> None:
         pts = np.array(
@@ -791,8 +824,12 @@ class FitRegionSurfaceTests(unittest.TestCase):
         for island in debug["islands"]:
             self.assertEqual(len(island["sides"]), 4)
             self.assertEqual(len(island["lengths"]), 4)
+            colors_by_side = {
+                int(b["side_index"]): int(b["color_id"])
+                for b in island["beziers"]
+            }
             self.assertEqual(
-                [b["color_id"] for b in island["beziers"]],
+                [colors_by_side[i] for i in sorted(colors_by_side)],
                 [0, 1, 0, 1],
             )
 
