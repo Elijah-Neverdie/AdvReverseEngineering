@@ -14,11 +14,14 @@ from AdvReverseEngineering.algorithms.region_fit import (
     classify_tri_or_quad,
     combine_boundary_islands,
     coons_patch,
+    detect_concave_fold_indices,
     detect_corner_indices,
     extract_island_longest_sides,
     extract_region_boundary_loops,
+    filter_handle_outliers,
     fit_cubic_bezier_controls,
     fit_region_surface,
+    point_to_polyline_distance,
     polyline_length,
     resample_closed_polyline,
     resample_polyline,
@@ -392,6 +395,58 @@ class TopologyClassificationTests(unittest.TestCase):
         # 锯齿点本身不应进入最终角点集
         self.assertNotIn(mid, found)
         self.assertEqual(len(found), 4)
+
+    def test_detect_concave_fold_and_ignore_handle_outlier(self) -> None:
+        """凹折角应被检出；偏离边线的手柄视为离散噪声忽略。"""
+        # CCW 凹多边形：右下有一个明显内凹
+        corners_xy = np.array(
+            [
+                [0.0, 0.0],
+                [4.0, 0.0],
+                [4.0, 1.0],
+                [2.5, 1.0],
+                [2.5, 2.0],
+                [4.0, 2.0],
+                [4.0, 3.0],
+                [0.0, 3.0],
+            ],
+            dtype=np.float64,
+        )
+        dense: list[np.ndarray] = []
+        for index in range(len(corners_xy)):
+            a = corners_xy[index]
+            b = corners_xy[(index + 1) % len(corners_xy)]
+            for t in np.linspace(0.0, 1.0, 24, endpoint=False):
+                dense.append(a * (1.0 - t) + b * t)
+        pts = np.asarray(dense, dtype=np.float64)
+        folds = detect_concave_fold_indices(
+            pts,
+            fold_angle_deg=45.0,
+            sample_strides=(2, 4, 8, 16),
+        )
+        self.assertGreaterEqual(len(folds), 1)
+        fold_pts = pts[np.asarray(folds, dtype=np.int32)]
+        # 至少一个折角靠近 (2.5,1) 或 (2.5,2)
+        notch = np.array([[2.5, 1.0], [2.5, 2.0]], dtype=np.float64)
+        nearest = min(
+            float(np.min(np.linalg.norm(fold_pts - target, axis=1)))
+            for target in notch
+        )
+        self.assertLess(nearest, 0.4)
+
+        side = np.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+        outlier = np.array([1.0, 0.5, 0.0], dtype=np.float64)
+        near = np.array([1.0, 0.01, 0.0], dtype=np.float64)
+        kept = filter_handle_outliers([outlier, near], side, max_distance=0.05)
+        self.assertEqual(len(kept), 1)
+        np.testing.assert_allclose(kept[0], near, atol=1e-9)
+        self.assertGreater(
+            point_to_polyline_distance(outlier, side),
+            0.05,
+        )
 
     def test_l_shape_corner_not_merged_into_one_side(self) -> None:
         """

@@ -35,10 +35,13 @@ from .regions import REGION_ID_ATTR, read_region_ids
 FIT_COLLECTION_NAME = "拟合面"
 FIT_PREVIEW_NAME = "ARE_FitPreview"
 FIT_DEBUG_CTRL_NAME = "ARE_FitDebugControls"
+FIT_DEBUG_FOLD_NAME = "ARE_FitConcaveFolds"
 FIT_EDGE_MAT_RED = "ARE_FitEdge_Red"
 FIT_EDGE_MAT_GREEN = "ARE_FitEdge_Green"
+FIT_FOLD_MAT = "ARE_FitFold_Marker"
 FIT_EDGE_COLOR_RED = (1.0, 0.12, 0.08, 1.0)
 FIT_EDGE_COLOR_GREEN = (0.1, 0.95, 0.22, 1.0)
+FIT_FOLD_COLOR = (0.15, 0.85, 1.0, 1.0)
 MODAL_TIMER_STEP = 0.1
 _FIT_OP_KEY = "are_active_fit_op"
 
@@ -448,6 +451,98 @@ def _create_or_update_control_point_object(
     return obj
 
 
+def _uv_sphere_mesh(
+    centers: np.ndarray,
+    radius: float,
+    segments: int = 12,
+    rings: int = 8,
+) -> tuple[np.ndarray, list[tuple[int, ...]]]:
+    """为每个中心生成低面数 UV 圆球。"""
+    if len(centers) == 0:
+        return np.zeros((0, 3), dtype=np.float64), []
+    seg = max(int(segments), 3)
+    ring = max(int(rings), 2)
+    unit_verts: list[np.ndarray] = []
+    unit_faces: list[tuple[int, ...]] = []
+    unit_verts.append(np.array([0.0, 0.0, radius], dtype=np.float64))
+    for ring_index in range(1, ring):
+        polar = np.pi * ring_index / ring
+        z = radius * np.cos(polar)
+        xy = radius * np.sin(polar)
+        for seg_index in range(seg):
+            azimuth = 2.0 * np.pi * seg_index / seg
+            unit_verts.append(
+                np.array(
+                    [xy * np.cos(azimuth), xy * np.sin(azimuth), z],
+                    dtype=np.float64,
+                )
+            )
+    unit_verts.append(np.array([0.0, 0.0, -radius], dtype=np.float64))
+    north = 0
+    south = len(unit_verts) - 1
+    for seg_index in range(seg):
+        a = 1 + seg_index
+        b = 1 + (seg_index + 1) % seg
+        unit_faces.append((north, a, b))
+    for ring_index in range(ring - 2):
+        row0 = 1 + ring_index * seg
+        row1 = 1 + (ring_index + 1) * seg
+        for seg_index in range(seg):
+            a = row0 + seg_index
+            b = row0 + (seg_index + 1) % seg
+            c = row1 + (seg_index + 1) % seg
+            d = row1 + seg_index
+            unit_faces.append((a, b, c, d))
+    last_row = 1 + (ring - 2) * seg
+    for seg_index in range(seg):
+        a = last_row + seg_index
+        b = last_row + (seg_index + 1) % seg
+        unit_faces.append((a, south, b))
+
+    verts: list[np.ndarray] = []
+    faces: list[tuple[int, ...]] = []
+    for center in centers:
+        base = len(verts)
+        for local in unit_verts:
+            verts.append(center + local)
+        for face in unit_faces:
+            faces.append(tuple(base + i for i in face))
+    return np.asarray(verts, dtype=np.float64), faces
+
+
+def _create_or_update_concave_fold_object(
+    name: str,
+    debug: dict,
+    matrix_world,
+    collection: bpy.types.Collection | None,
+    existing: bpy.types.Object | None = None,
+) -> bpy.types.Object | None:
+    """在明显凹折角处放置特殊青色圆球标记。"""
+    centers = np.asarray(debug.get("concave_fold_points", []), dtype=np.float64)
+    if len(centers) == 0:
+        if existing is not None:
+            _delete_object(existing)
+        return None
+    radius = float(debug.get("fold_radius", 0.006))
+    verts, faces = _uv_sphere_mesh(centers, radius)
+    obj = _create_or_update_mesh_object(
+        name,
+        verts,
+        faces,
+        matrix_world,
+        collection,
+        existing=existing,
+    )
+    mat = _ensure_fit_edge_material(FIT_FOLD_MAT, FIT_FOLD_COLOR)
+    mesh = obj.data
+    mesh.materials.clear()
+    mesh.materials.append(mat)
+    obj.hide_select = True
+    obj.display_type = "TEXTURED"
+    obj.show_in_front = True
+    return obj
+
+
 class ARE_OT_build_fit_surface(bpy.types.Operator):
     """面板按钮：从四边 debug 预览进入曲面拟合。"""
 
@@ -552,10 +647,13 @@ class ARE_OT_fit_region(bpy.types.Operator):
     def _discard_preview(self) -> None:
         preview = getattr(self, "_preview_object", None)
         controls = getattr(self, "_debug_control_object", None)
+        folds = getattr(self, "_debug_fold_object", None)
         _delete_object(preview)
         _delete_object(controls)
+        _delete_object(folds)
         self._preview_object = None
         self._debug_control_object = None
+        self._debug_fold_object = None
 
     def confirm_from_panel(self, context: bpy.types.Context) -> None:
         if getattr(self, "_closed", False):
@@ -608,9 +706,11 @@ class ARE_OT_fit_region(bpy.types.Operator):
         for island in debug.get("islands", []):
             lengths = island.get("lengths", [])
             length_txt = " / ".join(f"{length:.3f}" for length in lengths)
+            fold_n = int(island.get("concave_fold_count", 0))
+            fold_txt = f"，凹折{fold_n}" if fold_n else ""
             parts.append(
                 f"岛{island.get('island_index', '?')}: "
-                f"{len(lengths)}边 [{length_txt}]"
+                f"{len(lengths)}边 [{length_txt}]{fold_txt}"
             )
         return "；".join(parts)
 
@@ -659,8 +759,16 @@ class ARE_OT_fit_region(bpy.types.Operator):
             collection=None,
             existing=getattr(self, "_debug_control_object", None),
         )
+        folds = _create_or_update_concave_fold_object(
+            FIT_DEBUG_FOLD_NAME,
+            debug,
+            self._object.matrix_world,
+            collection=None,
+            existing=getattr(self, "_debug_fold_object", None),
+        )
         self._preview_object = preview
         self._debug_control_object = controls
+        self._debug_fold_object = folds
         scene_props.fit_status = self._status_text(scene_props)
         scene_props.fit_status_detail = self._format_debug_detail(debug)
         _tag_redraw(context)
@@ -831,6 +939,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._region_ids = region_ids.copy()
         self._preview_object = None
         self._debug_control_object = None
+        self._debug_fold_object = None
         self._last_result = None
         self._debug_result = None
         self._debug_island_count = 0
