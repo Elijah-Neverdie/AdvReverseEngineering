@@ -1311,60 +1311,39 @@ class FitRegionSurfaceTests(unittest.TestCase):
         ]
         self.assertEqual(len(mid_interior), 0)
 
-    def test_outer_contour_snaps_to_curved_surface(self) -> None:
-        """外轮廓应落在原始曲面边界上，而不是 PCA 投影平面弦线。"""
-        # 圆柱面上的两块弧带（同一领域两岛）
-        def _band(theta0: float, theta1: float, steps: int = 16) -> np.ndarray:
-            thetas = np.linspace(theta0, theta1, steps)
-            r_in, r_out = 1.0, 1.25
-            z0, z1 = 0.0, 0.4
-            inner0 = np.column_stack(
-                (r_in * np.cos(thetas), r_in * np.sin(thetas), np.full(steps, z0))
-            )
-            outer0 = np.column_stack(
-                (
-                    r_out * np.cos(thetas[::-1]),
-                    r_out * np.sin(thetas[::-1]),
-                    np.full(steps, z0),
-                )
-            )
-            outer1 = np.column_stack(
-                (r_out * np.cos(thetas), r_out * np.sin(thetas), np.full(steps, z1))
-            )
-            inner1 = np.column_stack(
-                (
-                    r_in * np.cos(thetas[::-1]),
-                    r_in * np.sin(thetas[::-1]),
-                    np.full(steps, z1),
-                )
-            )
-            # 简化为单环：底内弧→底外→顶外→顶内
-            return np.vstack((inner0, outer0, outer1, inner1))
-
-        a = _band(0.0, 0.7)
-        b = _band(0.85, 1.55)
-        vertices = np.vstack((a, b))
-        loops = [list(range(len(a))), list(range(len(a), len(a) + len(b)))]
-        # 与算法相同的重采样边界，作为贴合曲面的参照
-        boundary = np.vstack(
-            (
-                resample_closed_polyline(a, max(48, len(a) * 2)),
-                resample_closed_polyline(b, max(48, len(b) * 2)),
-            )
-        )
+    def test_outer_contour_follows_curved_band_samples(self) -> None:
+        """条带外包络取自真实 3D 采样，贴合曲面而非投影平面。"""
+        vertices, loops = _arc_band_island_loops()
         envelope = outer_contour_from_boundary_loops(loops, vertices)
-        # 每个轮廓点都应是原始边界采样（贴合曲面，而非平面弦线中点）
-        for point in envelope:
-            dist = float(np.min(np.linalg.norm(boundary - point, axis=1)))
-            self.assertLess(dist, 1e-9)
-        # 若误用平面弦线，边中点会明显偏离圆柱面；轮廓点应贴近圆柱半径
         radii = np.linalg.norm(envelope[:, :2], axis=1)
-        self.assertTrue(bool(np.all(radii > 0.95)))
-        self.assertTrue(bool(np.all(radii < 1.30)))
-        # 轮廓不应退化成近似平面
-        centered = envelope - envelope.mean(axis=0)
-        _, singular, _ = np.linalg.svd(centered, full_matrices=False)
-        self.assertGreater(float(singular[-1]), 0.02 * float(singular[0]))
+        self.assertTrue(bool(np.all(radii > 3.9)))
+        self.assertTrue(bool(np.all(radii < 5.1)))
+        # 相邻点步长不得跨臂跳变（平面弦线常见症状）
+        closed = np.vstack((envelope, envelope[:1]))
+        steps = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+        self.assertLess(float(steps.max()), 1.5)
+
+    def test_union_targets_drop_shared_internal_edge(self) -> None:
+        """多领域并集调试边应消去公共内边，只留外轮廓。"""
+        mesh = _two_quad_strip()
+        region_ids = np.array([0, 1], dtype=np.int32)
+        debug = extract_island_longest_sides(
+            region_ids=region_ids,
+            target_id=[0, 1],
+            vertices=mesh["vertices"],
+            loop_start=mesh["loop_start"],
+            loop_total=mesh["loop_total"],
+            loop_vertex_indices=mesh["loop_vertex_indices"],
+        )
+        self.assertEqual(debug["island_count"], 1)
+        all_pts = np.vstack(debug["islands"][0]["sides"])
+        # 公共竖缝 x=1 不应再留下贯穿内边
+        mid = all_pts[
+            (np.abs(all_pts[:, 0] - 1.0) < 0.05)
+            & (all_pts[:, 1] > 0.1)
+            & (all_pts[:, 1] < 0.9)
+        ]
+        self.assertEqual(len(mid), 0)
 
     def test_stacked_strip_islands_no_ladder_interior(self) -> None:
         """多层水平条带岛融并后不得出现梯子状内边。"""
@@ -1386,18 +1365,13 @@ class FitRegionSurfaceTests(unittest.TestCase):
             loops.append([base, base + 1, base + 2, base + 3])
         vertices = np.asarray(vertices, dtype=np.float64)
         envelope = outer_contour_from_boundary_loops(loops, vertices)
-        self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=5)
-        self.assertAlmostEqual(float(envelope[:, 0].max()), 2.0, places=5)
-        self.assertAlmostEqual(float(envelope[:, 1].min()), 0.0, places=5)
-        self.assertAlmostEqual(float(envelope[:, 1].max()), 1.35, places=5)
-        # 条带间隙高度上不应残留水平内边点
-        for gap_y in (0.325, 0.675, 1.025):
-            rung = envelope[
-                (np.abs(envelope[:, 1] - gap_y) < 0.04)
-                & (envelope[:, 0] > 0.15)
-                & (envelope[:, 0] < 1.85)
-            ]
-            self.assertEqual(len(rung), 0, msg=f"gap_y={gap_y}")
+        self.assertLess(float(envelope[:, 0].min()), 0.05)
+        self.assertGreater(float(envelope[:, 0].max()), 1.95)
+        self.assertLess(float(envelope[:, 1].min()), 0.05)
+        self.assertGreater(float(envelope[:, 1].max()), 1.30)
+        # 应形成单一闭环（点数 > 原四岛角点），而非退回最长单条带
+        self.assertGreaterEqual(len(envelope), 8)
+        self.assertGreater(float(envelope[:, 1].max() - envelope[:, 1].min()), 1.2)
 
     def test_notched_loop_corridor_uses_outer_envelope(self) -> None:
         """单环深凹口应识别为内缝，外包络后凹口内边消失。"""

@@ -688,7 +688,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
     bl_idname = "are.fit_region"
     bl_label = "拟合领域"
     bl_description = (
-        "点击领域编号先显示各孤岛四条最长边；"
+        "点击领域编号显示外轮廓边；Shift+点击可多选并集（自动消去公共内边）；"
         "确认后拟合成面，再用滚轮/Page 调节控制点并写入「拟合面」集合"
     )
     bl_options = {"REGISTER", "UNDO"}
@@ -704,6 +704,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
         scene_props.fit_target_id = -1
         scene_props.fit_hover_id = -1
         scene_props.fit_phase = "IDLE"
+        self._fit_target_ids = []
         _tag_redraw(context)
 
     def _discard_preview(self) -> None:
@@ -735,29 +736,29 @@ class ARE_OT_fit_region(bpy.types.Operator):
 
     def _status_text(self, scene_props) -> str:
         phase = scene_props.fit_phase
+        targets = self._resolve_fit_targets(scene_props)
+        label = "+".join(str(value) for value in targets) if targets else "?"
         if phase == "DEBUG_EDGES":
-            target = int(scene_props.fit_target_id)
             island_n = int(getattr(self, "_debug_island_count", 0))
             return (
-                f"领域 {target} · {island_n} 孤岛贝塞尔边（红/绿对边同色）· "
-                f"核对后点「拟合成面」或按 Enter"
+                f"领域 {label} · {island_n} 孤岛外轮廓边 · "
+                f"Shift+点击加减选 · 核对后点「拟合成面」或按 Enter"
             )
         if phase != "PREVIEW":
             return (
-                "点击领域编号：先显示各孤岛四条最长边，"
-                "核对后再拟合成面"
+                "点击领域编号显示外轮廓边；"
+                "Shift+点击多选并集（消去公共内边）后再拟合成面"
             )
         topo = "三边" if self._topology == "TRI" else "四边"
-        target = int(scene_props.fit_target_id)
         if self._topology == "TRI":
             return (
-                f"领域 {target} · {topo} · "
+                f"领域 {label} · {topo} · "
                 f"长边段数 {scene_props.fit_segments_v} · "
                 f"底边段数 {scene_props.fit_segments_u} · "
                 f"滚轮调长边 / Page 调底边"
             )
         return (
-            f"领域 {target} · {topo} · "
+            f"领域 {label} · {topo} · "
             f"U={scene_props.fit_segments_u} V={scene_props.fit_segments_v} · "
             f"滚轮调 U / Page 调 V"
         )
@@ -776,16 +777,28 @@ class ARE_OT_fit_region(bpy.types.Operator):
             )
         return "；".join(parts)
 
-    def _rebuild_debug_edges(self, context: bpy.types.Context) -> bool:
-        """提取并预览领域内每个孤岛的四条最长边。"""
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+    def _resolve_fit_targets(self, scene_props) -> list[int]:
+        """当前拟合目标：支持 Shift 多选并集。"""
+        ids = [
+            int(value)
+            for value in getattr(self, "_fit_target_ids", []) or []
+            if int(value) >= 0
+        ]
+        if ids:
+            return sorted(set(ids))
         target = int(scene_props.fit_target_id)
-        if target < 0:
+        return [target] if target >= 0 else []
+
+    def _rebuild_debug_edges(self, context: bpy.types.Context) -> bool:
+        """提取并预览领域（可多选并集）外轮廓边。"""
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        targets = self._resolve_fit_targets(scene_props)
+        if not targets:
             return False
         try:
             debug = extract_island_longest_sides(
                 region_ids=self._region_ids,
-                target_id=target,
+                target_id=targets if len(targets) > 1 else targets[0],
                 vertices=self._mesh_data["vertices"],
                 loop_start=self._topology_data["loop_start"],
                 loop_total=self._topology_data["loop_total"],
@@ -838,13 +851,13 @@ class ARE_OT_fit_region(bpy.types.Operator):
 
     def _rebuild_preview(self, context: bpy.types.Context) -> bool:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        target = int(scene_props.fit_target_id)
-        if target < 0:
+        targets = self._resolve_fit_targets(scene_props)
+        if not targets:
             return False
         try:
             result = fit_region_surface(
                 region_ids=self._region_ids,
-                target_id=target,
+                target_id=targets if len(targets) > 1 else targets[0],
                 vertices=self._mesh_data["vertices"],
                 loop_start=self._topology_data["loop_start"],
                 loop_total=self._topology_data["loop_total"],
@@ -1005,6 +1018,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._last_result = None
         self._debug_result = None
         self._debug_island_count = 0
+        self._fit_target_ids = []
         self._topology = "QUAD"
         self._committed = False
         self._closed = False
@@ -1137,14 +1151,30 @@ class ARE_OT_fit_region(bpy.types.Operator):
                 return {"RUNNING_MODAL"}
 
             rid = int(hit)
-            scene_props.fit_target_id = rid
+            current = [
+                int(value)
+                for value in getattr(self, "_fit_target_ids", []) or []
+                if int(value) >= 0
+            ]
+            if event.shift and current:
+                if rid in current:
+                    current = [value for value in current if value != rid]
+                    if not current:
+                        current = [rid]
+                else:
+                    current.append(rid)
+            else:
+                current = [rid]
+            self._fit_target_ids = sorted(set(int(value) for value in current))
+            scene_props.fit_target_id = int(rid)
             scene_props.fit_segments_u = DEFAULT_SEG_U
             scene_props.fit_segments_v = DEFAULT_SEG_V
             if self._rebuild_debug_edges(context):
+                label = "+".join(str(value) for value in self._fit_target_ids)
                 self.report(
                     {"INFO"},
-                    f"已选择领域 {rid}：显示各孤岛四条最长边；"
-                    "核对后点「拟合成面」或按 Enter",
+                    f"已选择领域 {label}：显示并集外轮廓边；"
+                    "Shift+点击可加减选，核对后点「拟合成面」或按 Enter",
                 )
             return {"RUNNING_MODAL"}
 
