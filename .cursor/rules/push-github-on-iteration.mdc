@@ -1,0 +1,13 @@
+---
+description: 每轮代码迭代结束后执行 push-github-update skill，保持 GitHub 与本地版本同步
+alwaysApply: true
+---
+
+# 迭代后推送 GitHub
+
+在本仓库完成一轮有意义的代码改动后，**在向用户汇报完成之前**：
+
+1. 读取并遵循项目 skill：`.cursor/skills/push-github-update/SKILL.md`
+2. 按该 skill 提交、推送到 `origin`，并同步本机 Blender 插件目录
+
+用户明确说不要推送时可跳过。临时只读排查、未改业务代码时可跳过。

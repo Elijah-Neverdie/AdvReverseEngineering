@@ -468,7 +468,8 @@ def _band_envelope_from_samples(
     # 比「当前分箱直线」更能盖住角部，又比折线端帽更不易扭曲。
     u_start = u_min + (first + lo) / max(bin_count - 1, 1) * u_span
     u_end = u_min + (first + hi) / max(bin_count - 1, 1) * u_span
-    window = max(u_span * 0.08, 1e-9)
+    # 端部窗口加宽，优先吃进角部/island 断口上的采样
+    window = max(u_span * 0.14, 1e-9)
 
     def _extreme_end_pair(u0: float, at_start: bool) -> tuple[np.ndarray, np.ndarray]:
         if at_start:
@@ -478,12 +479,12 @@ def _band_envelope_from_samples(
         members = np.flatnonzero(mask)
         if len(members) == 0:
             return lower_u[0 if at_start else -1], upper_u[0 if at_start else -1]
-        # 先取最靠外的一半点，再在其中取 v 极值，避免针尖分箱
+        # 取更靠端部的点，再在其中取 v 极值以延伸角部
         u_vals = param_u[members]
         if at_start:
-            keep_u = members[u_vals <= float(np.percentile(u_vals, 40))]
+            keep_u = members[u_vals <= float(np.percentile(u_vals, 35))]
         else:
-            keep_u = members[u_vals >= float(np.percentile(u_vals, 60))]
+            keep_u = members[u_vals >= float(np.percentile(u_vals, 65))]
         if len(keep_u) < 2:
             keep_u = members
         lo_i = int(keep_u[int(np.argmin(param_v[keep_u]))])
@@ -511,7 +512,7 @@ def combine_boundary_islands(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
     interior_points: np.ndarray | None = None,
-) -> tuple[np.ndarray, list[np.ndarray] | None]:
+) -> tuple[np.ndarray, list[np.ndarray] | None, dict | None]:
     """
     将同一领域内互不连通的 island 边界合成为一个连续外包络。
 
@@ -520,18 +521,19 @@ def combine_boundary_islands(
     包络线性连接。
 
     interior_points（通常为领域面心）会并入分箱极值，使包络向外
-    延伸覆盖角部/凹口，避免「只贴边界环、裁掉领域本体」的缺口。
+    延伸覆盖角部/凹口。
 
-    返回 (envelope, band_sides)：
+    返回 (envelope, band_sides, band_samples)：
       - envelope: 有序 3D 闭环（不重复首点）
-      - band_sides: 多 island 时为共享 u 参数的四边
-        [下链, 末端短边, 上链, 首端短边]；单环时为 None
+      - band_sides: 多 island 时为共享 u 参数的四边；单环时为 None
+      - band_samples: 多 island 时含 points/param_u/param_v，供表面采样；
+        单环时为 None
     """
     if not loops:
         raise RegionFitError("没有边界环可合并")
     verts = _as_float_array(vertices)
     if len(loops) == 1:
-        return verts[np.asarray(loops[0], dtype=np.int32)].copy(), None
+        return verts[np.asarray(loops[0], dtype=np.int32)].copy(), None, None
 
     loop_points = [
         verts[np.asarray(loop, dtype=np.int32)]
@@ -568,11 +570,10 @@ def combine_boundary_islands(
             project_points_to_plane(sampled, centroid, axis_u, axis_v)
         )
 
-    # 面心等内部点并入分箱，向外延伸覆盖角部（红框缺口的主因）
+    # 面心等内部点并入分箱，向外延伸覆盖角部
     if interior is not None and len(interior) > 0:
-        # 量大时均匀下采样，保持包络稳定且控制耗时
-        if len(interior) > 4000:
-            step = int(np.ceil(len(interior) / 4000))
+        if len(interior) > 8000:
+            step = int(np.ceil(len(interior) / 8000))
             interior = interior[::step]
         samples_3d.append(interior)
         samples_2d.append(
@@ -582,6 +583,7 @@ def combine_boundary_islands(
     points_3d = np.vstack(samples_3d)
     points_2d = np.vstack(samples_2d)
 
+    force_axis = False
     envelope, _corners, envelope_2d, band_sides = _band_envelope_from_samples(
         points_3d, points_2d, force_axis=False
     )
@@ -594,6 +596,7 @@ def combine_boundary_islands(
             envelope_2d
         ):
             envelope, band_sides = alt_env, alt_sides
+            force_axis = True
 
     # 对边长弧长度相差过大，或 island 过于碎散：说明并非同一条带，
     # 强行并包络会产生扭曲；回退为最长单环。
@@ -611,8 +614,83 @@ def combine_boundary_islands(
                     np.vstack((pts, pts[:1]))
                 ),
             )
-            return primary.copy(), None
-    return envelope, band_sides
+            return primary.copy(), None, None
+
+    if force_axis:
+        param_u = points_2d[:, 0]
+        param_v = points_2d[:, 1]
+    else:
+        param_u, param_v = _band_parameterization(points_2d)
+    band_samples = {
+        "points": points_3d,
+        "param_u": param_u,
+        "param_v": param_v,
+    }
+    return envelope, band_sides, band_samples
+
+
+def collect_island_bridge_interiors(
+    region_ids: np.ndarray,
+    target_id,
+    face_centers: np.ndarray,
+    adjacency_offsets: np.ndarray | None = None,
+    adjacency_indices: np.ndarray | None = None,
+    max_hops: int = 10,
+) -> np.ndarray:
+    """
+    收集用于 island 延伸的内部采样点：目标领域面心 + 邻近的未标注面
+    （region_id < 0，分割时忽略的离散碎面）。
+
+    跨岛空隙常被标成 -1。从目标面沿邻接、仅穿过 -1 做有限跳数 BFS
+    （默认 10），避免连通整个忽略层；并入包络后拟合面才能盖住断口/角部。
+    """
+    ids = _as_int_array(region_ids)
+    targets = _normalize_target_ids(target_id)
+    mask = np.isin(ids, np.asarray(targets, dtype=np.int32))
+    centers = _as_float_array(face_centers)
+    parts = [centers[mask]]
+    hop_limit = max(int(max_hops), 0)
+
+    if (
+        hop_limit > 0
+        and adjacency_offsets is not None
+        and adjacency_indices is not None
+        and len(adjacency_offsets) > 1
+        and np.any(mask)
+    ):
+        off = _as_int_array(adjacency_offsets)
+        adj = _as_int_array(adjacency_indices)
+        # (face, hops_from_target)；只记录 -1 面
+        queue: list[tuple[int, int]] = [
+            (int(f), 0) for f in np.flatnonzero(mask)
+        ]
+        bridge_ids: set[int] = set()
+        best_hop: dict[int, int] = {}
+        head = 0
+        while head < len(queue):
+            f, hops = queue[head]
+            head += 1
+            if hops >= hop_limit:
+                continue
+            a = int(off[f])
+            b = int(off[f + 1])
+            for n in adj[a:b]:
+                n = int(n)
+                if int(ids[n]) >= 0:
+                    continue
+                next_hops = hops + 1
+                prev = best_hop.get(n)
+                if prev is not None and prev <= next_hops:
+                    continue
+                best_hop[n] = next_hops
+                bridge_ids.add(n)
+                queue.append((n, next_hops))
+        if bridge_ids:
+            parts.append(
+                centers[np.asarray(sorted(bridge_ids), dtype=np.int32)]
+            )
+
+    return np.vstack(parts) if parts else np.empty((0, 3), dtype=np.float64)
 
 
 def resample_polyline_by_index(points: np.ndarray, count: int) -> np.ndarray:
@@ -1092,18 +1170,97 @@ def build_triangular_patch(
     return vertices, faces
 
 
+def soft_snap_quad_grid_to_points(
+    vertices: np.ndarray,
+    segments_u: int,
+    segments_v: int,
+    samples: np.ndarray,
+    *,
+    strength: float = 0.95,
+) -> np.ndarray:
+    """
+    将 Coons 规则网格吸附到表面采样点，减轻弦面抄近路导致的角部悬空。
+
+    每个顶点取邻域样本中位数目标，按强度混合；边界顶点允许有限外扩。
+    最后做一次四邻域平滑，抑制折角。
+    """
+    su = max(int(segments_u), MIN_SEGMENTS)
+    sv = max(int(segments_v), MIN_SEGMENTS)
+    grid = _as_float_array(vertices).reshape((sv + 1, su + 1, 3)).copy()
+    pts = _as_float_array(samples)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, 3)
+    if len(pts) < 8:
+        return grid.reshape(-1, 3)
+    if len(pts) > 12000:
+        pts = pts[:: int(np.ceil(len(pts) / 12000))]
+
+    blend = float(np.clip(strength, 0.0, 1.0))
+    # 允许位移上限：相对网格尺度
+    scale = float(
+        np.median(np.linalg.norm(np.diff(grid[0], axis=0), axis=1))
+        + np.median(np.linalg.norm(grid[-1] - grid[0], axis=1))
+    )
+    max_move = max(scale * 1.25, 1e-6)
+    k_neigh = 12
+
+    snapped = grid.copy()
+    flat = grid.reshape(-1, 3)
+    # 批量：对每个网格点找 k 近邻（网格很小，可暴力）
+    for idx in range(len(flat)):
+        g = flat[idx]
+        d2 = ((pts - g) ** 2).sum(axis=1)
+        if len(d2) > k_neigh:
+            nn = np.argpartition(d2, k_neigh)[:k_neigh]
+        else:
+            nn = np.arange(len(d2))
+        target = np.median(pts[nn], axis=0)
+        delta = target - g
+        dist = float(np.linalg.norm(delta))
+        if dist > max_move:
+            delta *= max_move / dist
+        j, i = divmod(idx, su + 1)
+        on_border = j in (0, sv) or i in (0, su)
+        w = blend * (0.7 if on_border else 1.0)
+        snapped[j, i] = g + w * delta
+
+    # 一次轻量平滑（含边界，保持规则网格）
+    smooth = snapped.copy()
+    for j in range(sv + 1):
+        for i in range(su + 1):
+            acc = snapped[j, i].copy()
+            n = 1.0
+            if i > 0:
+                acc += snapped[j, i - 1]
+                n += 1.0
+            if i < su:
+                acc += snapped[j, i + 1]
+                n += 1.0
+            if j > 0:
+                acc += snapped[j - 1, i]
+                n += 1.0
+            if j < sv:
+                acc += snapped[j + 1, i]
+                n += 1.0
+            smooth[j, i] = 0.65 * snapped[j, i] + 0.35 * (acc / n)
+
+    return smooth.reshape(-1, 3)
+
+
 def build_quad_patch(
     sides: Sequence[np.ndarray],
     segments_u: int,
     segments_v: int,
     *,
     shared_param: bool = False,
+    surface_samples: np.ndarray | None = None,
+    snap_strength: float = 0.85,
 ) -> tuple[np.ndarray, list[tuple[int, ...]]]:
     """
     四边 Coons：对边同分段。
 
     shared_param=True 时对边按下标重采样（条带内外弧共享 u 参数），
-    否则按弧长重采样。
+    否则按弧长重采样。若提供 surface_samples，则对网格做列向软吸附。
     """
     if len(sides) != 4:
         raise RegionFitError("四边拟合需要恰好四条边")
@@ -1116,6 +1273,14 @@ def build_quad_patch(
     left = resample(sides[3][::-1], seg_v + 1)
     grid = coons_patch(bottom, right, top, left)
     vertices = grid.reshape(-1, 3)
+    if surface_samples is not None and len(surface_samples) > 0:
+        vertices = soft_snap_quad_grid_to_points(
+            vertices,
+            seg_u,
+            seg_v,
+            surface_samples,
+            strength=snap_strength,
+        )
     faces = patch_grid_faces(seg_u, seg_v)
     return vertices, faces
 
@@ -1218,6 +1383,8 @@ def analyze_region_fit_topology(
     face_centers: np.ndarray,
     triangle_ratio: float = DEFAULT_TRIANGLE_RATIO,
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+    adjacency_offsets: np.ndarray | None = None,
+    adjacency_indices: np.ndarray | None = None,
 ) -> dict:
     """分析领域边界并返回拟合拓扑描述；target_id 可为编号集合。"""
     loops = extract_region_boundary_loops(
@@ -1227,13 +1394,15 @@ def analyze_region_fit_topology(
         loop_total,
         loop_vertex_indices,
     )
-    targets = _normalize_target_ids(target_id)
-    region_mask = np.isin(
-        _as_int_array(region_ids),
-        np.asarray(targets, dtype=np.int32),
+    # 目标面心 + 邻接的 -1 碎面，供跨岛包络向外延伸
+    interior = collect_island_bridge_interiors(
+        region_ids,
+        target_id,
+        face_centers,
+        adjacency_offsets=adjacency_offsets,
+        adjacency_indices=adjacency_indices,
     )
-    interior = _as_float_array(face_centers)[region_mask]
-    loop_pts, band_sides = combine_boundary_islands(
+    loop_pts, band_sides, _band_samples = combine_boundary_islands(
         loops,
         vertices,
         interior_points=interior,
@@ -1311,6 +1480,7 @@ def analyze_region_fit_topology(
         "loop_count": len(loops),
         "corner_count": corner_count,
         "shared_param": shared_param,
+        "surface_samples": interior,
     }
 
 
@@ -1328,6 +1498,8 @@ def fit_region_surface(
     segments_v: int = DEFAULT_SEG_V,
     triangle_ratio: float = DEFAULT_TRIANGLE_RATIO,
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+    adjacency_offsets: np.ndarray | None = None,
+    adjacency_indices: np.ndarray | None = None,
 ) -> RegionFitResult:
     """拟合指定领域（或多个领域并集）为三边或四边规则网格。"""
     analysis = analyze_region_fit_topology(
@@ -1342,6 +1514,8 @@ def fit_region_surface(
         face_centers=face_centers,
         triangle_ratio=triangle_ratio,
         corner_angle_deg=corner_angle_deg,
+        adjacency_offsets=adjacency_offsets,
+        adjacency_indices=adjacency_indices,
     )
     topology = str(analysis["topology"])
     sides = analysis["sides"]
@@ -1367,6 +1541,8 @@ def fit_region_surface(
             segments_base=seg_u,
         )
     else:
+        # 多 island：包络已并入目标面心与邻接 -1 桥接碎面；
+        # 表面吸附易引入折角，默认关闭，仅靠延伸后的包络 + Coons。
         mesh_verts, faces = build_quad_patch(
             sides,
             seg_u,
@@ -1399,6 +1575,7 @@ __all__ = (
     "build_quad_patch",
     "build_triangular_patch",
     "classify_tri_or_quad",
+    "collect_island_bridge_interiors",
     "combine_boundary_islands",
     "coons_patch",
     "detect_corner_indices",
@@ -1409,4 +1586,5 @@ __all__ = (
     "resample_closed_polyline",
     "resample_polyline",
     "select_primary_boundary_loop",
+    "soft_snap_quad_grid_to_points",
 )

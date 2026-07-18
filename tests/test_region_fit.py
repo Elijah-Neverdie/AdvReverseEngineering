@@ -271,7 +271,7 @@ class BoundaryExtractionTests(unittest.TestCase):
         # 回归：弯曲条带的两个 island 合并时，包络不得在弧的两条臂
         # 之间跳变（旧的主轴分箱会导致拟合面交叉扭曲）
         vertices, loops = _arc_band_island_loops()
-        envelope, band_sides = combine_boundary_islands(loops, vertices)
+        envelope, band_sides, _samples = combine_boundary_islands(loops, vertices)
         self.assertIsNotNone(band_sides)
         self.assertEqual(len(band_sides), 4)
         radii = np.linalg.norm(envelope[:, :2], axis=1)
@@ -293,7 +293,9 @@ class BoundaryExtractionTests(unittest.TestCase):
             mesh["loop_vertex_indices"],
         )
         self.assertEqual(len(loops), 2)
-        envelope, band_sides = combine_boundary_islands(loops, mesh["vertices"])
+        envelope, band_sides, _samples = combine_boundary_islands(
+            loops, mesh["vertices"]
+        )
         self.assertIsNotNone(band_sides)
         self.assertEqual(len(band_sides), 4)
         self.assertGreaterEqual(len(envelope), 4)
@@ -314,8 +316,8 @@ class BoundaryExtractionTests(unittest.TestCase):
                 np.zeros(len(mid_angles)),
             )
         )
-        _env_plain, sides_plain = combine_boundary_islands(loops, vertices)
-        _env_ext, sides_ext = combine_boundary_islands(
+        _env_plain, sides_plain, _ = combine_boundary_islands(loops, vertices)
+        _env_ext, sides_ext, _ = combine_boundary_islands(
             loops, vertices, interior_points=interior
         )
         self.assertIsNotNone(sides_plain)

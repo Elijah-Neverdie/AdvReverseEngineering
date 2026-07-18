@@ -57,10 +57,22 @@ def _get_panel_classes() -> list[type]:
 
 
 def _register_classes(class_list: list[type], label: str) -> None:
-    """批量注册 Blender 类型，失败时抛出明确错误。"""
+    """批量注册 Blender 类型；已注册则先注销再注册，便于热重载。"""
     for cls in class_list:
         try:
             bpy.utils.register_class(cls)
+        except ValueError:
+            # 上次启用失败可能留下半注册状态
+            try:
+                bpy.utils.unregister_class(cls)
+            except Exception:
+                pass
+            try:
+                bpy.utils.register_class(cls)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"AdvReverseEngineering: 注册 {label} '{cls.__name__}' 失败"
+                ) from exc
         except Exception as exc:
             raise RuntimeError(
                 f"AdvReverseEngineering: 注册 {label} '{cls.__name__}' 失败"

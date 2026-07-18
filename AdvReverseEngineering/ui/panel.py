@@ -7,11 +7,8 @@ from __future__ import annotations
 
 import bpy
 
-from .. import bl_info
+from ..operators.update import get_display_version_text
 from ..registration import SCENE_PROP_NAME, TAB_CATEGORY
-
-
-VERSION_TEXT = ".".join(str(value) for value in bl_info["version"])
 
 
 def _prefs(context: bpy.types.Context):
@@ -39,11 +36,15 @@ def _draw_foldout(layout, props, prop_name: str, title: str):
 class ARE_PT_main(bpy.types.Panel):
     """逆向工具主面板，始终显示以确保侧边栏标签可见。"""
 
-    bl_label = f"逆向工具  v{VERSION_TEXT}"
+    bl_label = "逆向工具"
     bl_idname = "ARE_PT_main"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = TAB_CATEGORY
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        # 每次绘制读磁盘版本，避免「文件已更新、标题仍显示旧号」
+        self.layout.label(text=f"v{get_display_version_text()}")
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
@@ -68,9 +69,7 @@ class ARE_PT_main(bpy.types.Panel):
 
             if prefs.show_github_sync:
                 sync_box = layout.box()
-                sync_box.prop(prefs, "github_owner")
-                sync_box.prop(prefs, "github_repo")
-                sync_box.prop(prefs, "github_branch")
+                sync_box.prop(prefs, "github_branch", text="分支")
 
                 if prefs.update_check_message:
                     sync_box.label(
@@ -98,6 +97,10 @@ class ARE_PT_main(bpy.types.Panel):
                 elif prefs.update_check_state == "CURRENT":
                     update_row.enabled = False
                     update_text = "当前为最新版"
+                elif prefs.update_check_state == "AHEAD":
+                    update_row.enabled = False
+                    server = prefs.latest_version or "?"
+                    update_text = f"服务端版本为{server}"
                 else:
                     update_row.enabled = False
                     update_text = "尚未检查更新"

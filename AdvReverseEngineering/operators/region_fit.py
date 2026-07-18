@@ -346,6 +346,8 @@ class ARE_OT_fit_region(bpy.types.Operator):
                 segments_v=int(scene_props.fit_segments_v),
                 triangle_ratio=float(scene_props.region_fit_triangle_ratio)
                 / 100.0,
+                adjacency_offsets=self._topology_data["adjacency_offsets"],
+                adjacency_indices=self._topology_data["adjacency_indices"],
             )
         except RegionFitError as exc:
             # 拟合失败：撤下旧预览，回到编号选择阶段
