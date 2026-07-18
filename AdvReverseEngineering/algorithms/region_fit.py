@@ -903,13 +903,17 @@ def cluster_nearby_boundary_loops(
         return []
     if count == 1:
         return [[0]]
-    samples = []
+    samples: list[np.ndarray | None] = []
+    bboxes: list[tuple[np.ndarray, np.ndarray] | None] = []
     for loop in loops:
         pts = verts[np.asarray(loop, dtype=np.int32)]
         if len(pts) < 3:
             samples.append(None)
+            bboxes.append(None)
             continue
-        samples.append(resample_closed_polyline(pts, int(np.clip(len(pts), 16, 48))))
+        # 聚类只需稀疏采样，避免卡顿
+        samples.append(resample_closed_polyline(pts, int(np.clip(len(pts), 12, 24))))
+        bboxes.append((pts.min(axis=0), pts.max(axis=0)))
 
     parent = list(range(count))
 
@@ -926,10 +930,17 @@ def cluster_nearby_boundary_loops(
 
     gap_limit = float(max(max_gap, 0.0))
     for i in range(count):
-        if samples[i] is None:
+        if samples[i] is None or bboxes[i] is None:
             continue
+        amin, amax = bboxes[i]
         for j in range(i + 1, count):
-            if samples[j] is None:
+            if samples[j] is None or bboxes[j] is None:
+                continue
+            bmin, bmax = bboxes[j]
+            # 包围盒分离过远则跳过精确间隙
+            sep = np.maximum(amin - bmax, bmin - amax)
+            sep = np.maximum(sep, 0.0)
+            if float(np.linalg.norm(sep)) > gap_limit:
                 continue
             if approx_closed_polyline_gap(samples[i], samples[j]) <= gap_limit:
                 _union(i, j)
@@ -951,7 +962,9 @@ def _segment_facing_score(
     proximity: float,
 ) -> float:
     """
-    两条线段若近平行、对向、投影重叠且间隙小，返回间隙；否则 +inf。
+    两条线段若近平行、对向、投影重叠且垂直间隙小，返回间隙；否则 +inf。
+
+    间隙用垂直于边方向的距离，避免采样相位错位时中点欧氏距离虚高。
     """
     da = a1 - a0
     db = b1 - b0
@@ -966,7 +979,10 @@ def _segment_facing_score(
         return float("inf")
     mid_a = 0.5 * (a0 + a1)
     mid_b = 0.5 * (b0 + b1)
-    gap = float(np.linalg.norm(mid_a - mid_b))
+    delta = mid_b - mid_a
+    # 沿边方向的错位不计入间隙
+    perp = delta - ua * float(delta.dot(ua))
+    gap = float(np.linalg.norm(perp))
     if gap > float(proximity) * 1.25:
         return float("inf")
     # 投影到 a 方向看重叠
@@ -979,6 +995,21 @@ def _segment_facing_score(
     return gap
 
 
+def _decimate_closed_loop_ids(loop: Sequence[int], max_verts: int) -> list[int]:
+    """闭环节流：按步长抽稀，保留原始顶点索引（不造新点）。"""
+    ids = [int(v) for v in loop]
+    count = len(ids)
+    if count <= max_verts:
+        return ids
+    step = int(np.ceil(count / float(max_verts)))
+    kept = ids[::step]
+    if kept[0] != ids[0]:
+        kept.insert(0, ids[0])
+    if len(kept) < 3:
+        return ids[:max_verts]
+    return kept
+
+
 def outer_contour_by_dissolving_facing_edges(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
@@ -987,95 +1018,150 @@ def outer_contour_by_dissolving_facing_edges(
     """
     消去邻近孤岛之间的对向内边，用原始 3D 顶点拼出真正外轮廓。
 
-    失败（无法成环）时返回 None，由调用方改为分岛处理。
+    为避免卡死：环顶点数设上限、空间哈希配对、有限次环追踪；
+    桥接只连对边端点最近邻。失败返回 None，由调用方分岛处理。
     """
     verts = _as_float_array(vertices)
-    loop_ids = [list(int(v) for v in loop) for loop in loops if len(loop) >= 3]
-    if len(loop_ids) < 2:
+    raw_loops = [list(int(v) for v in loop) for loop in loops if len(loop) >= 3]
+    if len(raw_loops) < 2:
         return None
 
-    segments: list[tuple[int, int, np.ndarray, np.ndarray]] = []
-    for loop in loop_ids:
-        count = len(loop)
-        for index in range(count):
-            va = int(loop[index])
-            vb = int(loop[(index + 1) % count])
-            segments.append((va, vb, verts[va].copy(), verts[vb].copy()))
+    _MAX_LOOP_VERTS = 48
+    _MAX_SEGMENTS = 480
+    _MAX_TRACE_STARTS = 12
 
+    max_verts = _MAX_LOOP_VERTS
+    segments: list[tuple[int, np.ndarray, np.ndarray]] = []
+    while True:
+        sample_loops = [
+            _decimate_closed_loop_ids(loop, max_verts) for loop in raw_loops
+        ]
+        segments = []
+        for loop_index, ids in enumerate(sample_loops):
+            count = len(ids)
+            for index in range(count):
+                segments.append(
+                    (
+                        loop_index,
+                        verts[ids[index]].copy(),
+                        verts[ids[(index + 1) % count]].copy(),
+                    )
+                )
+        if len(segments) <= _MAX_SEGMENTS or max_verts <= 12:
+            break
+        max_verts = max(12, max_verts // 2)
     n_seg = len(segments)
-    cancelled = np.zeros(n_seg, dtype=bool)
-    # 按所属环分段，避免同环边互消
-    loop_of: list[int] = []
-    for loop_index, loop in enumerate(loop_ids):
-        loop_of.extend([loop_index] * len(loop))
+    if n_seg > _MAX_SEGMENTS or n_seg < 3:
+        return None
 
     prox = float(max(proximity, 1e-6))
+    # 空间哈希：只与邻近桶内线段比对面
+    cell = max(prox * 0.9, 1e-6)
+
+    def _mid_key(point: np.ndarray) -> tuple[int, int, int]:
+        return (
+            int(np.floor(point[0] / cell)),
+            int(np.floor(point[1] / cell)),
+            int(np.floor(point[2] / cell)),
+        )
+
+    buckets: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+    mids = np.zeros((n_seg, 3), dtype=np.float64)
+    for index, (_li, pa, pb) in enumerate(segments):
+        mid = 0.5 * (pa + pb)
+        mids[index] = mid
+        buckets[_mid_key(mid)].append(index)
+
+    # 按垂直间隙从小到大配对，每段最多取消一次
+    pair_candidates: list[tuple[float, int, int]] = []
+    seen_pairs: set[tuple[int, int]] = set()
     for i in range(n_seg):
-        if cancelled[i]:
+        li, pa, pb = segments[i]
+        base = _mid_key(mids[i])
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for j in buckets.get(
+                        (base[0] + dx, base[1] + dy, base[2] + dz),
+                        (),
+                    ):
+                        if j <= i:
+                            continue
+                        lj, pc, pd = segments[j]
+                        if li == lj:
+                            continue
+                        key = (i, j)
+                        if key in seen_pairs:
+                            continue
+                        seen_pairs.add(key)
+                        score = _segment_facing_score(pa, pb, pc, pd, prox)
+                        if score < float("inf"):
+                            pair_candidates.append((score, i, j))
+
+    pair_candidates.sort(key=lambda item: item[0])
+    cancelled = np.zeros(n_seg, dtype=bool)
+    bridges: list[tuple[np.ndarray, np.ndarray]] = []
+    for _score, i, j in pair_candidates:
+        if cancelled[i] or cancelled[j]:
             continue
-        va, vb, pa, pb = segments[i]
-        for j in range(i + 1, n_seg):
-            if cancelled[j] or loop_of[i] == loop_of[j]:
-                continue
-            _vc, _vd, pc, pd = segments[j]
-            score = _segment_facing_score(pa, pb, pc, pd, prox)
-            if score < float("inf"):
-                cancelled[i] = True
-                cancelled[j] = True
-                break
+        cancelled[i] = True
+        cancelled[j] = True
+        _li, pa, pb = segments[i]
+        _lj, pc, pd = segments[j]
+        # 每端点只连对边上最近端点，避免密布短桥成梯子
+        for p in (pa, pb):
+            q = pc if float(np.linalg.norm(p - pc)) <= float(
+                np.linalg.norm(p - pd)
+            ) else pd
+            dist = float(np.linalg.norm(p - q))
+            if 1e-9 < dist <= prox * 1.15:
+                bridges.append((p.copy(), q.copy()))
 
     kept = [segments[i] for i in range(n_seg) if not cancelled[i]]
     if len(kept) < 3:
         return None
 
-    # 端点吸附：不同岛顶点不共享，按坐标并查集合并
+    # 仅焊接重合端点，禁止把岛间隙吸附成同一点
+    weld = max(min(prox * 0.05, cell * 0.05), 1e-9)
     node_points: list[np.ndarray] = []
-    parent: list[int] = []
+    grid: dict[tuple[int, int, int], list[int]] = defaultdict(list)
 
-    def _find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def _union(a: int, b: int) -> None:
-        ra, rb = _find(a), _find(b)
-        if ra != rb:
-            parent[rb] = ra
+    def _weld_key(point: np.ndarray) -> tuple[int, int, int]:
+        return (
+            int(np.floor(point[0] / max(weld, 1e-12))),
+            int(np.floor(point[1] / max(weld, 1e-12))),
+            int(np.floor(point[2] / max(weld, 1e-12))),
+        )
 
     def _register(point: np.ndarray) -> int:
-        for index, existing in enumerate(node_points):
-            if float(np.linalg.norm(existing - point)) <= prox * 0.75:
-                return _find(index)
+        base = _weld_key(point)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for index in grid.get(
+                        (base[0] + dx, base[1] + dy, base[2] + dz),
+                        (),
+                    ):
+                        if float(np.linalg.norm(node_points[index] - point)) <= weld:
+                            return index
         index = len(node_points)
         node_points.append(point.copy())
-        parent.append(index)
+        grid[base].append(index)
         return index
 
     edges: list[tuple[int, int]] = []
-    for _va, _vb, pa, pb in kept:
+    for _li, pa, pb in kept:
+        na = _register(pa)
+        nb = _register(pb)
+        if na != nb:
+            edges.append((na, nb))
+    for pa, pb in bridges:
         na = _register(pa)
         nb = _register(pb)
         if na != nb:
             edges.append((na, nb))
 
-    # 对消边留下的缺口：若两边端点彼此靠近则补短桥（仅局部，不跨远岛）
-    cancelled_endpoints: list[np.ndarray] = []
-    for i in range(n_seg):
-        if not cancelled[i]:
-            continue
-        _va, _vb, pa, pb = segments[i]
-        cancelled_endpoints.extend([pa, pb])
-    for i, p in enumerate(cancelled_endpoints):
-        for q in cancelled_endpoints[i + 1 :]:
-            dist = float(np.linalg.norm(p - q))
-            if 1e-9 < dist <= prox * 1.1:
-                na = _register(p)
-                nb = _register(q)
-                if na != nb:
-                    edges.append((na, nb))
-
-    if not edges:
+    if len(edges) < 3:
         return None
 
     outgoing: dict[int, list[int]] = defaultdict(list)
@@ -1083,68 +1169,83 @@ def outer_contour_by_dissolving_facing_edges(
         outgoing[a].append(b)
         outgoing[b].append(a)
 
-    # 追踪最长闭环
-    unused: dict[tuple[int, int], int] = defaultdict(int)
-    for a, b in edges:
-        unused[(a, b)] += 1
-        unused[(b, a)] += 1
-
-    best_loop: list[int] | None = None
-    best_len = -1.0
-    for start_a, start_b in list(edges):
+    def _trace_from(start_a: int, start_b: int) -> list[int] | None:
+        unused: dict[tuple[int, int], int] = defaultdict(int)
+        for a, b in edges:
+            unused[(a, b)] += 1
+            unused[(b, a)] += 1
         if unused[(start_a, start_b)] <= 0:
-            continue
-        unused[(start_a, start_b)] -= 1
-        unused[(start_b, start_a)] -= 1
+            return None
         loop_nodes = [start_a]
         current = start_b
         prev = start_a
-        guard = 0
-        ok = False
-        while guard <= len(edges) + 2:
-            guard += 1
+        unused[(start_a, start_b)] -= 1
+        unused[(start_b, start_a)] -= 1
+        max_steps = len(edges) + 2
+        for _ in range(max_steps):
             loop_nodes.append(current)
             if current == start_a and len(loop_nodes) > 3:
-                ok = True
-                break
+                return loop_nodes[:-1]
             candidates = [
                 nxt
                 for nxt in outgoing.get(current, [])
                 if nxt != prev and unused[(current, nxt)] > 0
             ]
             if not candidates:
-                break
-            # 选使折线尽量外凸的下一点（左转最大）
-            best_nxt = candidates[0]
-            if len(candidates) > 1 and len(loop_nodes) >= 2:
+                return None
+            nxt = candidates[0]
+            if len(candidates) > 1:
                 inbound = node_points[current] - node_points[prev]
-                best_score = -1e30
+                in_norm = float(np.linalg.norm(inbound))
+                best_dot = -1e30
+                if in_norm > 1e-12:
+                    inbound = inbound / in_norm
                 for cand in candidates:
                     outbound = node_points[cand] - node_points[current]
-                    score = float(np.linalg.norm(np.cross(inbound, outbound)))
-                    if score > best_score:
-                        best_score = score
-                        best_nxt = cand
-            nxt = best_nxt
+                    out_norm = float(np.linalg.norm(outbound))
+                    if out_norm < 1e-12:
+                        continue
+                    # 优先直行/外轮廓（转向最小），避免钻进短桥死胡同
+                    dot = float(inbound.dot(outbound / out_norm))
+                    if dot > best_dot:
+                        best_dot = dot
+                        nxt = cand
             unused[(current, nxt)] -= 1
             unused[(nxt, current)] -= 1
             prev, current = current, nxt
-        if not ok or len(loop_nodes) < 4:
+        return None
+
+    # 有限起点：优先度数异常节点，再补若干边
+    degree = {node: len(neigh) for node, neigh in outgoing.items()}
+    start_edges: list[tuple[int, int]] = []
+    for a, b in edges:
+        if degree.get(a, 0) != 2 or degree.get(b, 0) != 2:
+            start_edges.append((a, b))
+    for a, b in edges:
+        if (a, b) not in start_edges and (b, a) not in start_edges:
+            start_edges.append((a, b))
+        if len(start_edges) >= _MAX_TRACE_STARTS:
+            break
+
+    best_nodes: list[int] | None = None
+    best_len = -1.0
+    for start_a, start_b in start_edges[:_MAX_TRACE_STARTS]:
+        nodes = _trace_from(start_a, start_b)
+        if nodes is None or len(nodes) < 3:
             continue
-        # 去掉闭合重复首点
-        nodes = loop_nodes[:-1]
         pts = np.asarray([node_points[i] for i in nodes], dtype=np.float64)
-        length = float(polyline_length(np.vstack((pts, pts[:1]))))
+        length = float(
+            np.sum(np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1))
+        )
         if length > best_len:
             best_len = length
-            best_loop = nodes
+            best_nodes = nodes
 
-    if best_loop is None or len(best_loop) < 3:
+    if best_nodes is None:
         return None
-    result = np.asarray(
-        [node_points[i] for i in best_loop],
-        dtype=np.float64,
-    )
+    result = np.asarray([node_points[i] for i in best_nodes], dtype=np.float64)
+    if len(result) < 3:
+        return None
     origin, axis_u, axis_v = _loop_pca_basis(result)
     if _signed_area_2d(
         project_points_to_plane(result, origin, axis_u, axis_v)
@@ -1181,13 +1282,23 @@ def merge_nearby_loops_to_outer_contours(
                 }
             )
             continue
+        # 簇过大时融并代价高且易失败：直接分岛，保证不卡死
+        if len(cluster_loops) > 12:
+            for ids in cluster_loops:
+                items.append(
+                    {
+                        "points": verts[np.asarray(ids, dtype=np.int32)].copy(),
+                        "loop_ids": ids,
+                        "merged_from": 1,
+                    }
+                )
+            continue
         envelope = outer_contour_by_dissolving_facing_edges(
             cluster_loops,
             verts,
             proximity=float(max_gap),
         )
         if envelope is None or len(envelope) < 3:
-            # 融并失败：远近难判时宁可分岛，禁止弦线硬连
             for ids in cluster_loops:
                 items.append(
                     {
