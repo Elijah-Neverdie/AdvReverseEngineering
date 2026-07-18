@@ -302,6 +302,34 @@ class BoundaryExtractionTests(unittest.TestCase):
         self.assertAlmostEqual(float(envelope[:, 1].min()), 0.0, places=6)
         self.assertAlmostEqual(float(envelope[:, 1].max()), 1.0, places=6)
 
+    def test_interior_points_extend_band_envelope(self) -> None:
+        # 边界环高度仅到 y=1，但面心探到 y=1.8：包络应向外延伸盖住角部
+        vertices, loops = _arc_band_island_loops()
+        # 在弧中段外侧放置“角部”内部点
+        mid_angles = np.radians(np.array([30.0, 100.0]))
+        interior = np.column_stack(
+            (
+                5.6 * np.cos(mid_angles),
+                5.6 * np.sin(mid_angles),
+                np.zeros(len(mid_angles)),
+            )
+        )
+        _env_plain, sides_plain = combine_boundary_islands(loops, vertices)
+        _env_ext, sides_ext = combine_boundary_islands(
+            loops, vertices, interior_points=interior
+        )
+        self.assertIsNotNone(sides_plain)
+        self.assertIsNotNone(sides_ext)
+        r_plain = max(
+            float(np.linalg.norm(sides_plain[0][:, :2], axis=1).max()),
+            float(np.linalg.norm(sides_plain[2][:, :2], axis=1).max()),
+        )
+        r_ext = max(
+            float(np.linalg.norm(sides_ext[0][:, :2], axis=1).max()),
+            float(np.linalg.norm(sides_ext[2][:, :2], axis=1).max()),
+        )
+        self.assertGreater(r_ext, r_plain + 0.3)
+
 
 class TopologyClassificationTests(unittest.TestCase):
     def test_detect_square_corners(self) -> None:

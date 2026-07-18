@@ -416,12 +416,12 @@ def _band_envelope_from_samples(
     lower_u2 = lower2[first : last + 1]
     upper_u2 = upper2[first : last + 1]
 
-    # 修剪条带两端宽度过窄的分箱，避免零长度端帽把 Coons 压扁
+    # 仅修剪近乎零宽的端箱，避免压扁 Coons；阈值放宽以免裁掉角部延伸
     widths = np.linalg.norm(upper_u - lower_u, axis=1)
     positive = widths[widths > 1e-9]
     if len(positive) == 0:
         raise RegionFitError("多个 island 条带宽度过小，无法合并")
-    width_min = max(float(np.median(positive)) * 0.15, 1e-6)
+    width_min = max(float(np.median(positive)) * 0.05, 1e-6)
     usable = np.flatnonzero(widths >= width_min)
     if len(usable) < 2:
         usable = np.flatnonzero(widths > 1e-9)
@@ -464,11 +464,45 @@ def _band_envelope_from_samples(
     if len(envelope) < 4:
         raise RegionFitError("合并后的 island 包络点数不足")
 
-    # 共享 u 参数的四边：长边按下标对应，避免后续弧长重采样错位
+    # 端帽：在端部窗口内取最靠外的上下极值点，再连线——
+    # 比「当前分箱直线」更能盖住角部，又比折线端帽更不易扭曲。
+    u_start = u_min + (first + lo) / max(bin_count - 1, 1) * u_span
+    u_end = u_min + (first + hi) / max(bin_count - 1, 1) * u_span
+    window = max(u_span * 0.08, 1e-9)
+
+    def _extreme_end_pair(u0: float, at_start: bool) -> tuple[np.ndarray, np.ndarray]:
+        if at_start:
+            mask = param_u <= u0 + window
+        else:
+            mask = param_u >= u0 - window
+        members = np.flatnonzero(mask)
+        if len(members) == 0:
+            return lower_u[0 if at_start else -1], upper_u[0 if at_start else -1]
+        # 先取最靠外的一半点，再在其中取 v 极值，避免针尖分箱
+        u_vals = param_u[members]
+        if at_start:
+            keep_u = members[u_vals <= float(np.percentile(u_vals, 40))]
+        else:
+            keep_u = members[u_vals >= float(np.percentile(u_vals, 60))]
+        if len(keep_u) < 2:
+            keep_u = members
+        lo_i = int(keep_u[int(np.argmin(param_v[keep_u]))])
+        hi_i = int(keep_u[int(np.argmax(param_v[keep_u]))])
+        return pts3[lo_i], pts3[hi_i]
+
+    start_lo, start_hi = _extreme_end_pair(u_start, True)
+    end_lo, end_hi = _extreme_end_pair(u_end, False)
     cap_count = int(np.clip(n_lower // 8, 2, 16))
-    end_t = np.linspace(0.0, 1.0, cap_count, dtype=np.float64)[:, None]
-    end_cap = lower_u[-1][None, :] + end_t * (upper_u[-1] - lower_u[-1])
-    start_cap = upper_u[0][None, :] + end_t * (lower_u[0] - upper_u[0])
+    t = np.linspace(0.0, 1.0, cap_count, dtype=np.float64)[:, None]
+    start_cap = start_hi[None, :] + t * (start_lo - start_hi)
+    end_cap = end_lo[None, :] + t * (end_hi - end_lo)
+    lower_u = lower_u.copy()
+    upper_u = upper_u.copy()
+    lower_u[0] = start_lo
+    upper_u[0] = start_hi
+    lower_u[-1] = end_lo
+    upper_u[-1] = end_hi
+    upper_chain = upper_u[::-1]
     band_sides = [lower_u, end_cap, upper_chain, start_cap]
     return envelope, corners, envelope_2d, band_sides
 
@@ -476,6 +510,7 @@ def _band_envelope_from_samples(
 def combine_boundary_islands(
     loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
+    interior_points: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[np.ndarray] | None]:
     """
     将同一领域内互不连通的 island 边界合成为一个连续外包络。
@@ -483,6 +518,9 @@ def combine_boundary_islands(
     所有环先投影到共同 PCA 平面，按条带参数化（平直用主轴坐标、
     弯弧用极角）分箱提取两侧包络；island 之间无采样的区间用两侧
     包络线性连接。
+
+    interior_points（通常为领域面心）会并入分箱极值，使包络向外
+    延伸覆盖角部/凹口，避免「只贴边界环、裁掉领域本体」的缺口。
 
     返回 (envelope, band_sides)：
       - envelope: 有序 3D 闭环（不重复首点）
@@ -504,6 +542,14 @@ def combine_boundary_islands(
         raise RegionFitError("所有 island 边界均无效")
 
     all_points = np.vstack(loop_points)
+    if interior_points is not None and len(interior_points) > 0:
+        interior = _as_float_array(interior_points)
+        if interior.ndim == 1:
+            interior = interior.reshape(1, 3)
+        all_points = np.vstack((all_points, interior))
+    else:
+        interior = None
+
     centroid = all_points.mean(axis=0)
     _, _, vh = np.linalg.svd(all_points - centroid, full_matrices=False)
     axis_u = _normalize(vh[0])
@@ -520,6 +566,17 @@ def combine_boundary_islands(
         samples_3d.append(sampled)
         samples_2d.append(
             project_points_to_plane(sampled, centroid, axis_u, axis_v)
+        )
+
+    # 面心等内部点并入分箱，向外延伸覆盖角部（红框缺口的主因）
+    if interior is not None and len(interior) > 0:
+        # 量大时均匀下采样，保持包络稳定且控制耗时
+        if len(interior) > 4000:
+            step = int(np.ceil(len(interior) / 4000))
+            interior = interior[::step]
+        samples_3d.append(interior)
+        samples_2d.append(
+            project_points_to_plane(interior, centroid, axis_u, axis_v)
         )
 
     points_3d = np.vstack(samples_3d)
@@ -1170,7 +1227,17 @@ def analyze_region_fit_topology(
         loop_total,
         loop_vertex_indices,
     )
-    loop_pts, band_sides = combine_boundary_islands(loops, vertices)
+    targets = _normalize_target_ids(target_id)
+    region_mask = np.isin(
+        _as_int_array(region_ids),
+        np.asarray(targets, dtype=np.int32),
+    )
+    interior = _as_float_array(face_centers)[region_mask]
+    loop_pts, band_sides = combine_boundary_islands(
+        loops,
+        vertices,
+        interior_points=interior,
+    )
     _, normal, _, _ = compute_region_frame(
         face_normals,
         face_areas,
