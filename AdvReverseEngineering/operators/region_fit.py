@@ -310,7 +310,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
 
     def _status_text(self, scene_props) -> str:
         if scene_props.fit_phase != "PREVIEW":
-            return "点击领域编号开始拟合；同一编号的 island 会自动连接"
+            return "点击领域编号开始拟合；同编号 island 会沿边沿曲率延长相接"
         topo = "三边" if self._topology == "TRI" else "四边"
         target = int(scene_props.fit_target_id)
         if self._topology == "TRI":

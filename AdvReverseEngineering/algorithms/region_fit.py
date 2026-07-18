@@ -342,6 +342,59 @@ def _polyline_self_cross_count_2d(points_2d: np.ndarray) -> int:
     return crosses
 
 
+def _hermite_fill_missing_bins(
+    values: np.ndarray,
+    valid: np.ndarray,
+    first: int,
+    last: int,
+) -> np.ndarray:
+    """用邻近端点切向补齐空分箱，使 island 之间沿边沿方向顺延。"""
+    result = values.copy()
+    valid_order = [int(v) for v in valid.tolist() if first <= int(v) <= last]
+    if len(valid_order) < 2:
+        return result
+
+    for pos in range(len(valid_order) - 1):
+        left = valid_order[pos]
+        right = valid_order[pos + 1]
+        if right <= left + 1:
+            continue
+
+        span = float(right - left)
+        p0 = result[left].copy()
+        p1 = result[right].copy()
+        prev_index = valid_order[pos - 1] if pos > 0 else None
+        next_index = valid_order[pos + 2] if pos + 2 < len(valid_order) else None
+        if prev_index is not None:
+            m0 = (p0 - result[prev_index]) * (span / max(left - prev_index, 1))
+        else:
+            m0 = p1 - p0
+        if next_index is not None:
+            m1 = (result[next_index] - p1) * (
+                span / max(next_index - right, 1)
+            )
+        else:
+            m1 = p1 - p0
+
+        chord = float(np.linalg.norm(p1 - p0))
+        if chord > 1e-9:
+            for tangent in (m0, m1):
+                length = float(np.linalg.norm(tangent))
+                if length > chord * 2.5:
+                    tangent *= (chord * 2.5) / length
+
+        for index in range(left + 1, right):
+            t = (index - left) / span
+            t2 = t * t
+            t3 = t2 * t
+            h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+            h10 = t3 - 2.0 * t2 + t
+            h01 = -2.0 * t3 + 3.0 * t2
+            h11 = t3 - t2
+            result[index] = h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1
+    return result
+
+
 def _band_envelope_from_samples(
     points_3d: np.ndarray,
     points_2d: np.ndarray,
@@ -395,21 +448,10 @@ def _band_envelope_from_samples(
         raise RegionFitError("多个 island 无法形成连续包络")
     first = int(valid[0])
     last = int(valid[-1])
-    grid = np.arange(first, last + 1, dtype=np.float64)
-    for axis in range(3):
-        lower3[first : last + 1, axis] = np.interp(
-            grid, valid.astype(np.float64), lower3[valid, axis]
-        )
-        upper3[first : last + 1, axis] = np.interp(
-            grid, valid.astype(np.float64), upper3[valid, axis]
-        )
-    for axis in range(2):
-        lower2[first : last + 1, axis] = np.interp(
-            grid, valid.astype(np.float64), lower2[valid, axis]
-        )
-        upper2[first : last + 1, axis] = np.interp(
-            grid, valid.astype(np.float64), upper2[valid, axis]
-        )
+    lower3 = _hermite_fill_missing_bins(lower3, valid, first, last)
+    upper3 = _hermite_fill_missing_bins(upper3, valid, first, last)
+    lower2 = _hermite_fill_missing_bins(lower2, valid, first, last)
+    upper2 = _hermite_fill_missing_bins(upper2, valid, first, last)
 
     lower_u = lower3[first : last + 1]
     upper_u = upper3[first : last + 1]  # 与 lower 共享同一 u 分箱
@@ -517,8 +559,8 @@ def combine_boundary_islands(
     将同一领域内互不连通的 island 边界合成为一个连续外包络。
 
     所有环先投影到共同 PCA 平面，按条带参数化（平直用主轴坐标、
-    弯弧用极角）分箱提取两侧包络；island 之间无采样的区间用两侧
-    包络线性连接。
+    弯弧用极角）分箱提取两侧包络；island 之间无采样的区间按邻近
+    边沿切向补齐，模拟边沿曲率顺延后相接。
 
     interior_points（通常为领域面心）会并入分箱极值，使包络向外
     延伸覆盖角部/凹口。
@@ -1202,6 +1244,109 @@ def bridge_concave_notches(
     return out_2d, out_3d
 
 
+def extend_quad_corners_by_tangents(
+    sides_2d: Sequence[np.ndarray],
+    sides_3d: Sequence[np.ndarray],
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """
+    将相邻主边端部切线延长到交点，形成规整四边壁面。
+
+    单 island 的凹多边形边界常沿扫描分割凹口收缩；这里只调整四个
+    结构角点，保留每条边内部曲线，让长边按端部方向顺延。
+    """
+    if len(sides_2d) != 4 or len(sides_3d) != 4:
+        return (
+            [np.asarray(side, dtype=np.float64).copy() for side in sides_2d],
+            [np.asarray(side, dtype=np.float64).copy() for side in sides_3d],
+        )
+
+    out2 = [np.asarray(side, dtype=np.float64).copy() for side in sides_2d]
+    out3 = [np.asarray(side, dtype=np.float64).copy() for side in sides_3d]
+    side_lengths = [max(polyline_length(side), 1e-9) for side in out2]
+    extend_limit = float(np.median(side_lengths)) * 0.9
+
+    def _endpoint_tangent(
+        points: np.ndarray,
+        at_end: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        pts = np.asarray(points, dtype=np.float64)
+        count = len(pts)
+        if count < 2:
+            return pts[-1 if at_end else 0], np.zeros(2, dtype=np.float64)
+        window = min(max(count // 6, 2), 8, count)
+        segment = pts[-window:] if at_end else pts[:window]
+        center = segment.mean(axis=0)
+        _, _, vh = np.linalg.svd(segment - center, full_matrices=False)
+        direction = _normalize(np.array([vh[0, 0], vh[0, 1], 0.0]))[:2]
+        reference = (pts[-1] - pts[-2]) if at_end else (pts[1] - pts[0])
+        if float(direction.dot(reference)) < 0.0:
+            direction = -direction
+        return pts[-1 if at_end else 0], direction
+
+    def _line_intersection(
+        p: np.ndarray,
+        d: np.ndarray,
+        q: np.ndarray,
+        e: np.ndarray,
+    ) -> tuple[float, float, np.ndarray] | None:
+        mat = np.column_stack((d, -e))
+        det = float(np.linalg.det(mat))
+        if abs(det) < 1e-8:
+            return None
+        t, u = np.linalg.solve(mat, q - p)
+        point = p + float(t) * d
+        return float(t), float(u), point
+
+    def _endpoint_tangent_3d(
+        points3: np.ndarray,
+        points2: np.ndarray,
+        at_end: bool,
+    ) -> np.ndarray:
+        if len(points3) < 2 or len(points2) < 2:
+            return np.zeros(3, dtype=np.float64)
+        if at_end:
+            d2 = points2[-1] - points2[-2]
+            d3 = points3[-1] - points3[-2]
+        else:
+            d2 = points2[1] - points2[0]
+            d3 = points3[1] - points3[0]
+        scale = max(float(np.linalg.norm(d2)), 1e-9)
+        return d3 / scale
+
+    for index in range(4):
+        next_index = (index + 1) % 4
+        p, d = _endpoint_tangent(out2[index], at_end=True)
+        q, e = _endpoint_tangent(out2[next_index], at_end=False)
+        if float(np.linalg.norm(d)) < 1e-9 or float(np.linalg.norm(e)) < 1e-9:
+            continue
+        hit = _line_intersection(p, d, q, e)
+        if hit is None:
+            continue
+        t, u, point2 = hit
+        current = 0.5 * (p + q)
+        move = float(np.linalg.norm(point2 - current))
+        if move < 1e-6 or move > extend_limit:
+            continue
+        if abs(t) > extend_limit or abs(u) > extend_limit:
+            continue
+
+        d3_prev = _endpoint_tangent_3d(out3[index], out2[index], at_end=True)
+        d3_next = _endpoint_tangent_3d(
+            out3[next_index],
+            out2[next_index],
+            at_end=False,
+        )
+        point3_prev = out3[index][-1] + t * d3_prev
+        point3_next = out3[next_index][0] + u * d3_next
+        point3 = 0.5 * (point3_prev + point3_next)
+        out2[index][-1] = point2
+        out2[next_index][0] = point2
+        out3[index][-1] = point3
+        out3[next_index][0] = point3
+
+    return out2, out3
+
+
 def _signed_area_2d(points: np.ndarray) -> float:
     pts = _as_float_array(points)
     if len(pts) < 3:
@@ -1561,27 +1706,6 @@ def analyze_region_fit_topology(
 ) -> dict:
     """分析领域边界并返回拟合拓扑描述；target_id 可为编号集合。"""
     work_ids = _as_int_array(region_ids)
-    dropped_islands = 0
-    kept_islands = 0
-    if (
-        adjacency_offsets is not None
-        and adjacency_indices is not None
-        and len(adjacency_offsets) > 1
-    ):
-        keep_mask, kept_islands, dropped_islands = select_bridgeable_region_mask(
-            work_ids,
-            target_id,
-            adjacency_offsets,
-            adjacency_indices,
-        )
-        if dropped_islands > 0 and np.any(keep_mask):
-            # 无法经 -1 走廊连通的远岛不参与包络，避免假延长弦
-            work_ids = work_ids.copy()
-            targets = _normalize_target_ids(target_id)
-            target_mask = np.isin(
-                work_ids, np.asarray(targets, dtype=np.int32)
-            )
-            work_ids[target_mask & ~keep_mask] = -2
 
     loops = extract_region_boundary_loops(
         work_ids,
@@ -1663,6 +1787,11 @@ def analyze_region_fit_topology(
             sides_3d,
             corner_angle_deg,
         )
+        if len(sides_3d) == 4:
+            sides_2d, sides_3d = extend_quad_corners_by_tangents(
+                sides_2d,
+                sides_3d,
+            )
         topology, sides_3d = classify_tri_or_quad(sides_3d, triangle_ratio)
         corner_count = len(corners)
 
@@ -1677,8 +1806,6 @@ def analyze_region_fit_topology(
         "corner_count": corner_count,
         "shared_param": shared_param,
         "surface_samples": interior,
-        "dropped_islands": int(dropped_islands),
-        "kept_islands": int(kept_islands),
     }
 
 
@@ -1719,17 +1846,10 @@ def fit_region_surface(
     sides = analysis["sides"]
     normal = analysis["normal"]
     warnings: list[str] = []
-    kept = int(analysis.get("kept_islands", 0))
     loops_n = int(analysis["loop_count"])
-    island_n = kept if kept > 0 else loops_n
-    if island_n > 1:
+    if loops_n > 1:
         warnings.append(
-            f"检测到 {island_n} 个可连通 island，已沿碎面走廊延长相接"
-        )
-    dropped = int(analysis.get("dropped_islands", 0))
-    if dropped > 0:
-        warnings.append(
-            f"另有 {dropped} 个 island 无法经碎面连通，已排除以免假延长"
+            f"检测到 {loops_n} 个 island，已按边沿曲率延长相接"
         )
 
     seg_u = int(np.clip(segments_u, MIN_SEGMENTS, MAX_SEGMENTS))
@@ -1785,9 +1905,9 @@ __all__ = (
     "classify_tri_or_quad",
     "collect_island_bridge_interiors",
     "combine_boundary_islands",
-    "select_bridgeable_region_mask",
     "coons_patch",
     "detect_corner_indices",
+    "extend_quad_corners_by_tangents",
     "extract_region_boundary_loops",
     "fit_region_surface",
     "polyline_length",
