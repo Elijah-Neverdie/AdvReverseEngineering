@@ -1729,6 +1729,46 @@ def split_loop_into_sides(
     return sides
 
 
+def split_polyline_at_significant_folds(
+    points: np.ndarray,
+    fold_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+) -> list[np.ndarray]:
+    """
+    仅在折线内部明显折角处断开；锯齿/小平折保留在同一段内。
+
+    避免把 Douglas-Peucker 的每个短边都当成独立着色段。
+    """
+    pts = _as_float_array(points)
+    if len(pts) < 3:
+        return [pts.copy()] if len(pts) >= 2 else []
+    threshold = float(max(fold_angle_deg, 1.0))
+    break_indices = [0]
+    for index in range(1, len(pts) - 1):
+        incoming = pts[index] - pts[index - 1]
+        outgoing = pts[index + 1] - pts[index]
+        in_len = float(np.linalg.norm(incoming))
+        out_len = float(np.linalg.norm(outgoing))
+        if in_len < 1e-12 or out_len < 1e-12:
+            continue
+        cos_angle = float(
+            np.clip(
+                np.dot(incoming, outgoing) / (in_len * out_len),
+                -1.0,
+                1.0,
+            )
+        )
+        turn = float(np.degrees(np.arccos(cos_angle)))
+        if turn >= threshold:
+            break_indices.append(index)
+    break_indices.append(len(pts) - 1)
+    segments: list[np.ndarray] = []
+    for start, end in zip(break_indices[:-1], break_indices[1:]):
+        if end <= start:
+            continue
+        segments.append(pts[start : end + 1].copy())
+    return segments if segments else [pts.copy()]
+
+
 def make_segment_color(seed: int) -> tuple[float, float, float, float]:
     """由种子生成饱和、互异感强的 RGBA（确定性随机）。"""
     rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
@@ -2097,15 +2137,12 @@ def extract_island_longest_sides(
                 polyline = _as_float_array(key_or_side).copy()
                 polyline[0] = side[0]
                 polyline[-1] = side[-1]
-                # 折线内部折角再拆成平滑直线段，每段独立着色
-                if len(polyline) >= 3:
-                    for seg_i in range(len(polyline) - 1):
-                        _append_polyline_segment(
-                            polyline[seg_i : seg_i + 2],
-                            side_index,
-                        )
-                else:
-                    _append_polyline_segment(polyline, side_index)
+                # 只在明显折角处再拆段；锯齿关键点留在同一段同色
+                for segment in split_polyline_at_significant_folds(
+                    polyline,
+                    fold_angle_deg=corner_angle_deg,
+                ):
+                    _append_polyline_segment(segment, side_index)
                 continue
 
             assert spans is not None

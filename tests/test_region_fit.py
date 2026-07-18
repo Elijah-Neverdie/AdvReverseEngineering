@@ -32,6 +32,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     sample_cubic_bezier,
     select_primary_boundary_loop,
     side_interior_max_turn_deg,
+    split_polyline_at_significant_folds,
 )
 
 
@@ -983,6 +984,28 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertEqual(arc_mode, "CURVE")
         self.assertIsNotNone(arc_spans)
         self.assertGreaterEqual(len(arc_spans), 1)
+
+    def test_split_polyline_keeps_sawtooth_as_one_segment(self) -> None:
+        """锯齿关键点不应拆成多段；只有大折角才断开。"""
+        # 近似共线锯齿 + 一个 90° 折角，折后继续竖直锯齿
+        pts = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.3, 0.01, 0.0],
+                [0.6, -0.01, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.01, 1.3, 0.0],
+                [0.99, 1.6, 0.0],
+                [1.0, 2.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        segments = split_polyline_at_significant_folds(pts, fold_angle_deg=35.0)
+        self.assertEqual(len(segments), 2)
+        np.testing.assert_allclose(segments[0][-1], pts[3])
+        np.testing.assert_allclose(segments[1][0], pts[3])
+        np.testing.assert_allclose(segments[1][-1], pts[-1])
 
     def test_detect_side_fold_indices_keeps_sharp_turns(self) -> None:
         pts = []
