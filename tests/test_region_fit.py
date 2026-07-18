@@ -1218,7 +1218,6 @@ class FitRegionSurfaceTests(unittest.TestCase):
 
     def test_harmonize_multi_island_cuts_and_merges(self) -> None:
         side_long = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64)
-        # close the island0 loop with dummy other sides far away
         island0 = [
             side_long,
             np.array([[2.0, 0.0, 0.0], [2.0, -1.0, 0.0]], dtype=np.float64),
@@ -1232,14 +1231,21 @@ class FitRegionSurfaceTests(unittest.TestCase):
             np.array([[2.0, 1.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64),
             np.array([[0.0, 1.0, 0.0], [0.0, 0.02, 0.0]], dtype=np.float64),
         ]
-        out = harmonize_multi_island_sides([island0, island1], proximity=0.05)
-        # island0 top edge should be split near x=1
-        top_sides = [s for s in out[0] if abs(float(s[0, 1])) < 0.05 and abs(float(s[-1, 1])) < 0.05]
+        out, suppress = harmonize_multi_island_sides(
+            [island0, island1],
+            proximity=0.05,
+        )
+        # island0 顶边被切开；岛1 的对边被抑制绘制
+        top_sides = [
+            s
+            for idx, s in enumerate(out[0])
+            if abs(float(s[0, 1])) < 0.05 and abs(float(s[-1, 1])) < 0.05
+        ]
         self.assertGreaterEqual(len(top_sides), 2)
-        # facing sides closer after midline merge (y near 0.01)
-        mid_ys = [float(np.mean(s[:, 1])) for s in top_sides]
-        for my in mid_ys:
-            self.assertLess(abs(my - 0.01), 0.015)
+        self.assertTrue(any(island == 1 for island, _side in suppress))
+        # 绘制边应为中线附近
+        for side in top_sides:
+            self.assertLess(abs(float(np.mean(side[:, 1])) - 0.01), 0.02)
 
 
 if __name__ == "__main__":

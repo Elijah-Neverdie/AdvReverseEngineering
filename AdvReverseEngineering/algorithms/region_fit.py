@@ -29,7 +29,11 @@ _MAX_SPLIT_CORNERS = 64
 # 相对闭环周长过短的碎段（常见于 T 接缝锯齿）并入邻边
 _MIN_SEGMENT_LOOP_FRAC = 0.025
 # 多岛：线/点邻近判定相对包围盒对角线的比例
-_MULTI_ISLAND_PROXIMITY_FRAC = 0.03
+_MULTI_ISLAND_PROXIMITY_FRAC = 0.05
+# 近平行判定：方向点积绝对值下限
+_MULTI_ISLAND_PARALLEL_DOT = 0.85
+# 投影重叠占较长段比例下限
+_MULTI_ISLAND_OVERLAP_FRAC = 0.15
 # 锯齿边界：隔 2/4/8/16 点取弦，多尺度共识判定真尖角
 _CORNER_SAMPLE_STRIDES = (2, 4, 8, 16)
 _CORNER_STRIDE_MIN_VOTES = 2
@@ -2224,16 +2228,37 @@ def average_parallel_polylines(
     samples: int = 16,
 ) -> np.ndarray:
     """将近平行对边融并为中线（自动对齐方向）。"""
-    a = _as_float_array(side_a)
-    b = _as_float_array(side_b)
-    dir_a = _side_unit_direction(a)
-    dir_b = _side_unit_direction(b)
-    if dir_a is not None and dir_b is not None and float(np.dot(dir_a, dir_b)) < 0.0:
-        b = b[::-1].copy()
+    return average_polyline_cluster([side_a, side_b], samples=samples)
+
+
+def average_polyline_cluster(
+    sides: Sequence[np.ndarray],
+    samples: int = 16,
+) -> np.ndarray:
+    """多条近平行折线融并为一条中线。"""
+    members = [_as_float_array(side) for side in sides if len(side) >= 2]
+    if not members:
+        raise RegionFitError("空边簇无法融并")
+    if len(members) == 1:
+        return members[0].copy()
+    lengths = [float(polyline_length(poly)) for poly in members]
+    ref = members[int(np.argmax(lengths))]
+    dir_ref = _side_unit_direction(ref)
     count = max(int(samples), 4)
-    ra = resample_polyline(a, count)
-    rb = resample_polyline(b, count)
-    return 0.5 * (ra + rb)
+    stacked = [resample_polyline(ref, count)]
+    for side in members:
+        if side is ref:
+            continue
+        work = side
+        dir_b = _side_unit_direction(work)
+        if (
+            dir_ref is not None
+            and dir_b is not None
+            and float(np.dot(dir_ref, dir_b)) < 0.0
+        ):
+            work = work[::-1].copy()
+        stacked.append(resample_polyline(work, count))
+    return np.mean(np.stack(stacked, axis=0), axis=0)
 
 
 def collect_side_endpoints(sides: Sequence[np.ndarray]) -> list[np.ndarray]:
@@ -2249,20 +2274,44 @@ def collect_side_endpoints(sides: Sequence[np.ndarray]) -> list[np.ndarray]:
     return points
 
 
+def _sides_merge_compatible(
+    side_a: np.ndarray,
+    side_b: np.ndarray,
+    proximity: float,
+    parallel_dot: float = _MULTI_ISLAND_PARALLEL_DOT,
+    overlap_frac: float = _MULTI_ISLAND_OVERLAP_FRAC,
+) -> bool:
+    dir_a = _side_unit_direction(side_a)
+    dir_b = _side_unit_direction(side_b)
+    if dir_a is None or dir_b is None:
+        return False
+    if abs(float(np.dot(dir_a, dir_b))) < float(parallel_dot):
+        return False
+    if not _segments_projective_overlap(
+        side_a,
+        side_b,
+        min_overlap_frac=overlap_frac,
+    ):
+        return False
+    return _symmetric_mean_polyline_distance(side_a, side_b) <= float(proximity)
+
+
 def harmonize_multi_island_sides(
     island_sides: Sequence[Sequence[np.ndarray]],
     proximity: float,
-) -> list[list[np.ndarray]]:
+) -> tuple[list[list[np.ndarray]], set[tuple[int, int]]]:
     """
-    多岛边界协调：靠近的点切开线，靠近的平行线融并为中线。
+    多岛边界协调：靠近的点切开线；近平行线聚类后每簇只保留一条代表边。
 
-    解决「一岛整段、对岛多段」的邻近边界不一致。
+    返回 (各岛边列表, 抑制绘制的 (island_index, side_index) 集合)。
+    次要岛上的重复对边不再画出来，避免多条平行色管叠在一起。
     """
     if len(island_sides) < 2:
-        return [
+        copied = [
             [np.asarray(side, dtype=np.float64).copy() for side in sides]
             for sides in island_sides
         ]
+        return copied, set()
 
     limit = float(max(proximity, 0.0))
     keypoints = [collect_side_endpoints(sides) for sides in island_sides]
@@ -2281,47 +2330,96 @@ def harmonize_multi_island_sides(
         )
         cut_sides.append(share_closed_side_endpoints(cut))
 
-    # 2) 跨岛近平行重叠边 → 融并成同一中线
+    # 2) 跨岛近平行边聚类（并查集）
+    flat: list[tuple[int, int, np.ndarray]] = []
+    for island_index, sides in enumerate(cut_sides):
+        for side_index, side in enumerate(sides):
+            flat.append((island_index, side_index, side))
+
+    parent = list(range(len(flat)))
+
+    def _find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for a in range(len(flat)):
+        ia, _sa, side_a = flat[a]
+        for b in range(a + 1, len(flat)):
+            ib, _sb, side_b = flat[b]
+            if ia == ib:
+                continue
+            if _sides_merge_compatible(side_a, side_b, limit):
+                _union(a, b)
+
+    clusters: dict[int, list[int]] = {}
+    for index in range(len(flat)):
+        root = _find(index)
+        clusters.setdefault(root, []).append(index)
+
     result: list[list[np.ndarray]] = [
         [side.copy() for side in sides] for sides in cut_sides
     ]
-    consumed: set[tuple[int, int]] = set()
-    for i in range(len(result)):
-        for si in range(len(result[i])):
-            if (i, si) in consumed:
-                continue
-            side_a = result[i][si]
-            dir_a = _side_unit_direction(side_a)
-            if dir_a is None:
-                continue
-            best: tuple[float, int, int] | None = None
-            for j in range(i + 1, len(result)):
-                for sj in range(len(result[j])):
-                    if (j, sj) in consumed:
-                        continue
-                    side_b = result[j][sj]
-                    dir_b = _side_unit_direction(side_b)
-                    if dir_b is None:
-                        continue
-                    if abs(float(np.dot(dir_a, dir_b))) < 0.9:
-                        continue
-                    if not _segments_projective_overlap(side_a, side_b):
-                        continue
-                    dist = _symmetric_mean_polyline_distance(side_a, side_b)
-                    if dist > limit:
-                        continue
-                    if best is None or dist < best[0]:
-                        best = (dist, j, sj)
-            if best is None:
-                continue
-            _dist, j, sj = best
-            midline = average_parallel_polylines(side_a, result[j][sj])
-            result[i][si] = midline
-            result[j][sj] = midline.copy()
-            consumed.add((i, si))
-            consumed.add((j, sj))
+    suppress: set[tuple[int, int]] = set()
 
-    return [share_closed_side_endpoints(sides) for sides in result]
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        polylines = [flat[index][2] for index in members]
+        lengths = [float(polyline_length(poly)) for poly in polylines]
+        primary_local = int(np.argmax(lengths))
+        primary_flat = members[primary_local]
+        midline = average_polyline_cluster(polylines)
+        pi, psi, _ = flat[primary_flat]
+        result[pi][psi] = midline
+        for local_index, flat_index in enumerate(members):
+            if local_index == primary_local:
+                continue
+            ji, jsi, _ = flat[flat_index]
+            # 保留拓扑端点，但不绘制，避免平行双线
+            result[ji][jsi] = result[ji][jsi].copy()
+            suppress.add((int(ji), int(jsi)))
+
+    # 3) 仅对仍绘制的边，再用「绘制边」端点做一次近点切开
+    draw_keypoints: list[list[np.ndarray]] = []
+    for island_index, sides in enumerate(result):
+        pts: list[np.ndarray] = []
+        for side_index, side in enumerate(sides):
+            if (island_index, side_index) in suppress:
+                continue
+            pts.extend(collect_side_endpoints([side]))
+        draw_keypoints.append(pts)
+
+    for island_index, sides in enumerate(result):
+        foreign = []
+        for other, points in enumerate(draw_keypoints):
+            if other != island_index:
+                foreign.extend(points)
+        if not foreign:
+            continue
+        kept_indices = [
+            side_index
+            for side_index in range(len(sides))
+            if (island_index, side_index) not in suppress
+        ]
+        if not kept_indices:
+            continue
+        kept_sides = [sides[side_index] for side_index in kept_indices]
+        recut = resplit_sides_near_points(kept_sides, foreign, max_dist=limit)
+        # recut 可能改变边数：写回时扩展/收缩该岛边列表较复杂；
+        # 仅当边数不变时替换，否则跳过二次切开。
+        if len(recut) == len(kept_sides):
+            for local, side_index in enumerate(kept_indices):
+                result[island_index][side_index] = recut[local]
+        result[island_index] = share_closed_side_endpoints(result[island_index])
+
+    return result, suppress
 
 
 def extract_island_longest_sides(
@@ -2506,12 +2604,17 @@ def extract_island_longest_sides(
         )
         extent = float(np.linalg.norm(all_pts.max(axis=0) - all_pts.min(axis=0)))
         proximity = max(extent * _MULTI_ISLAND_PROXIMITY_FRAC, 1e-4)
-        harmonized = harmonize_multi_island_sides(
+        harmonized, suppress = harmonize_multi_island_sides(
             [draft["sides_3d"] for draft in island_drafts],
             proximity=proximity,
         )
-        for draft, sides in zip(island_drafts, harmonized):
-            draft["sides_3d"] = sides
+        for draft_index, draft in enumerate(island_drafts):
+            draft["sides_3d"] = harmonized[draft_index]
+            draft["suppress_sides"] = {
+                int(side_index)
+                for island_index, side_index in suppress
+                if int(island_index) == draft_index
+            }
 
     islands: list[dict] = []
     wire_vertices: list[np.ndarray] = []
@@ -2651,6 +2754,8 @@ def extract_island_longest_sides(
             control_color_ids.append(color_id)
 
         for side_index, side in enumerate(sides_3d):
+            if side_index in draft.get("suppress_sides", set()):
+                continue
             side_2d = project_points_to_plane(side, origin, axis_u, axis_v)
             fit_mode, key_or_side, spans = classify_side_fit_mode(
                 side,
