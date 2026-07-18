@@ -1264,19 +1264,175 @@ def outer_contour_by_dissolving_facing_edges(
     return result
 
 
+def bridge_reentrant_corners_closed_loop(
+    points: np.ndarray,
+    angle_threshold_deg: float = _CONCAVE_FOLD_ANGLE_DEG,
+    max_span_frac: float = 0.22,
+    max_passes: int = 12,
+) -> np.ndarray:
+    """
+    缝合后外轮廓上的内阴角：用弦切除凹口，使相邻孤岛接缝成连续外缘。
+
+    仅处理逆时针环上的凹折（叉积为负）；弦长超过包围盒对角线比例则跳过，
+    避免把整条内弧裁掉。远岛弦线桥接不在此处理。
+    """
+    pts = _as_float_array(points).copy()
+    if len(pts) < 4:
+        return pts
+
+    origin, axis_u, axis_v = _loop_pca_basis(pts)
+    pts2 = project_points_to_plane(pts, origin, axis_u, axis_v)
+    if _signed_area_2d(pts2) < 0.0:
+        pts = pts[::-1].copy()
+        pts2 = pts2[::-1].copy()
+
+    extent = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+    max_span = max(extent * float(max_span_frac), 1e-6)
+    threshold = float(max(angle_threshold_deg, 1.0))
+
+    def _local_concave_turns() -> list[tuple[float, int]]:
+        """稀疏折线也能检出的局部凹折：(转角, 下标)。"""
+        count = len(pts2)
+        scored: list[tuple[float, int]] = []
+        for index in range(count):
+            prev_p = pts2[(index - 1) % count]
+            cur_p = pts2[index]
+            next_p = pts2[(index + 1) % count]
+            vin = cur_p - prev_p
+            vout = next_p - cur_p
+            in_len = float(np.linalg.norm(vin))
+            out_len = float(np.linalg.norm(vout))
+            if in_len < 1e-12 or out_len < 1e-12:
+                continue
+            cross = float(vin[0] * vout[1] - vin[1] * vout[0])
+            if cross >= 0.0:
+                continue
+            cos_angle = float(
+                np.clip(vin.dot(vout) / (in_len * out_len), -1.0, 1.0)
+            )
+            turn = float(np.degrees(np.arccos(cos_angle)))
+            if turn >= threshold:
+                scored.append((turn, index))
+        scored.sort(reverse=True)
+        return scored
+
+    for _ in range(int(max(max_passes, 1))):
+        scored = _local_concave_turns()
+        if not scored:
+            break
+        _best_turn, best_index = scored[0]
+        count = len(pts2)
+
+        # 向两侧扩展到转角变缓处
+        i0 = best_index
+        i1 = best_index
+        for _step in range(max(count // 8, 3)):
+            left = (i0 - 1) % count
+            right = (i1 + 1) % count
+            expanded = False
+            for candidate, toward_left in ((left, True), (right, False)):
+                prev_p = pts2[(candidate - 1) % count]
+                cur_p = pts2[candidate]
+                next_p = pts2[(candidate + 1) % count]
+                vin = cur_p - prev_p
+                vout = next_p - cur_p
+                in_len = float(np.linalg.norm(vin))
+                out_len = float(np.linalg.norm(vout))
+                if in_len < 1e-12 or out_len < 1e-12:
+                    continue
+                cross = float(vin[0] * vout[1] - vin[1] * vout[0])
+                if cross >= 0.0:
+                    continue
+                cos_angle = float(
+                    np.clip(vin.dot(vout) / (in_len * out_len), -1.0, 1.0)
+                )
+                turn = float(np.degrees(np.arccos(cos_angle)))
+                if turn >= threshold * 0.5:
+                    if toward_left:
+                        i0 = left
+                    else:
+                        i1 = right
+                    expanded = True
+            span = (i1 - i0) % count
+            if not expanded or span <= 1 or span >= count - 3:
+                break
+
+        # 锚点取凹折两侧邻点（肩部），切除中间尖底
+        a_idx = (best_index - 1) % count
+        b_idx = (best_index + 1) % count
+        # 若扩展后有更宽凹口，用扩展端点
+        span = (i1 - i0) % count
+        if span >= 2 and span < count - 2:
+            a_idx = i0
+            b_idx = i1
+
+        chord_len = float(np.linalg.norm(pts2[b_idx] - pts2[a_idx]))
+        if chord_len < 1e-9 or chord_len > max_span:
+            # 无法弦切：至少丢掉最尖点，避免死循环
+            keep = [i for i in range(count) if i != best_index]
+            if len(keep) < 4:
+                break
+            pts = pts[np.asarray(keep, dtype=np.int32)].copy()
+            pts2 = pts2[np.asarray(keep, dtype=np.int32)].copy()
+            continue
+
+        chain_idx = []
+        cursor = a_idx
+        for _ in range(count):
+            chain_idx.append(cursor)
+            if cursor == b_idx:
+                break
+            cursor = (cursor + 1) % count
+        if len(chain_idx) < 3:
+            break
+
+        chord = pts2[b_idx] - pts2[a_idx]
+        left_n = np.array([-chord[1], chord[0]], dtype=np.float64)
+        left_n /= max(float(np.linalg.norm(left_n)), 1e-12)
+        segment = pts2[np.asarray(chain_idx, dtype=np.int32)]
+        deviation = float(np.mean((segment - pts2[a_idx]) @ left_n))
+        if deviation <= chord_len * 0.008:
+            # 外凸：丢掉当前尖点再试其余
+            keep = [i for i in range(count) if i != best_index]
+            if len(keep) < 4:
+                break
+            pts = pts[np.asarray(keep, dtype=np.int32)].copy()
+            pts2 = pts2[np.asarray(keep, dtype=np.int32)].copy()
+            continue
+
+        drop_set = set(chain_idx[1:-1])
+        keep = [i for i in range(count) if i not in drop_set]
+        if len(keep) < 4:
+            break
+        pts = pts[np.asarray(keep, dtype=np.int32)].copy()
+        pts2 = pts2[np.asarray(keep, dtype=np.int32)].copy()
+
+    if _signed_area_2d(pts2) < 0.0:
+        pts = pts[::-1].copy()
+    return pts
+
+
 def _outer_contour_for_nearby_cluster(
     cluster_loops: Sequence[Sequence[int]],
     vertices: np.ndarray,
     max_gap: float,
+    allow_band_fallback: bool = False,
 ) -> np.ndarray | None:
     """
-    邻近簇外轮廓：先消对向内边；失败再条带外包络（仅限已判定邻近的簇）。
+    邻近簇外轮廓：消对向内边后切除内阴角。
+
+    allow_band_fallback=True 时（远岛桥接阶段）才允许条带外包络回退。
     """
     verts = _as_float_array(vertices)
     loops = [list(int(v) for v in loop) for loop in cluster_loops if len(loop) >= 3]
     if len(loops) < 2:
         return None
-    # 大簇先两两消边，降低一次全量配对失败概率
+
+    def _finalize(envelope: np.ndarray | None) -> np.ndarray | None:
+        if envelope is None or len(envelope) < 3:
+            return None
+        return bridge_reentrant_corners_closed_loop(_as_float_array(envelope))
+
     working: list[np.ndarray] = [
         verts[np.asarray(loop, dtype=np.int32)].copy() for loop in loops
     ]
@@ -1286,10 +1442,11 @@ def _outer_contour_for_nearby_cluster(
         verts,
         proximity=float(max_gap),
     )
-    if envelope is not None and len(envelope) >= 3:
-        return _as_float_array(envelope)
+    finalized = _finalize(envelope)
+    if finalized is not None:
+        return finalized
 
-    # 层级：反复融并间隙最小的一对（用点环临时拼进顶点缓冲）
+    # 层级：反复融并间隙最小的一对
     max_rounds = max(len(working) - 1, 0)
     for _ in range(max_rounds):
         if len(working) < 2:
@@ -1305,7 +1462,6 @@ def _outer_contour_for_nearby_cluster(
         if best_pair is None or best_gap > float(max_gap) * 1.25:
             break
         i, j = best_pair
-        # 将两点环追加到临时顶点表，再消对边
         base = len(verts)
         merged_verts = np.vstack((verts, working[i], working[j]))
         n_a = len(working[i])
@@ -1319,17 +1475,21 @@ def _outer_contour_for_nearby_cluster(
             merged_verts,
             proximity=float(max_gap),
         )
+        pair_env = _finalize(pair_env)
         if pair_env is None or len(pair_env) < 3:
             break
         working = [
             pts
             for index, pts in enumerate(working)
             if index not in best_pair
-        ] + [_as_float_array(pair_env).copy()]
+        ] + [pair_env.copy()]
         verts = merged_verts
 
     if len(working) == 1 and len(working[0]) >= 3:
-        return working[0]
+        return _finalize(working[0])
+
+    if not allow_band_fallback:
+        return None
 
     try:
         envelope, _, _ = combine_boundary_islands(
@@ -1339,9 +1499,7 @@ def _outer_contour_for_nearby_cluster(
         )
     except RegionFitError:
         return None
-    if envelope is None or len(envelope) < 3:
-        return None
-    return _as_float_array(envelope)
+    return _finalize(envelope)
 
 
 def merge_nearby_loops_to_outer_contours(
@@ -3126,11 +3284,12 @@ def build_fit_work_items(
             bridge_links.append(
                 (centroids[index].copy(), centroids[index + 1].copy())
             )
-        # 先按缝合间隙尝试消对边；失败再用桥接外包络
+        # 先按缝合间隙消对边并切除内阴角；失败再用桥接外包络
         envelope = _outer_contour_for_nearby_cluster(
             cluster_loops,
             verts,
             max_gap=stitch_gap,
+            allow_band_fallback=True,
         )
         if envelope is None or len(envelope) < 3:
             try:
@@ -4663,6 +4822,8 @@ __all__ = (
     "RegionFitResult",
     "analyze_region_fit_topology",
     "bridge_concave_notches",
+    "bridge_reentrant_corners_closed_loop",
+    "build_fit_work_items",
     "build_quad_patch",
     "build_triangular_patch",
     "classify_tri_or_quad",
@@ -4672,7 +4833,6 @@ __all__ = (
     "detect_corner_indices",
     "detect_concave_fold_indices",
     "extend_quad_corners_by_tangents",
-    "build_fit_work_items",
     "extract_island_longest_sides",
     "extract_region_boundary_loops",
     "build_edge_face_adjacency",

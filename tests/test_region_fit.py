@@ -1313,6 +1313,70 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertEqual(len(bridge), 1)
         self.assertEqual(int(bridge[0]["merged_from"]), 3)
         self.assertGreaterEqual(len(meta.get("bridge_links") or []), 1)
+
+    def test_stitch_bridges_reentrant_notch_to_continuous_rim(self) -> None:
+        """缝合后内阴角应被切除，外轮廓不再钻进 V 形凹口。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            bridge_reentrant_corners_closed_loop,
+            build_fit_work_items,
+        )
+
+        notched = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.5, 0.55, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [3.0, 2.0, 0.0],
+                [0.0, 2.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        cleaned = bridge_reentrant_corners_closed_loop(
+            notched, angle_threshold_deg=35.0
+        )
+        tip = cleaned[
+            (np.abs(cleaned[:, 0] - 1.5) < 0.08)
+            & (cleaned[:, 1] > 0.35)
+            & (cleaned[:, 1] < 0.7)
+        ]
+        self.assertEqual(len(tip), 0, msg="内阴角尖点应被切除")
+        self.assertAlmostEqual(float(cleaned[:, 1].min()), 0.0, places=5)
+
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.05, 0.0, 0.0],
+                [2.05, 0.0, 0.0],
+                [2.05, 1.0, 0.0],
+                [1.05, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        loops = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        items, _ = build_fit_work_items(
+            loops,
+            vertices,
+            stage="STITCH",
+            stitch_gap_frac=0.15,
+            bridge_gap_frac=0.15,
+            bridge_enabled=False,
+        )
+        self.assertEqual(len(items), 1)
+        envelope = items[0]["points"]
+        mid_interior = envelope[
+            (envelope[:, 0] > 0.98)
+            & (envelope[:, 0] < 1.07)
+            & (envelope[:, 1] > 0.05)
+            & (envelope[:, 1] < 0.95)
+        ]
+        self.assertEqual(len(mid_interior), 0)
+
+    def test_nearby_islands_merge_to_outer_contour(self) -> None:
         """间隙很小的两岛融并为外轮廓，岛间内边被消去。"""
         # 两矩形间距 0.05；extent≈2.7 → gap 阈值约 0.13，应融并
         vertices = np.array(
