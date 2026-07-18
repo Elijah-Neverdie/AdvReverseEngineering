@@ -823,6 +823,127 @@ def combine_boundary_islands(
     return envelope, band_sides, band_samples
 
 
+def approx_closed_polyline_gap(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+) -> float:
+    """两条闭环折线之间的近似最小间隙。"""
+    a = _as_float_array(points_a)
+    b = _as_float_array(points_b)
+    if len(a) < 3 or len(b) < 3:
+        return float("inf")
+    sa = resample_closed_polyline(a, int(np.clip(len(a), 16, 48)))
+    sb = resample_closed_polyline(b, int(np.clip(len(b), 16, 48)))
+    closed_a = np.vstack((sa, sa[:1]))
+    closed_b = np.vstack((sb, sb[:1]))
+    step_a = max(1, len(sa) // 24)
+    step_b = max(1, len(sb) // 24)
+    d_ab = min(
+        point_to_polyline_distance(point, closed_b) for point in sa[::step_a]
+    )
+    d_ba = min(
+        point_to_polyline_distance(point, closed_a) for point in sb[::step_b]
+    )
+    return float(min(d_ab, d_ba))
+
+
+def cluster_nearby_boundary_loops(
+    loops: Sequence[Sequence[int]],
+    vertices: np.ndarray,
+    max_gap: float,
+) -> list[list[int]]:
+    """按间隙把邻近边界环聚成簇（将融并为同一外轮廓）。"""
+    verts = _as_float_array(vertices)
+    count = len(loops)
+    if count == 0:
+        return []
+    if count == 1:
+        return [[0]]
+    samples = []
+    for loop in loops:
+        pts = verts[np.asarray(loop, dtype=np.int32)]
+        if len(pts) < 3:
+            samples.append(None)
+            continue
+        samples.append(resample_closed_polyline(pts, int(np.clip(len(pts), 16, 48))))
+
+    parent = list(range(count))
+
+    def _find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    gap_limit = float(max(max_gap, 0.0))
+    for i in range(count):
+        if samples[i] is None:
+            continue
+        for j in range(i + 1, count):
+            if samples[j] is None:
+                continue
+            if approx_closed_polyline_gap(samples[i], samples[j]) <= gap_limit:
+                _union(i, j)
+
+    clusters: dict[int, list[int]] = {}
+    for index in range(count):
+        if samples[index] is None:
+            continue
+        root = _find(index)
+        clusters.setdefault(root, []).append(index)
+    return [sorted(members) for members in clusters.values()]
+
+
+def merge_nearby_loops_to_outer_contours(
+    loops: Sequence[Sequence[int]],
+    vertices: np.ndarray,
+    max_gap: float,
+) -> list[dict]:
+    """
+    邻近孤岛融并为新孤岛，只保留外轮廓。
+
+    返回工作项列表，每项含:
+      - points: (N,3) 外轮廓点（不重复首点）
+      - loop_ids: 原始顶点环（单岛时有值；融并外轮廓为 None）
+      - merged_from: 融并前孤岛数
+    """
+    verts = _as_float_array(vertices)
+    if not loops:
+        return []
+    clusters = cluster_nearby_boundary_loops(loops, verts, max_gap=max_gap)
+    items: list[dict] = []
+    for cluster in clusters:
+        cluster_loops = [list(int(v) for v in loops[index]) for index in cluster]
+        if len(cluster_loops) == 1:
+            ids = cluster_loops[0]
+            items.append(
+                {
+                    "points": verts[np.asarray(ids, dtype=np.int32)].copy(),
+                    "loop_ids": ids,
+                    "merged_from": 1,
+                }
+            )
+            continue
+        envelope, _band_sides, _samples = combine_boundary_islands(
+            cluster_loops,
+            verts,
+        )
+        # 外轮廓即新孤岛；岛间内边在包络过程中已被消去
+        items.append(
+            {
+                "points": _as_float_array(envelope).copy(),
+                "loop_ids": None,
+                "merged_from": int(len(cluster_loops)),
+            }
+        )
+    return items
+
+
 def _label_face_components(
     face_indices: np.ndarray,
     adjacency_offsets: np.ndarray,
@@ -2437,7 +2558,7 @@ def extract_island_longest_sides(
     对领域内每个 island 边界环按折角拆成段并拟合。
 
     不按长短合并到固定边数；只在明显折角处断开。
-    多岛时：靠近的点切开线，靠近的平行线融并为中线。
+    多岛时：邻近孤岛先融并为外轮廓新孤岛（消去岛间内边），再对轮廓拆分拟合。
     每条平滑折线段或曲线段分配独立随机颜色（segment_colors）。
     max_sides 保留兼容，调试拆分不再使用它压边数。
     """
@@ -2459,27 +2580,55 @@ def extract_island_longest_sides(
     loops = filter_significant_boundary_loops(loops, verts)
     if not loops:
         raise RegionFitError("过滤极小碎环后无可用边界")
+
+    # 邻近孤岛融并为外轮廓新孤岛（去掉岛间内边）
+    all_loop_pts = [
+        verts[np.asarray(loop, dtype=np.int32)]
+        for loop in loops
+        if len(loop) >= 3
+    ]
+    if all_loop_pts:
+        stacked_loops = np.vstack(all_loop_pts)
+        extent0 = float(
+            np.linalg.norm(stacked_loops.max(axis=0) - stacked_loops.min(axis=0))
+        )
+        merge_gap = max(extent0 * _MULTI_ISLAND_PROXIMITY_FRAC, 1e-4)
+    else:
+        merge_gap = 1e-4
+    work_items = merge_nearby_loops_to_outer_contours(
+        loops,
+        verts,
+        max_gap=merge_gap,
+    )
+    if not work_items:
+        raise RegionFitError("过滤极小碎环后无可用边界")
+
     sample_n = max(int(bezier_samples), 4)
     island_drafts: list[dict] = []
 
-    for island_index, loop in enumerate(loops):
-        loop_ids = [int(v) for v in loop]
-        loop_pts = verts[np.asarray(loop_ids, dtype=np.int32)]
+    for island_index, item in enumerate(work_items):
+        loop_pts = _as_float_array(item["points"])
+        loop_ids = item.get("loop_ids")
         if len(loop_pts) < 3:
             continue
         origin, axis_u, axis_v = _loop_pca_basis(loop_pts)
         pts_2d_raw = project_points_to_plane(loop_pts, origin, axis_u, axis_v)
         if _signed_area_2d(pts_2d_raw) < 0.0:
-            loop_ids = list(reversed(loop_ids))
             loop_pts = loop_pts[::-1]
+            if loop_ids is not None:
+                loop_ids = list(reversed(loop_ids))
 
-        neighbor_ids = boundary_loop_neighbor_ids(
-            loop_ids,
-            region_ids,
-            edge_faces,
-            target_id,
-        )
-        neighbor_vertices = neighbor_change_vertex_indices(neighbor_ids)
+        # 仅原始网格环可做邻域 T 接缝切点；融并外轮廓只靠几何折角
+        if loop_ids is not None:
+            neighbor_ids = boundary_loop_neighbor_ids(
+                loop_ids,
+                region_ids,
+                edge_faces,
+                target_id,
+            )
+            neighbor_vertices = neighbor_change_vertex_indices(neighbor_ids)
+        else:
+            neighbor_vertices = []
 
         sample_count = int(
             np.clip(
@@ -2502,10 +2651,14 @@ def extract_island_longest_sides(
             fold_angle_deg=corner_angle_deg,
             max_folds=_MAX_CONCAVE_FOLDS,
         )
-        neighbor_splits = map_loop_indices_to_resampled(
-            loop_pts,
-            neighbor_vertices,
-            sample_count,
+        neighbor_splits = (
+            map_loop_indices_to_resampled(
+                loop_pts,
+                neighbor_vertices,
+                sample_count,
+            )
+            if neighbor_vertices
+            else []
         )
         split_indices = sorted(
             set(corners) | set(fold_indices) | set(neighbor_splits)
@@ -2592,29 +2745,12 @@ def extract_island_longest_sides(
                 "axis_v": axis_v,
                 "split_count": int(len(ordered_splits)),
                 "island_folds": island_folds,
+                "merged_from": int(item.get("merged_from", 1)),
             }
         )
 
     if not island_drafts:
         raise RegionFitError("未提取到任何 island 边界边")
-
-    if len(island_drafts) >= 2:
-        all_pts = np.vstack(
-            [np.vstack(draft["sides_3d"]) for draft in island_drafts]
-        )
-        extent = float(np.linalg.norm(all_pts.max(axis=0) - all_pts.min(axis=0)))
-        proximity = max(extent * _MULTI_ISLAND_PROXIMITY_FRAC, 1e-4)
-        harmonized, suppress = harmonize_multi_island_sides(
-            [draft["sides_3d"] for draft in island_drafts],
-            proximity=proximity,
-        )
-        for draft_index, draft in enumerate(island_drafts):
-            draft["sides_3d"] = harmonized[draft_index]
-            draft["suppress_sides"] = {
-                int(side_index)
-                for island_index, side_index in suppress
-                if int(island_index) == draft_index
-            }
 
     islands: list[dict] = []
     wire_vertices: list[np.ndarray] = []
@@ -2785,6 +2921,7 @@ def extract_island_longest_sides(
                 "beziers": beziers,
                 "concave_fold_count": int(len(island_folds)),
                 "concave_fold_points": island_folds,
+                "merged_from": int(draft.get("merged_from", 1)),
             }
         )
 
@@ -3856,6 +3993,8 @@ __all__ = (
     "fit_cubic_bezier_controls",
     "fit_region_surface",
     "merge_collinear_adjacent_sides",
+    "merge_nearby_loops_to_outer_contours",
+    "cluster_nearby_boundary_loops",
     "point_to_polyline_distance",
     "sample_cubic_bezier",
     "polyline_length",

@@ -21,8 +21,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     detect_corner_indices,
     detect_side_fold_indices,
     extract_island_longest_sides,
-    harmonize_multi_island_sides,
-    average_parallel_polylines,
+    merge_nearby_loops_to_outer_contours,
     extract_polyline_keypoints,
     extract_region_boundary_loops,
     filter_handle_outliers,
@@ -1216,36 +1215,63 @@ class FitRegionSurfaceTests(unittest.TestCase):
                 nxt = island["sides"][(index + 1) % 4]
                 np.testing.assert_allclose(side[-1], nxt[0], atol=1e-9)
 
-    def test_harmonize_multi_island_cuts_and_merges(self) -> None:
-        side_long = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64)
-        island0 = [
-            side_long,
-            np.array([[2.0, 0.0, 0.0], [2.0, -1.0, 0.0]], dtype=np.float64),
-            np.array([[2.0, -1.0, 0.0], [0.0, -1.0, 0.0]], dtype=np.float64),
-            np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float64),
-        ]
-        island1 = [
-            np.array([[0.0, 0.02, 0.0], [1.0, 0.02, 0.0]], dtype=np.float64),
-            np.array([[1.0, 0.02, 0.0], [2.0, 0.02, 0.0]], dtype=np.float64),
-            np.array([[2.0, 0.02, 0.0], [2.0, 1.0, 0.0]], dtype=np.float64),
-            np.array([[2.0, 1.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64),
-            np.array([[0.0, 1.0, 0.0], [0.0, 0.02, 0.0]], dtype=np.float64),
-        ]
-        out, suppress = harmonize_multi_island_sides(
-            [island0, island1],
-            proximity=0.05,
+    def test_nearby_islands_merge_to_outer_contour(self) -> None:
+        """间隙很小的两岛融并为外轮廓，岛间内边被消去。"""
+        # 两矩形间距 0.05；extent≈2.7 → gap 阈值约 0.13，应融并
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.05, 0.0, 0.0],
+                [2.05, 0.0, 0.0],
+                [2.05, 1.0, 0.0],
+                [1.05, 1.0, 0.0],
+            ],
+            dtype=np.float64,
         )
-        # island0 顶边被切开；岛1 的对边被抑制绘制
-        top_sides = [
-            s
-            for idx, s in enumerate(out[0])
-            if abs(float(s[0, 1])) < 0.05 and abs(float(s[-1, 1])) < 0.05
+        loops = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        items = merge_nearby_loops_to_outer_contours(
+            loops,
+            vertices,
+            max_gap=0.2,
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(int(items[0]["merged_from"]), 2)
+        self.assertIsNone(items[0]["loop_ids"])
+        envelope = items[0]["points"]
+        self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(envelope[:, 0].max()), 2.05, places=5)
+        self.assertAlmostEqual(float(envelope[:, 1].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(envelope[:, 1].max()), 1.0, places=5)
+        # 岛间竖缝处不应留下贯穿高度的内边点（只允许上下外轮廓）
+        mid_interior = envelope[
+            (envelope[:, 0] > 0.98)
+            & (envelope[:, 0] < 1.07)
+            & (envelope[:, 1] > 0.05)
+            & (envelope[:, 1] < 0.95)
         ]
-        self.assertGreaterEqual(len(top_sides), 2)
-        self.assertTrue(any(island == 1 for island, _side in suppress))
-        # 绘制边应为中线附近
-        for side in top_sides:
-            self.assertLess(abs(float(np.mean(side[:, 1])) - 0.01), 0.02)
+        self.assertEqual(len(mid_interior), 0)
+
+    def test_far_islands_stay_separate_after_merge_pass(self) -> None:
+        """间距较大的两岛保持各自独立。"""
+        mesh = _disconnected_same_region_strip()
+        loops = extract_region_boundary_loops(
+            mesh["region_ids"],
+            0,
+            mesh["loop_start"],
+            mesh["loop_total"],
+            mesh["loop_vertex_indices"],
+        )
+        items = merge_nearby_loops_to_outer_contours(
+            loops,
+            mesh["vertices"],
+            max_gap=0.15,
+        )
+        self.assertEqual(len(items), 2)
+        self.assertTrue(all(item["merged_from"] == 1 for item in items))
+        self.assertTrue(all(item["loop_ids"] is not None for item in items))
 
 
 if __name__ == "__main__":
