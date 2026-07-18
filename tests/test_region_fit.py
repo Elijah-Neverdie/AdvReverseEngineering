@@ -24,6 +24,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     resample_polyline,
     sample_cubic_bezier,
     select_primary_boundary_loop,
+    side_interior_max_turn_deg,
 )
 
 
@@ -349,6 +350,61 @@ class TopologyClassificationTests(unittest.TestCase):
         )
         corners = detect_corner_indices(pts, angle_threshold_deg=20.0)
         self.assertEqual(len(corners), 4)
+
+    def test_l_shape_corner_not_merged_into_one_side(self) -> None:
+        """
+        L 形闭环：尖角若漏检会把竖边+横边并成伪最长边。
+        多取角点后取最长独立边时，任一边内部转角应远小于 90°。
+        """
+        # CCW L 形（外轮廓 6 角）：
+        # (0,0)-(3,0)-(3,1)-(1,1)-(1,2)-(0,2)
+        corners_xy = np.array(
+            [
+                [0.0, 0.0],
+                [3.0, 0.0],
+                [3.0, 1.0],
+                [1.0, 1.0],
+                [1.0, 2.0],
+                [0.0, 2.0],
+            ],
+            dtype=np.float64,
+        )
+        dense: list[np.ndarray] = []
+        for index in range(len(corners_xy)):
+            a = corners_xy[index]
+            b = corners_xy[(index + 1) % len(corners_xy)]
+            for t in np.linspace(0.0, 1.0, 20, endpoint=False):
+                dense.append(a * (1.0 - t) + b * t)
+        pts = np.asarray(dense, dtype=np.float64)
+
+        found = detect_corner_indices(
+            pts,
+            angle_threshold_deg=35.0,
+            max_corners=12,
+            include_strong_concave=True,
+        )
+        self.assertGreaterEqual(len(found), 5)
+
+        from AdvReverseEngineering.algorithms.region_fit import (
+            split_loop_into_sides,
+        )
+
+        sides = split_loop_into_sides(pts, found)
+        ranked = sorted(
+            range(len(sides)),
+            key=lambda i: polyline_length(sides[i]),
+            reverse=True,
+        )[:4]
+        longest = [sides[i] for i in sorted(ranked)]
+        self.assertEqual(len(longest), 4)
+        for side in longest:
+            self.assertLess(side_interior_max_turn_deg(side), 45.0)
+        # 最长边应是底边长度约 3，而不是竖+横折线
+        self.assertAlmostEqual(
+            max(polyline_length(side) for side in longest),
+            3.0,
+            places=1,
+        )
 
     def test_triangle_ratio_classification(self) -> None:
         long_a = np.array([[0.0, 0.0], [0.0, 2.0]], dtype=np.float64)

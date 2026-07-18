@@ -21,6 +21,9 @@ MAX_SEGMENTS = 64
 # 边界闭环重采样数量范围：角点检测在均匀弧长采样上进行
 _BOUNDARY_SAMPLES_MIN = 96
 _BOUNDARY_SAMPLES_MAX = 384
+# 先多取角点候选，再按最短边合并到三/四边，避免尖角被 NMS 挤掉后并成长边
+_MAX_CORNER_CANDIDATES = 12
+_STRONG_CONCAVE_ANGLE_DEG = 55.0
 
 
 class RegionFitError(ValueError):
@@ -993,44 +996,73 @@ def detect_corner_indices(
     max_corners: int = 4,
     min_separation_frac: float = 0.025,
     convex_only: bool = True,
+    include_strong_concave: bool = True,
 ) -> list[int]:
     """
     在均匀采样的闭环折线上按窗口化转角检测角点。
 
-    使用 ±window 采样点的弦向量计算转角，抑制扫描噪声；
-    按转角强度做非极大值抑制，最多保留 max_corners 个凸角点。
-    要求闭环为逆时针方向（convex_only 依赖叉积符号）。
+    使用多尺度 ±window 弦向量取最大转角，避免单一大窗口抹掉尖角；
+    按转角强度做非极大值抑制。默认优先凸角，但保留足够锐的凹角，
+    以免凹口尖角漏检后把折线并成一条伪最长边。
+    要求闭环为逆时针方向（凸/凹判定依赖叉积符号）。
     """
     pts = _as_float_array(points_2d)
     count = len(pts)
     if count < 3:
         return []
-    w = int(window) if window else max(1, count // 32)
-    w = min(w, max((count - 1) // 2, 1))
 
+    if window is not None:
+        window_list = [max(1, min(int(window), max((count - 1) // 2, 1)))]
+    else:
+        base = max(1, count // 32)
+        window_list = sorted(
+            {
+                max(1, base),
+                max(1, base // 2),
+                max(1, base // 4),
+                1,
+            }
+        )
+        window_list = [
+            min(w, max((count - 1) // 2, 1)) for w in window_list
+        ]
+
+    angles = np.zeros(count, dtype=np.float64)
+    cross = np.zeros(count, dtype=np.float64)
     indices = np.arange(count)
-    prev_pts = pts[(indices - w) % count]
-    next_pts = pts[(indices + w) % count]
-    incoming = pts - prev_pts
-    outgoing = next_pts - pts
-    in_len = np.linalg.norm(incoming, axis=1)
-    out_len = np.linalg.norm(outgoing, axis=1)
-    valid = (in_len > 1e-12) & (out_len > 1e-12)
+    for w in window_list:
+        prev_pts = pts[(indices - w) % count]
+        next_pts = pts[(indices + w) % count]
+        incoming = pts - prev_pts
+        outgoing = next_pts - pts
+        in_len = np.linalg.norm(incoming, axis=1)
+        out_len = np.linalg.norm(outgoing, axis=1)
+        valid = (in_len > 1e-12) & (out_len > 1e-12)
+        cos_angle = np.zeros(count, dtype=np.float64)
+        cos_angle[valid] = np.clip(
+            np.einsum("ij,ij->i", incoming[valid], outgoing[valid])
+            / (in_len[valid] * out_len[valid]),
+            -1.0,
+            1.0,
+        )
+        angles_w = np.degrees(np.arccos(cos_angle))
+        angles_w[~valid] = 0.0
+        cross_w = (
+            incoming[:, 0] * outgoing[:, 1] - incoming[:, 1] * outgoing[:, 0]
+        )
+        better = angles_w > angles
+        angles = np.where(better, angles_w, angles)
+        cross = np.where(better, cross_w, cross)
 
-    cos_angle = np.zeros(count, dtype=np.float64)
-    cos_angle[valid] = np.clip(
-        np.einsum("ij,ij->i", incoming[valid], outgoing[valid])
-        / (in_len[valid] * out_len[valid]),
-        -1.0,
-        1.0,
-    )
-    angles = np.degrees(np.arccos(cos_angle))
-    angles[~valid] = 0.0
-    cross = incoming[:, 0] * outgoing[:, 1] - incoming[:, 1] * outgoing[:, 0]
-
-    candidates = angles >= float(max(angle_threshold_deg, 1.0))
+    threshold = float(max(angle_threshold_deg, 1.0))
+    candidates = angles >= threshold
     if convex_only:
-        candidates &= cross > 0.0
+        keep = cross > 0.0
+        if include_strong_concave:
+            keep |= (cross < 0.0) & (
+                angles >= float(max(threshold, _STRONG_CONCAVE_ANGLE_DEG))
+            )
+        candidates &= keep
     candidate_idx = np.flatnonzero(candidates)
     if len(candidate_idx) == 0:
         return []
@@ -1050,6 +1082,30 @@ def detect_corner_indices(
         if len(kept) >= int(max_corners):
             break
     return sorted(kept)
+
+
+def side_interior_max_turn_deg(points: np.ndarray) -> float:
+    """边链内部（不含端点）的最大转角，用于发现被误并的尖角。"""
+    pts = _as_float_array(points)
+    if len(pts) < 3:
+        return 0.0
+    max_turn = 0.0
+    for index in range(1, len(pts) - 1):
+        incoming = pts[index] - pts[index - 1]
+        outgoing = pts[index + 1] - pts[index]
+        in_len = float(np.linalg.norm(incoming))
+        out_len = float(np.linalg.norm(outgoing))
+        if in_len < 1e-12 or out_len < 1e-12:
+            continue
+        cos_angle = float(
+            np.clip(
+                np.dot(incoming, outgoing) / (in_len * out_len),
+                -1.0,
+                1.0,
+            )
+        )
+        max_turn = max(max_turn, float(np.degrees(np.arccos(cos_angle))))
+    return max_turn
 
 
 def _side_from_loop(
@@ -1203,16 +1259,24 @@ def extract_island_longest_sides(
         corners = detect_corner_indices(
             pts_2d,
             corner_angle_deg,
-            max_corners=max(keep_sides, 4),
+            max_corners=_MAX_CORNER_CANDIDATES,
+            include_strong_concave=True,
         )
         if len(corners) < 3:
             quarter = max(sample_count // 4, 1)
             corners = [0, quarter, 2 * quarter, 3 * quarter]
 
         sides_3d = split_loop_into_sides(loop_rs, corners)
-        # 合并最短边直到 ≤ keep_sides，保留环向次序以便对边同色
+        # 取最长的 keep_sides 条独立边（不合并），避免尖角被并进伪最长边
         if len(sides_3d) > keep_sides:
-            sides_3d = reduce_sides_to_count(sides_3d, keep_sides)
+            ranked = sorted(
+                range(len(sides_3d)),
+                key=lambda i: polyline_length(sides_3d[i]),
+                reverse=True,
+            )[:keep_sides]
+            # 按环向顺序排列，便于邻边异色 / 对边同色
+            ordered = sorted(ranked)
+            sides_3d = [sides_3d[i] for i in ordered]
 
         beziers: list[dict] = []
         sides_sampled: list[np.ndarray] = []
@@ -1280,30 +1344,85 @@ def extract_island_longest_sides(
     }
 
 
+def _junction_turn_deg(side_a: np.ndarray, side_b: np.ndarray) -> float:
+    """两条邻接边在共享角点处的转角（度）。"""
+    a = _as_float_array(side_a)
+    b = _as_float_array(side_b)
+    if len(a) < 2 or len(b) < 2:
+        return 0.0
+    incoming = a[-1] - a[-2]
+    outgoing = b[1] - b[0]
+    in_len = float(np.linalg.norm(incoming))
+    out_len = float(np.linalg.norm(outgoing))
+    if in_len < 1e-12 or out_len < 1e-12:
+        return 0.0
+    cos_angle = float(
+        np.clip(np.dot(incoming, outgoing) / (in_len * out_len), -1.0, 1.0)
+    )
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
 def reduce_sides_to_count(
     sides: Sequence[np.ndarray],
     target_count: int,
 ) -> list[np.ndarray]:
-    """通过合并最短边，将边数降到 target_count。"""
+    """
+    将边数降到 target_count。
+
+    优先合并转角最平缓的邻接边对，保留尖角，避免把直角拐弯并进伪最长边。
+    """
     result = [np.asarray(side, dtype=np.float64).copy() for side in sides]
     target = max(int(target_count), 3)
     while len(result) > target:
-        lengths = [polyline_length(side) for side in result]
-        short_index = int(np.argmin(lengths))
-        left = (short_index - 1) % len(result)
-        right = (short_index + 1) % len(result)
-        # 把最短边并入较长的邻边
-        left_len = lengths[left]
-        right_len = lengths[right]
-        if left_len >= right_len:
-            merged = np.vstack((result[left][:-1], result[short_index]))
-            result[left] = merged
-            del result[short_index]
+        turns = [
+            _junction_turn_deg(result[i], result[(i + 1) % len(result)])
+            for i in range(len(result))
+        ]
+        merge_left = int(np.argmin(turns))
+        merge_right = (merge_left + 1) % len(result)
+        merged = np.vstack((result[merge_left][:-1], result[merge_right]))
+        if merge_right > merge_left:
+            result[merge_left] = merged
+            del result[merge_right]
         else:
-            merged = np.vstack((result[short_index][:-1], result[right]))
-            result[short_index] = merged
-            del result[right]
+            # 环尾与环首相接：merged 替换两侧后只留一条
+            result = [merged] + result[1:merge_left]
     return result
+
+
+def reduce_paired_sides_to_count(
+    sides_2d: Sequence[np.ndarray],
+    sides_3d: Sequence[np.ndarray],
+    target_count: int,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """按 3D 邻接转角同步合并 2D/3D 边，降到 target_count。"""
+    result_2d = [np.asarray(side, dtype=np.float64).copy() for side in sides_2d]
+    result_3d = [np.asarray(side, dtype=np.float64).copy() for side in sides_3d]
+    if len(result_2d) != len(result_3d):
+        raise RegionFitError("2D/3D 边数不一致，无法同步合并")
+    target = max(int(target_count), 3)
+    while len(result_3d) > target:
+        turns = [
+            _junction_turn_deg(result_3d[i], result_3d[(i + 1) % len(result_3d)])
+            for i in range(len(result_3d))
+        ]
+        merge_left = int(np.argmin(turns))
+        merge_right = (merge_left + 1) % len(result_3d)
+        merged_2d = np.vstack(
+            (result_2d[merge_left][:-1], result_2d[merge_right])
+        )
+        merged_3d = np.vstack(
+            (result_3d[merge_left][:-1], result_3d[merge_right])
+        )
+        if merge_right > merge_left:
+            result_2d[merge_left] = merged_2d
+            result_3d[merge_left] = merged_3d
+            del result_2d[merge_right]
+            del result_3d[merge_right]
+        else:
+            result_2d = [merged_2d] + result_2d[1:merge_left]
+            result_3d = [merged_3d] + result_3d[1:merge_left]
+    return result_2d, result_3d
 
 
 def classify_tri_or_quad(
@@ -1966,7 +2085,8 @@ def analyze_region_fit_topology(
         corners = detect_corner_indices(
             pts_2d,
             corner_angle_deg,
-            max_corners=4,
+            max_corners=_MAX_CORNER_CANDIDATES,
+            include_strong_concave=True,
         )
         if len(corners) < 3:
             # 无明显角点（近圆/椭圆域）：按弧长均匀取 4 个角点
@@ -1980,6 +2100,12 @@ def analyze_region_fit_topology(
             sides_3d,
             corner_angle_deg,
         )
+        if len(sides_3d) > 4:
+            sides_2d, sides_3d = reduce_paired_sides_to_count(
+                sides_2d,
+                sides_3d,
+                4,
+            )
         if len(sides_3d) == 4:
             sides_2d, sides_3d = extend_quad_corners_by_tangents(
                 sides_2d,
@@ -2111,5 +2237,6 @@ __all__ = (
     "resample_closed_polyline",
     "resample_polyline",
     "select_primary_boundary_loop",
+    "side_interior_max_turn_deg",
     "soft_snap_quad_grid_to_points",
 )
