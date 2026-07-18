@@ -21,6 +21,8 @@ from AdvReverseEngineering.algorithms.region_fit import (
     detect_corner_indices,
     detect_side_fold_indices,
     extract_island_longest_sides,
+    harmonize_multi_island_sides,
+    average_parallel_polylines,
     extract_polyline_keypoints,
     extract_region_boundary_loops,
     filter_handle_outliers,
@@ -1213,6 +1215,31 @@ class FitRegionSurfaceTests(unittest.TestCase):
             for index, side in enumerate(island["sides"]):
                 nxt = island["sides"][(index + 1) % 4]
                 np.testing.assert_allclose(side[-1], nxt[0], atol=1e-9)
+
+    def test_harmonize_multi_island_cuts_and_merges(self) -> None:
+        side_long = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64)
+        # close the island0 loop with dummy other sides far away
+        island0 = [
+            side_long,
+            np.array([[2.0, 0.0, 0.0], [2.0, -1.0, 0.0]], dtype=np.float64),
+            np.array([[2.0, -1.0, 0.0], [0.0, -1.0, 0.0]], dtype=np.float64),
+            np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float64),
+        ]
+        island1 = [
+            np.array([[0.0, 0.02, 0.0], [1.0, 0.02, 0.0]], dtype=np.float64),
+            np.array([[1.0, 0.02, 0.0], [2.0, 0.02, 0.0]], dtype=np.float64),
+            np.array([[2.0, 0.02, 0.0], [2.0, 1.0, 0.0]], dtype=np.float64),
+            np.array([[2.0, 1.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64),
+            np.array([[0.0, 1.0, 0.0], [0.0, 0.02, 0.0]], dtype=np.float64),
+        ]
+        out = harmonize_multi_island_sides([island0, island1], proximity=0.05)
+        # island0 top edge should be split near x=1
+        top_sides = [s for s in out[0] if abs(float(s[0, 1])) < 0.05 and abs(float(s[-1, 1])) < 0.05]
+        self.assertGreaterEqual(len(top_sides), 2)
+        # facing sides closer after midline merge (y near 0.01)
+        mid_ys = [float(np.mean(s[:, 1])) for s in top_sides]
+        for my in mid_ys:
+            self.assertLess(abs(my - 0.01), 0.015)
 
 
 if __name__ == "__main__":
