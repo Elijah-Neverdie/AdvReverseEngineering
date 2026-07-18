@@ -24,6 +24,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     loop_has_internal_corridor,
     merge_nearby_loops_to_outer_contours,
     outer_contour_from_boundary_loops,
+    outer_contour_by_dissolving_facing_edges,
     extract_polyline_keypoints,
     extract_region_boundary_loops,
     filter_handle_outliers,
@@ -1198,7 +1199,7 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertAlmostEqual(float(sampled[-1, 0]), 3.0, places=6)
 
     def test_extract_disconnected_islands_longest_sides(self) -> None:
-        """同一领域多岛调试边应融成一条外轮廓，不再各画一套内边。"""
+        """间距较大的同领域孤岛应分岛处理，禁止弦线桥接。"""
         mesh = _disconnected_same_region_strip()
         debug = extract_island_longest_sides(
             region_ids=mesh["region_ids"],
@@ -1208,23 +1209,12 @@ class FitRegionSurfaceTests(unittest.TestCase):
             loop_total=mesh["loop_total"],
             loop_vertex_indices=mesh["loop_vertex_indices"],
         )
-        self.assertEqual(debug["island_count"], 1)
-        self.assertEqual(int(debug["islands"][0]["merged_from"]), 2)
-        island = debug["islands"][0]
-        self.assertGreaterEqual(len(island["sides"]), 2)
-        color_ids = [int(b["color_id"]) for b in island["beziers"]]
-        self.assertEqual(len(color_ids), len(set(color_ids)))
-        # 外轮廓应盖住两岛整体包围盒，中缝不应再出现贯穿内边
-        all_pts = np.vstack(island["sides"])
-        self.assertAlmostEqual(float(all_pts[:, 0].min()), 0.0, places=5)
-        self.assertAlmostEqual(float(all_pts[:, 0].max()), 2.5, places=5)
-        mid_interior = all_pts[
-            (all_pts[:, 0] > 0.95)
-            & (all_pts[:, 0] < 1.55)
-            & (all_pts[:, 1] > 0.1)
-            & (all_pts[:, 1] < 0.9)
-        ]
-        self.assertEqual(len(mid_interior), 0)
+        self.assertEqual(debug["island_count"], 2)
+        for island in debug["islands"]:
+            self.assertEqual(int(island["merged_from"]), 1)
+            self.assertGreaterEqual(len(island["sides"]), 2)
+            color_ids = [int(b["color_id"]) for b in island["beziers"]]
+            self.assertEqual(len(color_ids), len(set(color_ids)))
 
     def test_nearby_islands_merge_to_outer_contour(self) -> None:
         """间隙很小的两岛融并为外轮廓，岛间内边被消去。"""
@@ -1284,44 +1274,39 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertTrue(all(item["merged_from"] == 1 for item in items))
         self.assertTrue(all(item["loop_ids"] is not None for item in items))
 
-    def test_prefer_outer_envelope_keeps_full_bbox(self) -> None:
-        """栅格外轮廓覆盖全部 island，不留下岛间内边。"""
+    def test_dissolve_facing_edges_keeps_surface_vertices(self) -> None:
+        """消对向内边后外轮廓仍用原始 3D 顶点，不造投影弦线。"""
         vertices = np.array(
             [
                 [0.0, 0.0, 0.0],
-                [2.0, 0.0, 0.0],
-                [2.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
                 [0.0, 1.0, 0.0],
-                [2.05, 0.2, 0.0],
-                [2.4, 0.2, 0.0],
-                [2.4, 0.8, 0.0],
-                [2.05, 0.8, 0.0],
+                [1.05, 0.0, 0.0],
+                [2.05, 0.0, 0.0],
+                [2.05, 1.0, 0.0],
+                [1.05, 1.0, 0.0],
             ],
             dtype=np.float64,
         )
         loops = [[0, 1, 2, 3], [4, 5, 6, 7]]
-        envelope = outer_contour_from_boundary_loops(loops, vertices)
-        self.assertAlmostEqual(float(envelope[:, 0].max()), 2.4, places=5)
-        self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=5)
+        envelope = outer_contour_by_dissolving_facing_edges(
+            loops,
+            vertices,
+            proximity=0.2,
+        )
+        self.assertIsNotNone(envelope)
+        assert envelope is not None
+        for point in envelope:
+            dist = float(np.min(np.linalg.norm(vertices - point, axis=1)))
+            self.assertLess(dist, 1e-9)
         mid_interior = envelope[
-            (envelope[:, 0] > 1.95)
-            & (envelope[:, 0] < 2.15)
-            & (envelope[:, 1] > 0.25)
-            & (envelope[:, 1] < 0.75)
+            (envelope[:, 0] > 0.98)
+            & (envelope[:, 0] < 1.07)
+            & (envelope[:, 1] > 0.05)
+            & (envelope[:, 1] < 0.95)
         ]
         self.assertEqual(len(mid_interior), 0)
-
-    def test_outer_contour_follows_curved_band_samples(self) -> None:
-        """条带外包络取自真实 3D 采样，贴合曲面而非投影平面。"""
-        vertices, loops = _arc_band_island_loops()
-        envelope = outer_contour_from_boundary_loops(loops, vertices)
-        radii = np.linalg.norm(envelope[:, :2], axis=1)
-        self.assertTrue(bool(np.all(radii > 3.9)))
-        self.assertTrue(bool(np.all(radii < 5.1)))
-        # 相邻点步长不得跨臂跳变（平面弦线常见症状）
-        closed = np.vstack((envelope, envelope[:1]))
-        steps = np.linalg.norm(np.diff(closed, axis=0), axis=1)
-        self.assertLess(float(steps.max()), 1.5)
 
     def test_union_targets_drop_shared_internal_edge(self) -> None:
         """多领域并集调试边应消去公共内边，只留外轮廓。"""
@@ -1345,9 +1330,8 @@ class FitRegionSurfaceTests(unittest.TestCase):
         ]
         self.assertEqual(len(mid), 0)
 
-    def test_stacked_strip_islands_no_ladder_interior(self) -> None:
-        """多层水平条带岛融并后不得出现梯子状内边。"""
-        # 4 条水平带，竖向间隙 0.05
+    def test_stacked_strip_islands_dissolve_to_outer(self) -> None:
+        """多层邻近水平条带应消内边成外轮廓，而非梯子/弦线。"""
         vertices = []
         loops = []
         for index in range(4):
@@ -1364,18 +1348,27 @@ class FitRegionSurfaceTests(unittest.TestCase):
             )
             loops.append([base, base + 1, base + 2, base + 3])
         vertices = np.asarray(vertices, dtype=np.float64)
-        envelope = outer_contour_from_boundary_loops(loops, vertices)
-        self.assertLess(float(envelope[:, 0].min()), 0.05)
-        self.assertGreater(float(envelope[:, 0].max()), 1.95)
-        self.assertLess(float(envelope[:, 1].min()), 0.05)
-        self.assertGreater(float(envelope[:, 1].max()), 1.30)
-        # 应形成单一闭环（点数 > 原四岛角点），而非退回最长单条带
-        self.assertGreaterEqual(len(envelope), 8)
-        self.assertGreater(float(envelope[:, 1].max() - envelope[:, 1].min()), 1.2)
+        items = merge_nearby_loops_to_outer_contours(
+            loops,
+            vertices,
+            max_gap=0.12,
+        )
+        self.assertEqual(len(items), 1)
+        envelope = items[0]["points"]
+        self.assertAlmostEqual(float(envelope[:, 0].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(envelope[:, 0].max()), 2.0, places=5)
+        self.assertAlmostEqual(float(envelope[:, 1].min()), 0.0, places=5)
+        self.assertAlmostEqual(float(envelope[:, 1].max()), 1.35, places=5)
+        for gap_y in (0.325, 0.675, 1.025):
+            rung = envelope[
+                (np.abs(envelope[:, 1] - gap_y) < 0.04)
+                & (envelope[:, 0] > 0.15)
+                & (envelope[:, 0] < 1.85)
+            ]
+            self.assertEqual(len(rung), 0, msg=f"gap_y={gap_y}")
 
-    def test_notched_loop_corridor_uses_outer_envelope(self) -> None:
-        """单环深凹口应识别为内缝，外包络后凹口内边消失。"""
-        # U 形：顶部中间开口向下的深凹口
+    def test_single_loop_keeps_mesh_boundary(self) -> None:
+        """单环外轮廓即网格边界，不再用条带/凸包改写。"""
         vertices = np.array(
             [
                 [0.0, 0.0, 0.0],
@@ -1390,22 +1383,14 @@ class FitRegionSurfaceTests(unittest.TestCase):
             dtype=np.float64,
         )
         loop = [0, 1, 2, 3, 4, 5, 6, 7]
-        self.assertTrue(loop_has_internal_corridor(vertices[loop]))
         items = merge_nearby_loops_to_outer_contours(
             [loop],
             vertices,
             max_gap=0.1,
         )
         self.assertEqual(len(items), 1)
-        self.assertIsNone(items[0]["loop_ids"])
-        envelope = items[0]["points"]
-        notch_interior = envelope[
-            (envelope[:, 0] > 1.05)
-            & (envelope[:, 0] < 1.95)
-            & (envelope[:, 1] > 0.2)
-            & (envelope[:, 1] < 1.8)
-        ]
-        self.assertEqual(len(notch_interior), 0)
+        self.assertEqual(items[0]["loop_ids"], loop)
+        np.testing.assert_allclose(items[0]["points"], vertices[loop])
 
 
 if __name__ == "__main__":
