@@ -251,6 +251,45 @@ def select_primary_boundary_loop(
     return best_loop
 
 
+# 相对最长边界环周长的比例：更短的碎环视为离散极小值，不参与边拟合
+_MIN_ISLAND_PERIMETER_FRAC = 0.12
+
+
+def filter_significant_boundary_loops(
+    loops: Sequence[Sequence[int]],
+    vertices: np.ndarray,
+    min_perimeter_frac: float = _MIN_ISLAND_PERIMETER_FRAC,
+) -> list[list[int]]:
+    """
+    过滤离散极小边界环（碎岛 / 噪声环）。
+
+    仅保留周长 ≥ 最长环 * min_perimeter_frac 的闭环，避免面内漂浮的极小拟合段。
+    """
+    if not loops:
+        return []
+    verts = _as_float_array(vertices)
+    scored: list[tuple[float, list[int]]] = []
+    for loop in loops:
+        indices = [int(v) for v in loop]
+        if len(indices) < 3:
+            continue
+        pts = verts[np.asarray(indices, dtype=np.int32)]
+        closed = np.vstack((pts, pts[:1]))
+        length = float(polyline_length(closed))
+        if length <= 1e-12:
+            continue
+        scored.append((length, indices))
+    if not scored:
+        return []
+    max_length = max(length for length, _ in scored)
+    threshold = max_length * float(max(min_perimeter_frac, 0.0))
+    kept = [loop for length, loop in scored if length >= threshold]
+    if not kept:
+        # 极端情况：全部被滤掉时至少保留最长环
+        kept = [max(scored, key=lambda item: item[0])[1]]
+    return kept
+
+
 def _fit_circle_2d(points_2d: np.ndarray) -> tuple[np.ndarray, float] | None:
     """Kasa 最小二乘圆拟合，返回 (圆心(2,), 半径)；退化时返回 None。"""
     pts = _as_float_array(points_2d)
@@ -1527,6 +1566,10 @@ def extract_island_longest_sides(
         loop_total,
         loop_vertex_indices,
     )
+    # 忽略离散极小边界环，避免面内出现极短拟合边
+    loops = filter_significant_boundary_loops(loops, verts)
+    if not loops:
+        raise RegionFitError("过滤极小碎环后无可用边界")
     keep_sides = max(int(max_sides), 3)
     sample_n = max(int(bezier_samples), 4)
     sharp_keep = float(max(corner_angle_deg, _STRONG_CONCAVE_ANGLE_DEG))
@@ -2484,6 +2527,9 @@ def analyze_region_fit_topology(
         loop_total,
         loop_vertex_indices,
     )
+    loops = filter_significant_boundary_loops(loops, vertices)
+    if not loops:
+        raise RegionFitError("过滤极小碎环后无可用边界")
     # 目标面心 + 邻接/-走廊 -1 碎面，供跨岛包络延长相接
     interior = collect_island_bridge_interiors(
         work_ids,
@@ -2706,6 +2752,7 @@ __all__ = (
     "extract_island_longest_sides",
     "extract_region_boundary_loops",
     "filter_handle_outliers",
+    "filter_significant_boundary_loops",
     "fit_bezier_polyline_spans",
     "fit_cubic_bezier_controls",
     "fit_region_surface",

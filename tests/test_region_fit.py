@@ -19,6 +19,7 @@ from AdvReverseEngineering.algorithms.region_fit import (
     extract_island_longest_sides,
     extract_region_boundary_loops,
     filter_handle_outliers,
+    filter_significant_boundary_loops,
     fit_cubic_bezier_controls,
     fit_region_surface,
     point_to_polyline_distance,
@@ -341,6 +342,32 @@ class BoundaryExtractionTests(unittest.TestCase):
 
 
 class TopologyClassificationTests(unittest.TestCase):
+    def test_filter_significant_boundary_loops_drops_tiny(self) -> None:
+        """相对主环过短的碎环应被当作离散极小值过滤。"""
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 3.0, 0.0],
+                [0.0, 3.0, 0.0],
+                # 面内极小环
+                [1.5, 1.4, 0.0],
+                [1.7, 1.4, 0.0],
+                [1.7, 1.6, 0.0],
+                [1.5, 1.6, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        big = [0, 1, 2, 3]
+        tiny = [4, 5, 6, 7]
+        kept = filter_significant_boundary_loops(
+            [big, tiny],
+            vertices,
+            min_perimeter_frac=0.12,
+        )
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0], big)
+
     def test_detect_square_corners(self) -> None:
         pts = np.array(
             [
