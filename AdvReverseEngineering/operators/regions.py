@@ -1085,6 +1085,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             "点击编号选择要拆分的领域；Esc 取消"
         )
         self._selected_cut_edges.clear()
+        self._ridge_cut_edges = np.empty(0, dtype=np.int32)
         self._candidate_edges = np.empty(0, dtype=np.int32)
         self._candidate_edges_world = np.empty((0, 2, 3), dtype=np.float64)
         self._hover_edge = None
@@ -1109,6 +1110,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         scene_props.split_phase = "EDGE"
         scene_props.split_target_id = int(target_id)
         self._selected_cut_edges.clear()
+        self._ridge_cut_edges = np.empty(0, dtype=np.int32)
         self._hover_edge = None
         self._preview_ids = None
         self._preview_colors = None
@@ -1163,13 +1165,16 @@ class ARE_OT_split_regions(bpy.types.Operator):
             for edge_index in chain.tolist():
                 self._edge_to_chain[int(edge_index)] = chain_id
 
-        cand_set = set(int(e) for e in self._candidate_edges.tolist())
-        kept: set[int] = set()
-        for edge_index in list(self._selected_cut_edges):
-            kept.update(self._chain_edges_for(edge_index))
-        self._selected_cut_edges = {e for e in kept if e in cand_set}
+        # 已延伸的完整分割棱不得被候选集合裁短（棱线中段常不在候选里）
+        ridge = getattr(self, "_ridge_cut_edges", None)
+        if ridge is not None and len(ridge) > 0:
+            self._selected_cut_edges = {int(e) for e in ridge.tolist()}
+            self._completed_edges = np.asarray(ridge, dtype=np.int32)
+            self._completed_edges_world = self._edges_to_world(self._completed_edges)
         self._candidate_edges_world = self._edges_to_world(self._candidate_edges)
-        if self._hover_edge is not None and self._hover_edge not in cand_set:
+        if self._hover_edge is not None and int(self._hover_edge) not in {
+            int(e) for e in self._candidate_edges.tolist()
+        }:
             self._hover_edge = None
 
     def _adjust_threshold(self, context: bpy.types.Context, delta: float) -> None:
@@ -1236,8 +1241,13 @@ class ARE_OT_split_regions(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         edge_index = int(edge_index)
         # 再点已选完整棱 → 清除
-        if edge_index in self._selected_cut_edges:
+        if (
+            self._ridge_cut_edges is not None
+            and len(self._ridge_cut_edges)
+            and edge_index in self._selected_cut_edges
+        ):
             self._selected_cut_edges.clear()
+            self._ridge_cut_edges = np.empty(0, dtype=np.int32)
             self._clear_preview_keep_selection(context)
             scene_props.split_status = (
                 f"已选领域 {scene_props.split_target_id} · "
@@ -1264,7 +1274,6 @@ class ARE_OT_split_regions(bpy.types.Operator):
             vertices=self._mesh_data["vertices"],
         )
         if len(completed) <= 1:
-            # 兜底：旧 Dijkstra（大半径）
             completed = complete_cut_edges_dijkstra(
                 self._topology,
                 self._mesh_data["normals"],
@@ -1285,8 +1294,9 @@ class ARE_OT_split_regions(bpy.types.Operator):
         if len(completed) == 0:
             completed = np.asarray([edge_index], dtype=np.int32)
 
-        self._selected_cut_edges = {int(e) for e in completed.tolist()}
-        self._completed_edges = np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
+        self._ridge_cut_edges = np.asarray(completed, dtype=np.int32)
+        self._selected_cut_edges = {int(e) for e in self._ridge_cut_edges.tolist()}
+        self._completed_edges = self._ridge_cut_edges.copy()
         self._completed_edges_world = self._edges_to_world(self._completed_edges)
         self._preview_serial += 1
         scene_props.split_status = (
@@ -1299,13 +1309,18 @@ class ARE_OT_split_regions(bpy.types.Operator):
     def _run_edge_preview(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         target = int(scene_props.split_target_id)
-        if target < 0 or not self._selected_cut_edges:
-            self._clear_preview_keep_selection(context)
-            self._refresh_session(context)
-            return
+        ridge = getattr(self, "_ridge_cut_edges", None)
+        if target < 0 or ridge is None or len(ridge) == 0:
+            if not self._selected_cut_edges:
+                self._clear_preview_keep_selection(context)
+                self._refresh_session(context)
+                return
+            ridge = np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
+            self._ridge_cut_edges = ridge
 
-        # 点选时已延伸为完整棱线，直接用作切线
-        completed = np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
+        # 预览必须用点选时延伸好的完整棱，禁止 Dijkstra 改短/改道
+        completed = np.asarray(ridge, dtype=np.int32)
+        self._selected_cut_edges = {int(e) for e in completed.tolist()}
         new_ids, new_colors, new_count = split_region_by_cut_edges(
             self._region_ids,
             self._topology,
@@ -1313,37 +1328,6 @@ class ARE_OT_split_regions(bpy.types.Operator):
             self._colors,
         )
         changed = bool(np.any(new_ids != self._region_ids))
-
-        if not changed:
-            # 仍未切开：再补一次大半径 Dijkstra
-            stroke = self._edge_mids[completed]
-            extra = complete_cut_edges_dijkstra(
-                self._topology,
-                self._mesh_data["normals"],
-                self._mesh_data["face_centers"],
-                self._region_ids,
-                target,
-                completed,
-                stroke,
-                np.empty((0, 2), dtype=np.float64),
-                self._edge_costs,
-                self._edge_mids,
-                self._vert_edge_offsets,
-                self._vert_edge_indices,
-                self._edge_vert_a,
-                self._edge_vert_b,
-                max_radius=self._max_radius,
-            )
-            if len(extra) > len(completed):
-                completed = extra
-                self._selected_cut_edges = {int(e) for e in completed.tolist()}
-                new_ids, new_colors, new_count = split_region_by_cut_edges(
-                    self._region_ids,
-                    self._topology,
-                    completed,
-                    self._colors,
-                )
-                changed = bool(np.any(new_ids != self._region_ids))
 
         self._completed_edges = completed
         self._completed_edges_world = self._edges_to_world(completed)
@@ -1355,12 +1339,13 @@ class ARE_OT_split_regions(bpy.types.Operator):
             scene_props.split_phase = "PREVIEW"
             scene_props.split_status = (
                 f"预览：{self._live_base_count} → {new_count} 个领域 · "
+                f"切线 {len(completed)} 段 · "
                 "确认拆分保存 · Ctrl+Z 清除选中 · Esc 取消"
             )
         else:
             scene_props.split_phase = "EDGE"
             scene_props.split_status = (
-                "切线未能把领域分成两块，请换一条更靠近棱线的短边"
+                f"切线 {len(completed)} 段仍未切开领域，请换一条更靠近棱线中心的短边"
             )
             self._preview_ids = None
             self._preview_colors = None
@@ -1384,6 +1369,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._cancel_debounce_timer()
         if self._preview_ids is not None or self._selected_cut_edges:
             self._selected_cut_edges.clear()
+            self._ridge_cut_edges = np.empty(0, dtype=np.int32)
             self._hover_edge = None
             self._preview_ids = None
             self._preview_colors = None
@@ -1504,6 +1490,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._candidate_chains: list[np.ndarray] = []
         self._edge_to_chain: dict[int, int] = {}
         self._selected_cut_edges: set[int] = set()
+        self._ridge_cut_edges = np.empty(0, dtype=np.int32)
         self._hover_edge = None
         self._preview_ids = None
         self._preview_colors = None

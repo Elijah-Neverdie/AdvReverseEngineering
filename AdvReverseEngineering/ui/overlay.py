@@ -483,27 +483,29 @@ def draw_split_stroke_preview() -> None:
     if obj is None or obj.type != "MESH":
         return
 
-    # 候选硬边：青绿粗线（无深度，盖在领域色之上）
-    _draw_edge_lines_world(
-        session.get("candidate_edges_world"),
-        (0.1, 1.0, 0.82, 0.95),
-        3.5,
-    )
-    # 悬停边：更亮更粗
+    # 已选完整切线时隐藏候选碎边，避免预览阶段「看起来又变短」
+    has_cut = False
+    completed = session.get("completed_edges_world")
+    selected = session.get("selected_edges_world")
+    if completed is not None and len(completed) > 0:
+        has_cut = True
+    if selected is not None and len(selected) > 1:
+        has_cut = True
+    if not has_cut:
+        _draw_edge_lines_world(
+            session.get("candidate_edges_world"),
+            (0.1, 1.0, 0.82, 0.95),
+            3.5,
+        )
     hover = session.get("hover_edge_world")
-    if hover is not None and len(hover) > 0:
+    if hover is not None and len(hover) > 0 and not has_cut:
         _draw_edge_lines_world(hover, (1.0, 0.95, 0.2, 1.0), 5.0)
-    # 已选种子边：品红
+    # 完整分割棱：红色加粗（选中与预览同一条）
+    cut_edges = completed if (completed is not None and len(completed) > 0) else selected
     _draw_edge_lines_world(
-        session.get("selected_edges_world"),
-        (1.0, 0.2, 0.85, 1.0),
-        5.5,
-    )
-    # 补全切线：红色（预览切分路径）
-    _draw_edge_lines_world(
-        session.get("completed_edges_world"),
-        (1.0, 0.05, 0.05, 1.0),
-        4.0,
+        cut_edges,
+        (1.0, 0.08, 0.08, 1.0),
+        6.0,
     )
 
 
