@@ -1264,6 +1264,128 @@ def outer_contour_by_dissolving_facing_edges(
     return result
 
 
+_ULTRA_REFLEX_INTERIOR_DEG = 355.0
+
+
+def _vertex_interior_angle_deg_2d(pts2: np.ndarray, index: int) -> float:
+    """逆时针闭环上顶点的内角（度）。"""
+    count = len(pts2)
+    if count < 3:
+        return 180.0
+    prev_p = pts2[(index - 1) % count]
+    cur_p = pts2[index]
+    next_p = pts2[(index + 1) % count]
+    vin = cur_p - prev_p
+    vout = next_p - cur_p
+    in_len = float(np.linalg.norm(vin))
+    out_len = float(np.linalg.norm(vout))
+    if in_len < 1e-12 or out_len < 1e-12:
+        return 360.0
+    cross = float(vin[0] * vout[1] - vin[1] * vout[0])
+    cos_angle = float(np.clip(vin.dot(vout) / (in_len * out_len), -1.0, 1.0))
+    turn = float(np.degrees(np.arccos(cos_angle)))
+    if cross >= 0.0:
+        return 180.0 - turn
+    return 180.0 + turn
+
+
+def _is_spike_stem_interior(interior_deg: float, interior_threshold_deg: float) -> bool:
+    """尖刺链上的顶点：超锐内角或近乎直线（~180°）。"""
+    if interior_deg > interior_threshold_deg:
+        return True
+    return abs(interior_deg - 180.0) < 5.0
+
+
+def _spike_junction_index_2d(
+    pts2: np.ndarray,
+    tip_index: int,
+    direction: int,
+    interior_threshold_deg: float,
+) -> int:
+    """沿尖刺走向寻找上一级分岔交点（T 形接头）。"""
+    count = len(pts2)
+    tip_index = int(tip_index) % count
+    direction = 1 if direction >= 0 else -1
+    cursor = (tip_index + direction) % count
+    for _step in range(max(count // 2, 2)):
+        if cursor == tip_index:
+            break
+        interior = _vertex_interior_angle_deg_2d(pts2, cursor)
+        if _is_spike_stem_interior(interior, interior_threshold_deg):
+            cursor = (cursor + direction) % count
+            continue
+        return cursor
+    return (tip_index + direction) % count
+
+
+def collapse_ultra_reflex_spike_vertices_closed_loop(
+    points: np.ndarray,
+    interior_threshold_deg: float = _ULTRA_REFLEX_INTERIOR_DEG,
+    max_passes: int = 32,
+) -> np.ndarray:
+    """
+    内角超过阈值的尖刺：删去尖刺链，保留上一级交点（肩部）。
+
+    适用于拟合边界上几乎 360° 的内角（细刺/毛刺），
+    将尖点及其同侧细段收束到分岔处的交点。
+    """
+    pts = _as_float_array(points).copy()
+    if len(pts) < 4:
+        return pts
+
+    threshold = float(min(max(interior_threshold_deg, 180.0), 359.9))
+    origin, axis_u, axis_v = _loop_pca_basis(pts)
+    pts2 = project_points_to_plane(pts, origin, axis_u, axis_v)
+    if _signed_area_2d(pts2) < 0.0:
+        pts = pts[::-1].copy()
+        pts2 = pts2[::-1].copy()
+
+    for _ in range(int(max(max_passes, 1))):
+        count = len(pts)
+        if count < 4:
+            break
+
+        tip_index = -1
+        best_interior = threshold
+        for index in range(count):
+            interior = _vertex_interior_angle_deg_2d(pts2, index)
+            if interior > best_interior:
+                best_interior = interior
+                tip_index = index
+        if tip_index < 0:
+            break
+
+        junction_back = _spike_junction_index_2d(
+            pts2, tip_index, -1, threshold
+        )
+        junction_fwd = _spike_junction_index_2d(
+            pts2, tip_index, 1, threshold
+        )
+
+        remove_set: set[int] = set()
+        if junction_back == junction_fwd:
+            remove_set.add(tip_index)
+        else:
+            cursor = (junction_back + 1) % count
+            while cursor != junction_fwd:
+                remove_set.add(cursor)
+                cursor = (cursor + 1) % count
+                if len(remove_set) >= count - 3:
+                    break
+            if not remove_set:
+                remove_set.add(tip_index)
+
+        keep = [i for i in range(count) if i not in remove_set]
+        if len(keep) < 3:
+            break
+        pts = pts[np.asarray(keep, dtype=np.int32)].copy()
+        pts2 = project_points_to_plane(pts, origin, axis_u, axis_v)
+
+    if _signed_area_2d(pts2) < 0.0:
+        pts = pts[::-1].copy()
+    return pts
+
+
 def bridge_reentrant_corners_closed_loop(
     points: np.ndarray,
     angle_threshold_deg: float = _CONCAVE_FOLD_ANGLE_DEG,
@@ -1274,9 +1396,10 @@ def bridge_reentrant_corners_closed_loop(
     缝合后外轮廓上的内阴角：用弦切除凹口，使相邻孤岛接缝成连续外缘。
 
     仅处理逆时针环上的凹折（叉积为负）；弦长超过包围盒对角线比例则跳过，
-    避免把整条内弧裁掉。远岛弦线桥接不在此处理。
+    避免把整条内弧裁掉。远岛弦线桥接不在此处理。先收束内角>355°的尖刺。
     """
-    pts = _as_float_array(points).copy()
+    pts = collapse_ultra_reflex_spike_vertices_closed_loop(points)
+    pts = _as_float_array(pts).copy()
     if len(pts) < 4:
         return pts
 
@@ -3497,12 +3620,25 @@ def build_fit_work_items(
     if stage_key == "ISLANDS":
         items = [
             {
-                "points": verts[np.asarray(loop, dtype=np.int32)].copy(),
+                "points": collapse_ultra_reflex_spike_vertices_closed_loop(
+                    verts[np.asarray(loop, dtype=np.int32)]
+                ),
                 "loop_ids": loop,
                 "merged_from": 1,
             }
             for loop in valid
         ]
+        # 收束后点列可能不再对应原始顶点下标
+        for item in items:
+            collapsed = item["points"]
+            ids = item.get("loop_ids")
+            if ids is None:
+                continue
+            original = verts[np.asarray(ids, dtype=np.int32)]
+            if len(collapsed) != len(original) or not np.allclose(
+                collapsed, original, atol=1e-9
+            ):
+                item["loop_ids"] = None
         return items, meta
 
     if stage_key == "STITCH":
@@ -3661,6 +3797,14 @@ def extract_island_longest_sides(
             loop_pts = loop_pts[::-1]
             if loop_ids is not None:
                 loop_ids = list(reversed(loop_ids))
+
+        # 内角>355°的尖刺收束到上一级交点（所有拟合阶段）
+        collapsed = collapse_ultra_reflex_spike_vertices_closed_loop(loop_pts)
+        if len(collapsed) != len(loop_pts) or not np.allclose(
+            collapsed, loop_pts, atol=1e-9
+        ):
+            loop_pts = collapsed
+            loop_ids = None
 
         # 仅原始网格环可做邻域 T 接缝切点；融并外轮廓只靠几何折角
         if loop_ids is not None:
@@ -5090,6 +5234,7 @@ __all__ = (
     "analyze_region_fit_topology",
     "bridge_concave_notches",
     "bridge_reentrant_corners_closed_loop",
+    "collapse_ultra_reflex_spike_vertices_closed_loop",
     "stitch_two_loops_by_corner_seams",
     "build_fit_work_items",
     "build_quad_patch",

@@ -1314,6 +1314,31 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertEqual(int(bridge[0]["merged_from"]), 3)
         self.assertGreaterEqual(len(meta.get("bridge_links") or []), 1)
 
+    def test_collapse_ultra_reflex_spike_at_parent_junction(self) -> None:
+        """内角>355°的尖刺应收束到上一级分岔交点。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            collapse_ultra_reflex_spike_vertices_closed_loop,
+        )
+
+        spiked = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [2.0, 1.0, 0.0],
+                [2.0, 2.0, 0.0],
+                [2.001, 2.8, 0.0],
+                [1.999, 1.001, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        cleaned = collapse_ultra_reflex_spike_vertices_closed_loop(spiked)
+        self.assertLess(len(cleaned), len(spiked))
+        self.assertEqual(len(cleaned[cleaned[:, 1] > 1.05]), 0)
+        fork = cleaned[(np.abs(cleaned[:, 0] - 2.0) < 0.05) & (cleaned[:, 1] < 1.05)]
+        self.assertGreaterEqual(len(fork), 1)
+
     def test_stitch_bridges_reentrant_notch_to_continuous_rim(self) -> None:
         """缝合后内阴角应被切除，外轮廓不再钻进 V 形凹口。"""
         from AdvReverseEngineering.algorithms.region_fit import (
