@@ -478,10 +478,12 @@ def grow_ridge_cut_to_boundary(
 
             begin = int(vert_edge_offsets[current])
             end = int(vert_edge_offsets[current + 1])
-            best_edge = None
-            best_score = -1.0
-            best_other = -1
-            best_is_boundary = False
+            best_internal = None
+            best_internal_score = -1.0
+            best_internal_other = -1
+            best_boundary = None
+            best_boundary_score = -1.0
+            best_boundary_other = -1
 
             for edge_index in vert_edge_indices[begin:end].tolist():
                 edge_index = int(edge_index)
@@ -497,11 +499,10 @@ def grow_ridge_cut_to_boundary(
                     score = score_edge(
                         edge_index, current, travel, is_boundary=True
                     )
-                    if score > best_score:
-                        best_score = score
-                        best_edge = edge_index
-                        best_other = v_other
-                        best_is_boundary = True
+                    if score > best_boundary_score:
+                        best_boundary_score = score
+                        best_boundary = edge_index
+                        best_boundary_other = v_other
                     continue
 
                 if not _is_internal_region_edge(
@@ -512,14 +513,13 @@ def grow_ridge_cut_to_boundary(
                 score = score_edge(
                     edge_index, current, travel, is_boundary=False
                 )
-                if score > best_score:
-                    best_score = score
-                    best_edge = edge_index
-                    best_other = v_other
-                    best_is_boundary = False
+                if score > best_internal_score:
+                    best_internal_score = score
+                    best_internal = edge_index
+                    best_internal_other = v_other
 
             # 无坐标时：在合格边中选最硬者
-            if best_edge is None and travel is None:
+            if best_internal is None and travel is None:
                 for edge_index in vert_edge_indices[begin:end].tolist():
                     edge_index = int(edge_index)
                     if edge_index in used:
@@ -531,11 +531,10 @@ def grow_ridge_cut_to_boundary(
                         edge_index, face_a, face_b, region_ids, target_rid
                     ):
                         score = 1.0 + hardness(edge_index)
-                        if score > best_score:
-                            best_score = score
-                            best_edge = edge_index
-                            best_other = v_other
-                            best_is_boundary = True
+                        if score > best_boundary_score:
+                            best_boundary_score = score
+                            best_boundary = edge_index
+                            best_boundary_other = v_other
                         continue
                     if not _is_internal_region_edge(
                         edge_index, face_a, face_b, region_ids, target_rid
@@ -544,13 +543,12 @@ def grow_ridge_cut_to_boundary(
                     hard = hardness(edge_index)
                     if hard < min_hardness:
                         continue
-                    if hard > best_score:
-                        best_score = hard
-                        best_edge = edge_index
-                        best_other = v_other
-                        best_is_boundary = False
+                    if hard > best_internal_score:
+                        best_internal_score = hard
+                        best_internal = edge_index
+                        best_internal_other = v_other
 
-            if best_edge is None and travel is not None:
+            if best_internal is None and travel is not None:
                 # 缓棱中段：绝对硬度不够时，取方向合格的局部最硬边
                 local: list[tuple[float, float, int, int]] = []
                 for edge_index in vert_edge_indices[begin:end].tolist():
@@ -574,25 +572,27 @@ def grow_ridge_cut_to_boundary(
                     local.append((hard, align, edge_index, v_other))
                 if local:
                     local.sort(key=lambda item: (item[0], item[1]), reverse=True)
-                    hard0, align0, edge0, other0 = local[0]
-                    # 要求明显是该方向上的局部硬棱（相对次优更硬）
+                    hard0, _align0, edge0, other0 = local[0]
                     if hard0 >= 0.05 and (
                         len(local) == 1 or hard0 >= local[1][0] * 0.85
                     ):
-                        best_edge = edge0
-                        best_other = other0
-                        best_is_boundary = False
-                        best_score = hard0
+                        best_internal = edge0
+                        best_internal_other = other0
+                        best_internal_score = hard0
 
-            if best_edge is None:
+            # 优先沿内部硬棱继续；只有没有合格内部续边时才碰到边界结束
+            # （绝不把边界边加入切线——边界边两侧分属不同领域，不能切开目标）
+            if best_internal is not None:
+                path.append(int(best_internal))
+                used.add(int(best_internal))
+                previous = current
+                current = int(best_internal_other)
+                continue
+
+            if best_boundary is not None:
                 break
 
-            path.append(int(best_edge))
-            used.add(int(best_edge))
-            if best_is_boundary:
-                break
-            previous = current
-            current = int(best_other)
+            break
 
         return path
 
@@ -779,11 +779,13 @@ def split_region_by_cut_edges(
     topology: dict,
     cut_edges: np.ndarray,
     colors: np.ndarray,
+    target_rid: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
     将补全边作为邻接屏障，在受影响领域内做连通分量拆分。
 
     最大分量保留原 ID/颜色；其余分量分配新 ID/新色。忽略面不变。
+    target_rid 非空时只拆分该领域，且只使用两侧都属于该领域的内部切边。
     """
     ids = np.asarray(region_ids, dtype=np.int32).copy()
     colors = np.asarray(colors, dtype=np.float32)
@@ -797,26 +799,27 @@ def split_region_by_cut_edges(
     offsets = np.asarray(topology["adjacency_offsets"], dtype=np.int32)
     adj = np.asarray(topology["adjacency_indices"], dtype=np.int32)
 
-    # 边索引 → 是否屏障；同时构建 (min_face,max_face) 快速查询
+    # 仅内部边（两侧同属目标/同一领域）才构成切开屏障
     barrier_pairs: set[tuple[int, int]] = set()
+    affected: set[int] = set()
     for edge_index in cut_set:
         if edge_index < 0 or edge_index >= len(face_a):
             continue
         fa = int(face_a[edge_index])
         fb = int(face_b[edge_index])
-        barrier_pairs.add((min(fa, fb), max(fa, fb)))
-
-    # 受影响的原领域：至少一侧被切边触及且属于该领域
-    affected: set[int] = set()
-    for edge_index in cut_set:
-        if edge_index < 0 or edge_index >= len(face_a):
+        ra = int(ids[fa])
+        rb = int(ids[fb])
+        if ra < 0 or rb < 0 or ra != rb:
             continue
-        for face in (int(face_a[edge_index]), int(face_b[edge_index])):
-            rid = int(ids[face])
-            if rid >= 0:
-                affected.add(rid)
+        if target_rid is not None and ra != int(target_rid):
+            continue
+        barrier_pairs.add((min(fa, fb), max(fa, fb)))
+        affected.add(ra)
 
-    if not affected:
+    if target_rid is not None:
+        affected = {int(target_rid)} if barrier_pairs else set()
+
+    if not affected or not barrier_pairs:
         region_count = int(ids.max()) + 1 if np.any(ids >= 0) else 0
         if len(colors) < region_count:
             extra = generate_region_colors(region_count - len(colors))
@@ -862,12 +865,24 @@ def split_region_by_cut_edges(
             continue
 
         components.sort(key=len, reverse=True)
-        # 最大分量保留原 rid；其余分配新 id，并用对比色以便预览区分。
+        # 过小碎片不单独成领域（避免「预览闪一下、确认后看不出拆分」）
+        # 大领域上过小碎片不单独成领域；小测试网格不受限
+        total_faces = sum(len(c) for c in components)
+        if total_faces >= 100:
+            min_faces = max(3, int(total_faces * 0.01))
+            new_parts = [
+                c for c in components[1:] if len(c) >= min_faces
+            ]
+        else:
+            new_parts = components[1:]
+        if not new_parts:
+            continue
+
         base = colors[rid] if rid < len(colors) else np.array(
             [0.5, 0.5, 0.8, 0.55],
             dtype=np.float32,
         )
-        for offset_index, component in enumerate(components[1:]):
+        for offset_index, component in enumerate(new_parts):
             new_rid = next_id
             next_id += 1
             for face in component:
@@ -1097,6 +1112,7 @@ def cut_edges_from_paint_corridor(
         topology,
         completed,
         generate_region_colors(max(int(region_ids.max()) + 1, 1)),
+        target_rid=int(target_rid),
     )
     original_count = int(region_ids.max()) + 1 if np.any(region_ids >= 0) else 0
     if probe_count <= original_count and not np.any(

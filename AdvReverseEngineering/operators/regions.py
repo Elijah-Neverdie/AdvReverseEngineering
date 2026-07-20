@@ -922,7 +922,8 @@ class ARE_OT_split_regions(bpy.types.Operator):
     bl_description = (
         "点击编号选择领域，Ctrl+滚轮调线框阈值，点选硬边拆分"
     )
-    bl_options = {"REGISTER", "UNDO"}
+    # 不用 UNDO：确认写入后若模态被 cancel，Blender 会回滚 Mesh 属性导致「拆了又没了」
+    bl_options = {"REGISTER"}
 
     def _cleanup_ui(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
@@ -1326,6 +1327,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             self._topology,
             completed,
             self._colors,
+            target_rid=target,
         )
         changed = bool(np.any(new_ids != self._region_ids))
 
@@ -1389,7 +1391,15 @@ class ARE_OT_split_regions(bpy.types.Operator):
         if self._preview_ids is None or self._preview_colors is None:
             self.report({"WARNING"}, "还没有可确认的分色预览")
             return False
+        # 先标记已提交，避免后续异常导致 cancel 回滚显示
+        self._committed = True
         write_region_ids(self._object.data, self._preview_ids)
+        # 强制刷新依赖图，确保属性写入立即可见
+        try:
+            self._object.data.update()
+            context.view_layer.update()
+        except Exception:
+            pass
         version = int(self._snapshot_version) + 1
         self._object[REGION_VERSION_ATTR] = version
         self._object[REGION_COLORS_ATTR] = (
@@ -1409,7 +1419,18 @@ class ARE_OT_split_regions(bpy.types.Operator):
             self._preview_ids,
             self._preview_colors,
         )
-        self._committed = True
+        try:
+            bpy.ops.ed.undo_push(message="拆分领域")
+        except Exception:
+            pass
+        # 校验写入是否生效
+        written = read_region_ids(self._object.data)
+        if written is None or not np.array_equal(
+            written, np.asarray(self._preview_ids, dtype=np.int32)
+        ):
+            self.report({"ERROR"}, "拆分写入校验失败，请重试")
+            self._committed = False
+            return False
         return True
 
     @classmethod
@@ -1541,6 +1562,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._alive = False
         if getattr(self, "_committed", False):
             self._cleanup_ui(context)
+            self._closed = True
             return {"FINISHED"}
         self._cleanup_ui(context)
         try:
