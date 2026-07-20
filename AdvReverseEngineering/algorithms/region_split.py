@@ -756,10 +756,15 @@ def unify_cut_edges_as_line(
         heap: list[tuple[float, int]] = [(0.0, v) for v in starts]
         heapq.heapify(heap)
         reached: int | None = None
+        visits = 0
+        max_visits = 30000
         while heap:
             cost_u, u = heapq.heappop(heap)
             if cost_u > dist.get(u, float("inf")) + 1e-12:
                 continue
+            visits += 1
+            if visits > max_visits:
+                break
             if u in goal_set and u not in starts:
                 reached = u
                 break
@@ -1031,8 +1036,7 @@ def refine_cut_to_hard_ridge(
     """
     把锯齿切线吸附到同端点之间的最硬棱路径。
 
-    自动识别的边界之所以整齐，是因为贴在硬棱上生长；手动切线若沿
-    三角网随意折线走就会呈锯齿。此函数在用户切线走廊内重寻硬棱测地线。
+    仅在原切线空间走廊内搜索（O(走廊)），避免大网格 Dijkstra 卡死。
     """
     face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
     face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
@@ -1051,6 +1055,10 @@ def refine_cut_to_hard_ridge(
         return np.empty(0, dtype=np.int32)
 
     seed_set = {int(e) for e in seeds.tolist()}
+    # 切线已经很干净时跳过重寻，避免无谓开销
+    if len(seed_set) <= 2:
+        return np.asarray(sorted(seed_set), dtype=np.int32)
+
     degree: dict[int, int] = {}
     for edge_index in seed_set:
         for vert in (
@@ -1069,15 +1077,12 @@ def refine_cut_to_hard_ridge(
                 return True
         return False
 
-    # 优先取贴周界的端点；否则取度数为 1 的端点
     boundary_ends = [v for v, d in degree.items() if d == 1 and vert_on_boundary(v)]
     dangling = [v for v, d in degree.items() if d == 1]
     ends = boundary_ends if len(boundary_ends) >= 2 else dangling
     if len(ends) < 2:
-        # 退化：整条已是环或单点，保持原切线
         return np.asarray(sorted(seed_set), dtype=np.int32)
 
-    # 选空间上最远的一对端点，覆盖整条意图切线
     tip_pos: dict[int, np.ndarray] = {}
     for vert in ends:
         begin = int(offsets[vert])
@@ -1114,25 +1119,24 @@ def refine_cut_to_hard_ridge(
     focus_center = focus.mean(axis=0)
     span = focus - focus_center
     radius = float(np.sqrt(np.max(np.sum(span * span, axis=1)))) + 1e-6
-    corridor_r = radius * 2.5
-
-    def corridor_bias(edge_index: int) -> float:
-        mid = edge_mids[edge_index]
-        dists = np.sum((focus - mid) ** 2, axis=1)
-        nearest = float(np.sqrt(dists.min()))
-        # 偏离原切线走廊则显著加价，避免抄到另一条硬棱
-        return 2.5 * (nearest / corridor_r) ** 2
+    corridor_r = radius * 1.75
+    corridor_r_sq = corridor_r * corridor_r
+    max_visits = min(80000, max(2000, len(seed_set) * 40))
 
     dist: dict[int, float] = {start_vert: 0.0}
     prev_edge: dict[int, int | None] = {start_vert: None}
     prev_vert: dict[int, int | None] = {start_vert: None}
     heap: list[tuple[float, int]] = [(0.0, start_vert)]
     reached = False
+    visits = 0
 
     while heap:
         cost_u, u = heapq.heappop(heap)
         if cost_u > dist.get(u, float("inf")) + 1e-12:
             continue
+        visits += 1
+        if visits > max_visits:
+            break
         if u == goal_vert:
             reached = True
             break
@@ -1140,7 +1144,13 @@ def refine_cut_to_hard_ridge(
         end = int(offsets[u + 1])
         for edge_index in adj_edges[begin:end].tolist():
             edge_index = int(edge_index)
-            # 允许走内部边；领域边界边只在端点处出现
+            mid = edge_mids[edge_index]
+            delta = mid - focus_center
+            dist_sq = float(np.dot(delta, delta))
+            # 严格限制在走廊内，禁止扫遍整个领域
+            if edge_index not in seed_set and dist_sq > corridor_r_sq:
+                continue
+
             is_boundary = _is_region_boundary_edge(
                 edge_index, face_a, face_b, region_ids, target
             )
@@ -1156,11 +1166,10 @@ def refine_cut_to_hard_ridge(
             if not np.isfinite(step) or step < 0.0:
                 step = 1.0
             if is_boundary:
-                # 边界边不当作切割主体，仅允许极短过渡
                 step = step * 0.02 + 0.001
             else:
-                step = step + corridor_bias(edge_index)
-            # 原切线上的边略优惠，稳定拓扑意图
+                # O(1) 走廊偏置，禁止对全部种子点做 numpy 距离
+                step = step + 2.0 * (dist_sq / corridor_r_sq)
             if edge_index in seed_set:
                 step *= 0.55
             new_cost = cost_u + step
@@ -1185,7 +1194,6 @@ def refine_cut_to_hard_ridge(
         cursor = prev_vert.get(cursor)
 
     if len(path) < max(1, len(seed_set) // 4):
-        # 路径异常偏短：回退原切线
         return np.asarray(sorted(seed_set), dtype=np.int32)
     return np.asarray(sorted(set(path)), dtype=np.int32)
 
@@ -1199,7 +1207,10 @@ def optimize_split_boundary_to_hard_edges(
     iterations: int = 8,
 ) -> np.ndarray:
     """
-    拆分后把两块交界挪到更硬的边上（接近自动识别边界质感）。
+    拆分后把两块交界挪到更硬的边上。
+
+    用局部能量增量（只看候选面邻接），复杂度 O(迭代 × 边界面)，
+    禁止全网格扫边。
     """
     ids = np.asarray(region_ids, dtype=np.int32).copy()
     face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
@@ -1212,62 +1223,72 @@ def optimize_split_boundary_to_hard_edges(
     if ra < 0 or rb < 0 or ra == rb:
         return ids
 
-    def boundary_energy(cur: np.ndarray) -> float:
-        energy = 0.0
-        for edge_index in range(len(face_a)):
-            fa = int(face_a[edge_index])
-            fb = int(face_b[edge_index])
-            ia = int(cur[fa])
-            ib = int(cur[fb])
-            if {ia, ib} == {ra, rb}:
-                energy += float(costs[edge_index])
-        return energy
+    # face 对 → 边代价：只索引落在两块领域内部的边
+    id_a = ids[face_a]
+    id_b = ids[face_b]
+    inside = ((id_a == ra) | (id_a == rb)) & ((id_b == ra) | (id_b == rb))
+    pair_cost: dict[tuple[int, int], float] = {}
+    for edge_index in np.flatnonzero(inside).tolist():
+        edge_index = int(edge_index)
+        fa = int(face_a[edge_index])
+        fb = int(face_b[edge_index])
+        pair_cost[(min(fa, fb), max(fa, fb))] = float(costs[edge_index])
 
-    for _ in range(int(iterations)):
-        # 收集交界面
-        candidates: list[int] = []
-        for face in range(len(ids)):
+    def flip_delta(face: int, from_rid: int, to_rid: int) -> float:
+        delta = 0.0
+        begin = int(offsets[face])
+        end = int(offsets[face + 1])
+        for neighbor in adj[begin:end].tolist():
+            neighbor = int(neighbor)
+            nr = int(ids[neighbor])
+            cost = pair_cost.get((min(face, neighbor), max(face, neighbor)), 1.0)
+            before = {from_rid, nr} == {ra, rb}
+            after = {to_rid, nr} == {ra, rb}
+            if before:
+                delta -= cost
+            if after:
+                delta += cost
+        return delta
+
+    # 只收集 ra/rb 交界候选，不扫其它领域
+    focus = np.flatnonzero((ids == ra) | (ids == rb))
+    max_iters = min(int(iterations), 12)
+    for _ in range(max_iters):
+        best_face = -1
+        best_delta = 0.0
+        best_to = -1
+        checked = 0
+        for face in focus.tolist():
+            face = int(face)
             rid = int(ids[face])
             if rid not in (ra, rb):
                 continue
-            begin = int(offsets[face])
-            end = int(offsets[face + 1])
-            for neighbor in adj[begin:end].tolist():
-                if int(ids[int(neighbor)]) in (ra, rb) and int(ids[int(neighbor)]) != rid:
-                    candidates.append(face)
-                    break
-        if not candidates:
-            break
-
-        base_energy = boundary_energy(ids)
-        best_face = -1
-        best_energy = base_energy
-        best_to = -1
-        for face in candidates:
-            rid = int(ids[face])
             other = rb if rid == ra else ra
-            # 仅当邻域中 other 占多数或打平才考虑，避免打穿
             begin = int(offsets[face])
             end = int(offsets[face + 1])
             own_n = 0
             other_n = 0
+            touches = False
             for neighbor in adj[begin:end].tolist():
                 nr = int(ids[int(neighbor)])
                 if nr == rid:
                     own_n += 1
                 elif nr == other:
                     other_n += 1
-            if other_n == 0:
+                    touches = True
+            if not touches:
                 continue
+            checked += 1
             if own_n > other_n + 1:
                 continue
-            ids[face] = other
-            energy = boundary_energy(ids)
-            ids[face] = rid
-            if energy + 1e-9 < best_energy:
-                best_energy = energy
+            delta = flip_delta(face, rid, other)
+            if delta < best_delta - 1e-9:
+                best_delta = delta
                 best_face = face
                 best_to = other
+            # 边界很长时每轮不必穷举过多
+            if checked > 4000:
+                break
         if best_face < 0:
             break
         ids[best_face] = best_to
@@ -1605,16 +1626,21 @@ def split_region_by_cut_edges(
             colors = np.vstack((colors, extra)) if len(colors) else extra
         return ids, colors[:region_count].copy(), region_count
 
-    # 把交界挪到更硬的边上（对齐自动识别质感）
+    # 把交界挪到更硬的边上（对齐自动识别质感）；超大块跳过以免卡顿
     if edge_costs is not None and len(split_pairs):
         for rid_a, rid_b in split_pairs:
+            n_ab = int(
+                np.count_nonzero((ids == rid_a) | (ids == rid_b))
+            )
+            if n_ab > 120000:
+                continue
             ids = optimize_split_boundary_to_hard_edges(
                 ids,
                 topology,
                 edge_costs,
                 rid_a,
                 rid_b,
-                iterations=10,
+                iterations=6,
             )
 
     # 边界平滑：去掉残留单面毛刺
@@ -1758,10 +1784,14 @@ def seal_cut_to_region_boundary(
         prev_vert: dict[int, int | None] = {start: None}
         heap: list[tuple[float, int]] = [(0.0, start)]
         reached: int | None = None
+        visits = 0
         while heap:
             cost_u, u = heapq.heappop(heap)
             if cost_u > dist.get(u, float("inf")) + 1e-12:
                 continue
+            visits += 1
+            if visits > 20000:
+                break
             if u != start and vert_on_boundary(u):
                 reached = u
                 break
@@ -1770,7 +1800,6 @@ def seal_cut_to_region_boundary(
             for edge_index in adj_edges[begin:end].tolist():
                 edge_index = int(edge_index)
                 if edge_index in completed:
-                    # 允许沿已有切线走到另一端，但不作为新封边
                     pass
                 if not _is_internal_region_edge(
                     edge_index, face_a, face_b, region_ids, target
@@ -1782,7 +1811,6 @@ def seal_cut_to_region_boundary(
                 step = float(edge_costs[edge_index])
                 if not np.isfinite(step) or step < 0.0:
                     step = 1.0
-                # 已在切线上的边代价极低，便于穿过
                 if edge_index in completed:
                     step *= 0.01
                 new_cost = cost_u + step

@@ -1428,7 +1428,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             completed,
             self._colors,
             target_rid=target,
-            smooth_iterations=4,
+            smooth_iterations=3,
             edge_costs=self._edge_costs,
         )
         changed = bool(np.any(new_ids != self._region_ids))
