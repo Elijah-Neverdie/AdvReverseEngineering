@@ -1613,8 +1613,8 @@ def split_region_by_cut_edges(
     """
     将补全边作为邻接屏障，在受影响领域内做连通分量拆分。
 
-    最大分量保留原 ID/颜色；主要新块分配新 ID；锯齿碎块并入邻块，
-    再 PCA 拉直交界并平滑，接近自动识别边界质感。
+    最大分量保留原 ID/颜色；主要新块分配新 ID；锯齿碎块并入邻块。
+    分界严格跟随切线，仅做轻度去毛刺（不做平面拉直，以免偏离红线）。
     """
     ids = np.asarray(region_ids, dtype=np.int32).copy()
     colors = np.asarray(colors, dtype=np.float32)
@@ -1784,52 +1784,16 @@ def split_region_by_cut_edges(
             colors = np.vstack((colors, extra)) if len(colors) else extra
         return ids, colors[:region_count].copy(), region_count
 
-    # PCA 切割面拉直交界（优先），再硬边微调
-    if face_centers is not None and len(split_pairs):
-        for rid_a, rid_b in split_pairs:
-            ids = straighten_split_boundary(
-                ids,
-                topology,
-                face_centers,
-                rid_a,
-                rid_b,
-                ring_expand=2,
-                smooth_rounds=8,
-            )
-
-    if edge_costs is not None and len(split_pairs):
-        for rid_a, rid_b in split_pairs:
-            n_ab = int(
-                np.count_nonzero((ids == rid_a) | (ids == rid_b))
-            )
-            if n_ab > 120000:
-                continue
-            ids = optimize_split_boundary_to_hard_edges(
-                ids,
-                topology,
-                edge_costs,
-                rid_a,
-                rid_b,
-                iterations=5,
-            )
-
-    # 边界平滑：两侧都够大时才用强模式，避免小测试网格被吞并
+    # 分界以切线为准：禁止平面拉直/强平滑把色界从红线拉开。
+    # 只剔单面毛刺，避免「看起来更光滑但误差更大」。
+    _ = (edge_costs, face_centers, split_pairs)
     if smooth_iterations > 0:
-        use_aggressive = False
-        if split_pairs:
-            use_aggressive = True
-            for rid_a, rid_b in split_pairs:
-                ca = int(np.count_nonzero(ids == rid_a))
-                cb = int(np.count_nonzero(ids == rid_b))
-                if min(ca, cb) < 20:
-                    use_aggressive = False
-                    break
         ids = smooth_region_boundaries(
             ids,
             topology,
             focus_ids=touched_ids,
-            iterations=max(int(smooth_iterations), 4 if use_aggressive else 2),
-            aggressive=use_aggressive,
+            iterations=min(int(smooth_iterations), 3),
+            aggressive=False,
         )
 
     # 再吸收残留碎屑（平滑可能产生的小岛）；上限封顶，避免吞掉有效新块
