@@ -402,7 +402,12 @@ def draw_split_brush_cursor() -> None:
 
 
 def _draw_edge_lines_world(edges_world, color, width: float) -> None:
-    """绘制 (N,2,3) 世界空间线段。"""
+    """
+    绘制 (N,2,3) 世界空间线段。
+
+    关闭深度测试：候选硬边与网格/领域色面共面，LESS_EQUAL 会被
+    外移后的领域覆盖层完全挡住，导致「候选 N 条」却看不见线。
+    """
     if edges_world is None or len(edges_world) == 0:
         return
     segments = []
@@ -416,7 +421,9 @@ def _draw_edge_lines_world(edges_world, color, width: float) -> None:
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     batch = batch_for_shader(shader, "LINES", {"pos": segments})
     gpu.state.blend_set("ALPHA")
-    gpu.state.depth_test_set("LESS_EQUAL")
+    # 引导线始终盖在网格之上，避免与领域色面 Z-fighting / 深度遮挡。
+    gpu.state.depth_test_set("NONE")
+    gpu.state.depth_mask_set(False)
     gpu.state.line_width_set(float(width))
     try:
         shader.bind()
@@ -424,6 +431,7 @@ def _draw_edge_lines_world(edges_world, color, width: float) -> None:
         batch.draw(shader)
     finally:
         gpu.state.line_width_set(1.0)
+        gpu.state.depth_mask_set(True)
         gpu.state.depth_test_set("NONE")
         gpu.state.blend_set("NONE")
 
@@ -475,27 +483,27 @@ def draw_split_stroke_preview() -> None:
     if obj is None or obj.type != "MESH":
         return
 
-    # 候选硬边：半透明青绿粗线
+    # 候选硬边：青绿粗线（无深度，盖在领域色之上）
     _draw_edge_lines_world(
         session.get("candidate_edges_world"),
-        (0.15, 0.95, 0.75, 0.75),
-        2.5,
+        (0.1, 1.0, 0.82, 0.95),
+        3.5,
     )
     # 悬停边：更亮更粗
     hover = session.get("hover_edge_world")
     if hover is not None and len(hover) > 0:
-        _draw_edge_lines_world(hover, (1.0, 0.95, 0.2, 0.95), 4.0)
+        _draw_edge_lines_world(hover, (1.0, 0.95, 0.2, 1.0), 5.0)
     # 已选种子边：品红
     _draw_edge_lines_world(
         session.get("selected_edges_world"),
-        (1.0, 0.2, 0.85, 0.95),
-        4.5,
+        (1.0, 0.2, 0.85, 1.0),
+        5.5,
     )
     # 补全切线：红色（预览切分路径）
     _draw_edge_lines_world(
         session.get("completed_edges_world"),
-        (1.0, 0.05, 0.05, 0.95),
-        3.0,
+        (1.0, 0.05, 0.05, 1.0),
+        4.0,
     )
 
 
@@ -504,12 +512,14 @@ def register_split_draw_handler() -> None:
     global _SPLIT_DRAW_HANDLE
     namespace = bpy.app.driver_namespace
     old = namespace.get(SPLIT_DRAW_HANDLE_KEY)
-    if old is not None:
+    # 句柄存为 (POST_VIEW, POST_PIXEL) tuple，须逐个移除。
+    for item in old if isinstance(old, (tuple, list)) else (old,):
+        if item is None:
+            continue
         try:
-            bpy.types.SpaceView3D.draw_handler_remove(old, "WINDOW")
-        except (ReferenceError, ValueError):
+            bpy.types.SpaceView3D.draw_handler_remove(item, "WINDOW")
+        except (ReferenceError, ValueError, TypeError):
             pass
-    # 用 tuple 存两个句柄
     view_handle = bpy.types.SpaceView3D.draw_handler_add(
         draw_split_stroke_preview,
         (),
