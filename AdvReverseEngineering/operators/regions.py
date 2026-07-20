@@ -20,6 +20,7 @@ from ..algorithms.region_split import (
     group_candidate_edge_chains,
     grow_ridge_cut_to_boundary,
     prepare_edge_costs,
+    refine_cut_to_hard_ridge,
     seal_cut_to_region_boundary,
     split_region_by_cut_edges,
     unify_cut_edges_as_line,
@@ -1315,6 +1316,19 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 self._edge_vert_a,
                 self._edge_vert_b,
             )
+            # 吸附到硬棱测地线，使边界接近「识别领域」的整齐硬边
+            unified = refine_cut_to_hard_ridge(
+                unified,
+                self._topology,
+                self._region_ids,
+                target,
+                self._edge_costs,
+                self._edge_mids,
+                self._vert_edge_offsets,
+                self._vert_edge_indices,
+                self._edge_vert_a,
+                self._edge_vert_b,
+            )
         self._ridge_cut_edges = np.asarray(unified, dtype=np.int32)
         self._selected_cut_edges = {int(e) for e in self._ridge_cut_edges.tolist()}
         self._completed_edges = self._ridge_cut_edges.copy()
@@ -1414,7 +1428,8 @@ class ARE_OT_split_regions(bpy.types.Operator):
             completed,
             self._colors,
             target_rid=target,
-            smooth_iterations=3,
+            smooth_iterations=4,
+            edge_costs=self._edge_costs,
         )
         changed = bool(np.any(new_ids != self._region_ids))
 

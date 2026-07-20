@@ -16,6 +16,7 @@ from AdvReverseEngineering.algorithms.region_split import (
     group_candidate_edge_chains,
     grow_ridge_cut_to_boundary,
     prepare_edge_costs,
+    refine_cut_to_hard_ridge,
     seal_cut_to_region_boundary,
     split_region_by_cut_edges,
     stroke_hits_to_seed_edges,
@@ -397,6 +398,42 @@ class RegionSplitTests(unittest.TestCase):
             topology["edge_vert_b"],
         )
         self.assertEqual(len(chains), 0)
+
+    def test_refine_cut_prefers_hard_vertical(self) -> None:
+        """走廊内重寻应仍落在竖硬棱上并能切开。"""
+        topology, centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        costs, mids = prepare_edge_costs(
+            topology, normals, centers, region_ids
+        )
+        refined = refine_cut_to_hard_ridge(
+            np.array([4, 5, 6], dtype=np.int32),
+            topology,
+            region_ids,
+            0,
+            costs,
+            mids,
+            topology["vert_edge_offsets"],
+            topology["vert_edge_indices"],
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+        )
+        self.assertTrue(len(refined) >= 1)
+        self.assertTrue(
+            chain_splits_region(refined, region_ids, topology, 0)
+            or set(refined.tolist()).intersection({4, 5, 6})
+        )
+        new_ids, new_colors, new_count = split_region_by_cut_edges(
+            region_ids,
+            topology,
+            refined,
+            generate_region_colors(1),
+            target_rid=0,
+            edge_costs=costs,
+            smooth_iterations=2,
+        )
+        self.assertEqual(new_count, 2)
+        self.assertEqual(new_colors.shape[0], 2)
 
     def test_unify_cut_edges_bridges_gap(self) -> None:
         """两段点选之间的缺口应被硬边最短路桥接成一条切线。"""
