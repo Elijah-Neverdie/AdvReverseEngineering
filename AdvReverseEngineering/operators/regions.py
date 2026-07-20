@@ -15,10 +15,12 @@ from ..algorithms.regions import (
 )
 from ..algorithms.region_split import (
     candidate_hard_edges,
+    count_components_after_cut,
     filter_internal_cut_edges,
     group_candidate_edge_chains,
     grow_ridge_cut_to_boundary,
     prepare_edge_costs,
+    seal_cut_to_region_boundary,
     split_region_by_cut_edges,
     unify_cut_edges_as_line,
 )
@@ -1300,6 +1302,19 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 self._region_ids,
                 target,
             )
+        # unify 内已 seal；再封一次确保多点选后悬空端贴周界
+        if len(unified):
+            unified = seal_cut_to_region_boundary(
+                unified,
+                self._topology,
+                self._region_ids,
+                target,
+                self._edge_costs,
+                self._vert_edge_offsets,
+                self._vert_edge_indices,
+                self._edge_vert_a,
+                self._edge_vert_b,
+            )
         self._ridge_cut_edges = np.asarray(unified, dtype=np.int32)
         self._selected_cut_edges = {int(e) for e in self._ridge_cut_edges.tolist()}
         self._completed_edges = self._ridge_cut_edges.copy()
@@ -1399,6 +1414,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             completed,
             self._colors,
             target_rid=target,
+            min_component_faces=1,
         )
         changed = bool(np.any(new_ids != self._region_ids))
 
@@ -1417,12 +1433,24 @@ class ARE_OT_split_regions(bpy.types.Operator):
             )
             self.report({"INFO"}, scene_props.split_status)
         else:
-            # 不清空红线：允许继续点选补全后再判断
+            # 不清空红线：说明真实原因，便于继续补刀
             scene_props.split_phase = "EDGE"
-            scene_props.split_status = (
-                f"已选切线 {len(completed)} 段，尚无法一分为二。"
-                "请继续点选缺口处的折棱合并补全，出现分色预览后再确认"
+            n_comp = count_components_after_cut(
+                self._region_ids,
+                self._topology,
+                completed,
+                target,
             )
+            if n_comp <= 1:
+                scene_props.split_status = (
+                    f"切线 {len(completed)} 段看起来贯通，但拓扑上领域仍连成一块"
+                    "（两端未封死或背面/侧面仍相连）。"
+                    "请在缺口或另一侧继续点选折棱补刀"
+                )
+            else:
+                scene_props.split_status = (
+                    f"切线已分成 {n_comp} 块但未能写入预览，请再点一次或 Ctrl+Z 后重选"
+                )
             self._preview_ids = None
             self._preview_colors = None
         self._refresh_session(context)

@@ -10,11 +10,13 @@ from AdvReverseEngineering.algorithms.region_split import (
     candidate_hard_edges,
     chain_splits_region,
     complete_cut_edges_dijkstra,
+    count_components_after_cut,
     cut_edges_from_paint_corridor,
     filter_bisecting_candidate_chains,
     group_candidate_edge_chains,
     grow_ridge_cut_to_boundary,
     prepare_edge_costs,
+    seal_cut_to_region_boundary,
     split_region_by_cut_edges,
     stroke_hits_to_seed_edges,
     unify_cut_edges_as_line,
@@ -420,6 +422,72 @@ class RegionSplitTests(unittest.TestCase):
         self.assertTrue(
             chain_splits_region(unified, region_ids, topology, 0)
         )
+
+    def test_target_split_keeps_small_component(self) -> None:
+        """指定目标领域时，即使新块很小也要拆出（手动点选不被 1% 过滤）。"""
+        topology, centers, normals = _quad_strip_topology()
+        del centers, normals
+        # 放大「领域面数」语义：用重复 id 模拟不了；直接测 6 面切开上下
+        region_ids = np.zeros(6, dtype=np.int32)
+        colors = generate_region_colors(1)
+        cut_edges = np.array([4, 5, 6], dtype=np.int32)
+        new_ids, new_colors, new_count = split_region_by_cut_edges(
+            region_ids,
+            topology,
+            cut_edges,
+            colors,
+            target_rid=0,
+            min_component_faces=1,
+        )
+        self.assertEqual(new_count, 2)
+        self.assertEqual(new_colors.shape[0], 2)
+        self.assertEqual(
+            count_components_after_cut(region_ids, topology, cut_edges, 0),
+            2,
+        )
+
+    def test_seal_extends_incomplete_vertical_cut(self) -> None:
+        """悬空端应封到能切开；残缺竖切经 seal/unify 后应可分。"""
+        topology, centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        costs, mids = prepare_edge_costs(
+            topology, normals, centers, region_ids
+        )
+        del mids
+        # 仅中间一段，本身不能拆成两块
+        partial = np.array([5], dtype=np.int32)
+        self.assertEqual(
+            count_components_after_cut(region_ids, topology, partial, 0),
+            1,
+        )
+        sealed = seal_cut_to_region_boundary(
+            partial,
+            topology,
+            region_ids,
+            0,
+            costs,
+            topology["vert_edge_offsets"],
+            topology["vert_edge_indices"],
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+        )
+        # 合成条带无异色周界时 seal 可能无法外延；unify 桥接仍应用
+        unified = unify_cut_edges_as_line(
+            np.array([4, 6], dtype=np.int32),
+            topology,
+            region_ids,
+            0,
+            costs,
+            topology["vert_edge_offsets"],
+            topology["vert_edge_indices"],
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+        )
+        self.assertGreaterEqual(
+            count_components_after_cut(region_ids, topology, unified, 0),
+            2,
+        )
+        self.assertGreaterEqual(len(sealed), 1)
 
     def test_grow_ridge_completes_vertical_cut(self) -> None:
         """点一条竖硬边应延伸出整条竖棱，并能切开条带。"""

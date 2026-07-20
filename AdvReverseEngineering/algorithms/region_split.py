@@ -830,6 +830,19 @@ def unify_cut_edges_as_line(
         for edge_index in best_path:
             completed.add(int(edge_index))
 
+    sealed = seal_cut_to_region_boundary(
+        np.asarray(sorted(completed), dtype=np.int32),
+        topology,
+        region_ids,
+        target,
+        edge_costs,
+        offsets,
+        adj_edges,
+        edge_vert_a,
+        edge_vert_b,
+    )
+    if len(sealed):
+        return sealed
     return np.asarray(sorted(completed), dtype=np.int32)
 
 
@@ -1007,12 +1020,15 @@ def split_region_by_cut_edges(
     cut_edges: np.ndarray,
     colors: np.ndarray,
     target_rid: int | None = None,
+    min_component_faces: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
     将补全边作为邻接屏障，在受影响领域内做连通分量拆分。
 
     最大分量保留原 ID/颜色；其余分量分配新 ID/新色。忽略面不变。
     target_rid 非空时只拆分该领域，且只使用两侧都属于该领域的内部切边。
+    min_component_faces: 新分量最少面数；None 时大领域默认约 1%，
+    手动点选切分请传 1，避免「看起来切开却无预览」。
     """
     ids = np.asarray(region_ids, dtype=np.int32).copy()
     colors = np.asarray(colors, dtype=np.float32)
@@ -1092,16 +1108,17 @@ def split_region_by_cut_edges(
             continue
 
         components.sort(key=len, reverse=True)
-        # 过小碎片不单独成领域（避免「预览闪一下、确认后看不出拆分」）
-        # 大领域上过小碎片不单独成领域；小测试网格不受限
         total_faces = sum(len(c) for c in components)
-        if total_faces >= 100:
+        # 手动点选（指定 min_component_faces）或指定目标领域：保留所有非空新分量
+        if min_component_faces is not None:
+            min_faces = max(1, int(min_component_faces))
+        elif target_rid is not None:
+            min_faces = 1
+        elif total_faces >= 100:
             min_faces = max(3, int(total_faces * 0.01))
-            new_parts = [
-                c for c in components[1:] if len(c) >= min_faces
-            ]
         else:
-            new_parts = components[1:]
+            min_faces = 1
+        new_parts = [c for c in components[1:] if len(c) >= min_faces]
         if not new_parts:
             continue
 
@@ -1125,6 +1142,169 @@ def split_region_by_cut_edges(
         extra = generate_region_colors(region_count - len(colors))
         colors = np.vstack((colors, extra)) if len(colors) else extra
     return ids, colors[:region_count].copy(), region_count
+
+
+def count_components_after_cut(
+    region_ids: np.ndarray,
+    topology: dict,
+    cut_edges: np.ndarray,
+    target_rid: int,
+) -> int:
+    """切线作为屏障后，目标领域的面连通分量数。"""
+    ids = np.asarray(region_ids, dtype=np.int32)
+    target = int(target_rid)
+    members = np.flatnonzero(ids == target)
+    if len(members) == 0:
+        return 0
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    offsets = np.asarray(topology["adjacency_offsets"], dtype=np.int32)
+    adj = np.asarray(topology["adjacency_indices"], dtype=np.int32)
+    barrier_pairs: set[tuple[int, int]] = set()
+    for edge_index in np.asarray(cut_edges, dtype=np.int32).tolist():
+        edge_index = int(edge_index)
+        if edge_index < 0 or edge_index >= len(face_a):
+            continue
+        fa = int(face_a[edge_index])
+        fb = int(face_b[edge_index])
+        if int(ids[fa]) != target or int(ids[fb]) != target:
+            continue
+        barrier_pairs.add((min(fa, fb), max(fa, fb)))
+    if not barrier_pairs:
+        return 1
+    visited = np.zeros(len(ids), dtype=bool)
+    components = 0
+    for start in members.tolist():
+        if visited[start]:
+            continue
+        components += 1
+        stack = [int(start)]
+        visited[start] = True
+        while stack:
+            face = stack.pop()
+            begin = int(offsets[face])
+            end = int(offsets[face + 1])
+            for neighbor in adj[begin:end].tolist():
+                neighbor = int(neighbor)
+                if visited[neighbor] or int(ids[neighbor]) != target:
+                    continue
+                pair = (min(face, neighbor), max(face, neighbor))
+                if pair in barrier_pairs:
+                    continue
+                visited[neighbor] = True
+                stack.append(neighbor)
+    return components
+
+
+def seal_cut_to_region_boundary(
+    cut_edges: np.ndarray,
+    topology: dict,
+    region_ids: np.ndarray,
+    target_rid: int,
+    edge_costs: np.ndarray,
+    vert_edge_offsets: np.ndarray,
+    vert_edge_indices: np.ndarray,
+    edge_vert_a: np.ndarray,
+    edge_vert_b: np.ndarray,
+) -> np.ndarray:
+    """
+    把切线悬空端点封到领域周界，堵住「看起来贯通、面仍可绕行」的缺口。
+    """
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    edge_vert_a = np.asarray(edge_vert_a, dtype=np.int32)
+    edge_vert_b = np.asarray(edge_vert_b, dtype=np.int32)
+    edge_costs = np.asarray(edge_costs, dtype=np.float64)
+    offsets = np.asarray(vert_edge_offsets, dtype=np.int32)
+    adj_edges = np.asarray(vert_edge_indices, dtype=np.int32)
+    target = int(target_rid)
+
+    completed = {
+        int(e)
+        for e in filter_internal_cut_edges(
+            cut_edges, topology, region_ids, target
+        ).tolist()
+    }
+    if not completed:
+        return np.empty(0, dtype=np.int32)
+
+    def vert_on_boundary(vert: int) -> bool:
+        begin = int(offsets[vert])
+        end = int(offsets[vert + 1])
+        for edge_index in adj_edges[begin:end].tolist():
+            if _is_region_boundary_edge(
+                int(edge_index), face_a, face_b, region_ids, target
+            ):
+                return True
+        return False
+
+    degree: dict[int, int] = {}
+    for edge_index in completed:
+        for vert in (
+            int(edge_vert_a[edge_index]),
+            int(edge_vert_b[edge_index]),
+        ):
+            degree[vert] = degree.get(vert, 0) + 1
+    dangling = [v for v, d in degree.items() if d == 1]
+
+    def path_to_boundary(start: int) -> list[int]:
+        if vert_on_boundary(start):
+            return []
+        dist: dict[int, float] = {start: 0.0}
+        prev_edge: dict[int, int | None] = {start: None}
+        prev_vert: dict[int, int | None] = {start: None}
+        heap: list[tuple[float, int]] = [(0.0, start)]
+        reached: int | None = None
+        while heap:
+            cost_u, u = heapq.heappop(heap)
+            if cost_u > dist.get(u, float("inf")) + 1e-12:
+                continue
+            if u != start and vert_on_boundary(u):
+                reached = u
+                break
+            begin = int(offsets[u])
+            end = int(offsets[u + 1])
+            for edge_index in adj_edges[begin:end].tolist():
+                edge_index = int(edge_index)
+                if edge_index in completed:
+                    # 允许沿已有切线走到另一端，但不作为新封边
+                    pass
+                if not _is_internal_region_edge(
+                    edge_index, face_a, face_b, region_ids, target
+                ):
+                    continue
+                va = int(edge_vert_a[edge_index])
+                vb = int(edge_vert_b[edge_index])
+                v_other = vb if va == u else va
+                step = float(edge_costs[edge_index])
+                if not np.isfinite(step) or step < 0.0:
+                    step = 1.0
+                # 已在切线上的边代价极低，便于穿过
+                if edge_index in completed:
+                    step *= 0.01
+                new_cost = cost_u + step
+                if new_cost + 1e-12 >= dist.get(v_other, float("inf")):
+                    continue
+                dist[v_other] = new_cost
+                prev_edge[v_other] = edge_index
+                prev_vert[v_other] = u
+                heapq.heappush(heap, (new_cost, v_other))
+        if reached is None:
+            return []
+        path: list[int] = []
+        cursor = reached
+        while cursor is not None and prev_edge.get(cursor) is not None:
+            edge_index = int(prev_edge[cursor])
+            if edge_index not in completed:
+                path.append(edge_index)
+            cursor = prev_vert.get(cursor)
+        return path
+
+    for vert in dangling:
+        for edge_index in path_to_boundary(int(vert)):
+            completed.add(int(edge_index))
+
+    return np.asarray(sorted(completed), dtype=np.int32)
 
 
 def cut_edges_from_paint_corridor(
@@ -1395,6 +1575,8 @@ __all__ = (
     "filter_internal_cut_edges",
     "grow_ridge_cut_to_boundary",
     "unify_cut_edges_as_line",
+    "seal_cut_to_region_boundary",
+    "count_components_after_cut",
     "stroke_hits_to_seed_edges",
     "complete_cut_edges_dijkstra",
     "split_region_by_cut_edges",
