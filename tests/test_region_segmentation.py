@@ -7,9 +7,9 @@ import unittest
 import numpy as np
 
 from AdvReverseEngineering.algorithms.regions import (
-    REGION_IGNORED_ID,
     blender_wire_edge_fac,
     blender_wire_step_param,
+    build_region_adjacency,
     generate_region_colors,
     segment_regions_by_normal,
     smooth_face_normals,
@@ -389,6 +389,47 @@ class RegionSegmentationTests(unittest.TestCase):
         self.assertGreater(
             float(np.linalg.norm(first[0, :3] - first[1, :3])),
             0.05,
+        )
+
+    def test_adjacent_colors_maximize_contrast(self) -> None:
+        # 2x2 网格邻接：对角可不邻接，边邻接必须拉开。
+        adjacency = (
+            (1, 2),
+            (0, 3),
+            (0, 3),
+            (1, 2),
+        )
+        colors = generate_region_colors(4, adjacency=adjacency)
+        again = generate_region_colors(4, adjacency=adjacency)
+        np.testing.assert_allclose(colors, again)
+        for rid, neighbors in enumerate(adjacency):
+            for nbr in neighbors:
+                if nbr <= rid:
+                    continue
+                dist = float(
+                    np.linalg.norm(colors[rid, :3] - colors[nbr, :3])
+                )
+                self.assertGreater(
+                    dist,
+                    0.35,
+                    msg=f"regions {rid}/{nbr} too similar: {dist:.3f}",
+                )
+
+    def test_build_region_adjacency_from_topology(self) -> None:
+        # 两面共享一边 → 两领域相邻
+        topology = {
+            "edge_face_a": np.array([0], dtype=np.int32),
+            "edge_face_b": np.array([1], dtype=np.int32),
+            "adjacency_offsets": np.array([0, 1, 2], dtype=np.int32),
+            "adjacency_indices": np.array([1, 0], dtype=np.int32),
+        }
+        region_ids = np.array([0, 1], dtype=np.int32)
+        adj = build_region_adjacency(region_ids, topology, 2)
+        self.assertEqual(adj, [[1], [0]])
+        colors = generate_region_colors(2, adjacency=adj)
+        self.assertGreater(
+            float(np.linalg.norm(colors[0, :3] - colors[1, :3])),
+            0.35,
         )
 
 

@@ -10,14 +10,14 @@
     2. 按 Blender edge_fac 公式把相邻面法线夹角映射为线框可见性
     3. 种子区域生长：只越过「线框不可见」的平坦边；双重法线判据防泄漏
     4. 按网格总面积占比过滤离散小领域
-    5. 为有效领域生成稳定可复现的随机色
+    5. 为有效领域生成稳定可复现、邻接可区分的随机色
 """
 
 from __future__ import annotations
 
 from collections import deque
 from math import sqrt
-from typing import TypedDict
+from typing import Sequence, TypedDict
 
 import numpy as np
 
@@ -26,6 +26,8 @@ from ..utils.mesh import FaceTopology
 
 REGION_IGNORED_ID = -1
 COLOR_SEED = 20260717
+# 邻接配色：相邻领域 HSV 对比度下限；低于此值再尝试逃逸色相。
+_MIN_ADJACENT_HSV_CONTRAST = 0.55
 # Blender extract_mesh_vbo_edge_fac.cc::edge_factor_calc 中的缩放常数：
 # fac = clamp(200*(dot-1)+1, 0, 1)；约 acos(0.995)≈5.73° 以上恒为硬边。
 _BLENDER_WIRE_FAC_SCALE = 200.0
@@ -305,50 +307,199 @@ def _grow_regions(
     return np.asarray(labels, dtype=np.int32)
 
 
+def build_region_adjacency(
+    region_ids: np.ndarray,
+    topology: FaceTopology,
+    region_count: int | None = None,
+) -> list[list[int]]:
+    """
+    由共享边构建领域邻接表（无向）。
+
+    返回长度为 region_count 的列表，每项为邻居领域 ID 升序列表。
+    """
+    ids = np.asarray(region_ids, dtype=np.int32)
+    if region_count is None:
+        if len(ids) == 0 or not np.any(ids >= 0):
+            region_count = 0
+        else:
+            region_count = int(ids.max()) + 1
+    region_count = int(region_count)
+    neighbors: list[set[int]] = [set() for _ in range(region_count)]
+    if region_count <= 0 or len(ids) == 0:
+        return [[] for _ in range(region_count)]
+
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    for edge_index in range(len(face_a)):
+        ra = int(ids[int(face_a[edge_index])])
+        rb = int(ids[int(face_b[edge_index])])
+        if ra < 0 or rb < 0 or ra == rb:
+            continue
+        if ra >= region_count or rb >= region_count:
+            continue
+        neighbors[ra].add(rb)
+        neighbors[rb].add(ra)
+    return [sorted(group) for group in neighbors]
+
+
+def _circular_hue_distance(h0: float, h1: float) -> float:
+    delta = abs(float(h0) - float(h1)) % 1.0
+    return float(min(delta, 1.0 - delta))
+
+
+def _hsv_contrast(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+) -> float:
+    """相邻配色用的 HSV 对比度：色相环距离权重大，饱和/明度次之。"""
+    dh = _circular_hue_distance(a[0], b[0])
+    ds = abs(a[1] - b[1])
+    dv = abs(a[2] - b[2])
+    return float(sqrt((dh * 3.2) ** 2 + (ds * 1.15) ** 2 + (dv * 1.05) ** 2))
+
+
+def _hsv_to_rgba(
+    hue: float,
+    sat: float,
+    val: float,
+    alpha: float,
+) -> tuple[float, float, float, float]:
+    sector = int(hue * 6.0)
+    frac = hue * 6.0 - sector
+    p = val * (1.0 - sat)
+    q = val * (1.0 - sat * frac)
+    t = val * (1.0 - sat * (1.0 - frac))
+    sector %= 6
+    if sector == 0:
+        r, g, b = val, t, p
+    elif sector == 1:
+        r, g, b = q, val, p
+    elif sector == 2:
+        r, g, b = p, val, t
+    elif sector == 3:
+        r, g, b = p, q, val
+    elif sector == 4:
+        r, g, b = t, p, val
+    else:
+        r, g, b = val, p, q
+    return (float(r), float(g), float(b), float(alpha))
+
+
+def _candidate_hsv_palette(
+    count: int,
+    seed: int,
+) -> list[tuple[float, float, float]]:
+    """高饱和、多明度带的候选色，色相按黄金角铺开。"""
+    rng = np.random.default_rng(seed)
+    base = float(rng.random())
+    sat_bands = (0.92, 0.78, 0.88, 0.70)
+    val_bands = (0.92, 0.78, 0.86, 0.70)
+    palette: list[tuple[float, float, float]] = []
+    for index in range(count):
+        hue = (base + index * 0.61803398875) % 1.0
+        sat = sat_bands[index % len(sat_bands)]
+        val = val_bands[(index // 2) % len(val_bands)]
+        palette.append((float(hue), float(sat), float(val)))
+    return palette
+
+
+def _escape_hsv(
+    neighbor_hsv: Sequence[tuple[float, float, float]],
+) -> tuple[float, float, float]:
+    """在邻居色相环最大空隙处落点，并拉高饱和/明度。"""
+    if not neighbor_hsv:
+        return (0.0, 0.92, 0.88)
+    hues = sorted(float(item[0]) % 1.0 for item in neighbor_hsv)
+    best_hue = 0.0
+    best_gap = -1.0
+    for index, hue in enumerate(hues):
+        nxt = hues[(index + 1) % len(hues)]
+        if index + 1 < len(hues):
+            gap = nxt - hue
+            mid = (hue + nxt) * 0.5
+        else:
+            gap = (nxt + 1.0) - hue
+            mid = (hue + gap * 0.5) % 1.0
+        if gap > best_gap:
+            best_gap = gap
+            best_hue = mid % 1.0
+    mean_sat = sum(item[1] for item in neighbor_hsv) / len(neighbor_hsv)
+    mean_val = sum(item[2] for item in neighbor_hsv) / len(neighbor_hsv)
+    sat = 0.95 if mean_sat < 0.85 else 0.72
+    val = 0.90 if mean_val < 0.82 else 0.68
+    return (float(best_hue), float(sat), float(val))
+
+
 def generate_region_colors(
     region_count: int,
     seed: int = COLOR_SEED,
     alpha: float = 0.45,
+    adjacency: Sequence[Sequence[int]] | None = None,
 ) -> np.ndarray:
     """
     生成稳定、可区分的半透明随机色。
 
-    使用黄金分割色相偏移，避免相邻编号颜色过于接近。
+    无邻接表时：黄金分割色相 + 饱和/明度分带，避免编号相近时撞色。
+    有邻接表时：按度数贪心，为每个领域选与已着色邻居对比度最大的候选色；
+    非邻接领域可复用同色。同 seed / 同邻接结果可复现。
     """
     if region_count <= 0:
         return np.empty((0, 4), dtype=np.float32)
 
-    rng = np.random.default_rng(seed)
-    # 固定偏移后按黄金角排布色相，再轻微扰动饱和度/明度。
-    base = float(rng.random())
-    hues = (base + np.arange(region_count) * 0.61803398875) % 1.0
-    saturations = 0.55 + 0.35 * rng.random(region_count)
-    values = 0.70 + 0.25 * rng.random(region_count)
+    if adjacency is None:
+        palette = _candidate_hsv_palette(region_count, seed)
+        colors = np.empty((region_count, 4), dtype=np.float32)
+        for index, (hue, sat, val) in enumerate(palette):
+            colors[index] = _hsv_to_rgba(hue, sat, val, alpha)
+        return colors
+
+    adj: list[list[int]] = [[] for _ in range(region_count)]
+    for rid in range(min(region_count, len(adjacency))):
+        adj[rid] = [
+            int(nbr)
+            for nbr in adjacency[rid]
+            if 0 <= int(nbr) < region_count and int(nbr) != rid
+        ]
+
+    candidate_count = max(region_count * 3, 48)
+    candidates = _candidate_hsv_palette(candidate_count, seed)
+    order = sorted(
+        range(region_count),
+        key=lambda rid: (-len(adj[rid]), rid),
+    )
+    assigned: list[tuple[float, float, float] | None] = [
+        None for _ in range(region_count)
+    ]
+
+    for rid in order:
+        neighbor_hsv = [
+            assigned[nbr]
+            for nbr in adj[rid]
+            if assigned[nbr] is not None
+        ]
+        best_hsv: tuple[float, float, float] | None = None
+        best_score = -1.0
+        for cand in candidates:
+            if not neighbor_hsv:
+                score = 1.0
+            else:
+                score = min(_hsv_contrast(cand, nbr) for nbr in neighbor_hsv)
+            if score > best_score + 1e-12:
+                best_score = score
+                best_hsv = cand
+                if not neighbor_hsv:
+                    break
+        if best_hsv is None:
+            best_hsv = candidates[rid % len(candidates)]
+            best_score = 0.0
+        if neighbor_hsv and best_score < _MIN_ADJACENT_HSV_CONTRAST:
+            best_hsv = _escape_hsv(neighbor_hsv)
+        assigned[rid] = best_hsv
 
     colors = np.empty((region_count, 4), dtype=np.float32)
-    for index in range(region_count):
-        hue = float(hues[index])
-        sat = float(saturations[index])
-        val = float(values[index])
-        sector = int(hue * 6.0)
-        frac = hue * 6.0 - sector
-        p = val * (1.0 - sat)
-        q = val * (1.0 - sat * frac)
-        t = val * (1.0 - sat * (1.0 - frac))
-        sector %= 6
-        if sector == 0:
-            r, g, b = val, t, p
-        elif sector == 1:
-            r, g, b = q, val, p
-        elif sector == 2:
-            r, g, b = p, val, t
-        elif sector == 3:
-            r, g, b = p, q, val
-        elif sector == 4:
-            r, g, b = t, p, val
-        else:
-            r, g, b = val, p, q
-        colors[index] = (r, g, b, alpha)
+    for rid in range(region_count):
+        hue, sat, val = assigned[rid] or candidates[rid % len(candidates)]
+        colors[rid] = _hsv_to_rgba(hue, sat, val, alpha)
     return colors
 
 
@@ -529,7 +680,8 @@ def segment_regions_by_normal(
 
     # 压缩为稠密 0..K-1（碎屑已并入，不再产生忽略面）
     compacted, _remap, region_count = compact_region_ids(temp_ids)
-    colors = generate_region_colors(region_count)
+    adjacency = build_region_adjacency(compacted, topology, region_count)
+    colors = generate_region_colors(region_count, adjacency=adjacency)
 
     return RegionSegmentationResult(
         region_ids=compacted,
