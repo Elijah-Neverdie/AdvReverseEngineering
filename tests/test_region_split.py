@@ -421,6 +421,35 @@ class RegionSplitTests(unittest.TestCase):
             chain_splits_region(completed, region_ids, topology, 0)
         )
 
+    def test_grow_ridge_follows_direction_not_side_boundary(self) -> None:
+        """有坐标时沿竖棱方向延伸，补全整条竖硬边。"""
+        topology, centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        costs, mids = prepare_edge_costs(
+            topology, normals, centers, region_ids
+        )
+        vertices = np.zeros((12, 3), dtype=np.float64)
+        for y in range(3):
+            for x in range(4):
+                vertices[y * 4 + x] = (float(x), float(2 - y), 0.0)
+        completed = grow_ridge_cut_to_boundary(
+            5,
+            topology,
+            region_ids,
+            0,
+            costs,
+            mids,
+            topology["vert_edge_offsets"],
+            topology["vert_edge_indices"],
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+            vertices=vertices,
+        )
+        self.assertTrue(set(completed.tolist()).issuperset({4, 5, 6}))
+        # 不应把平坦水平边卷进来
+        for flat in (0, 1, 2, 3):
+            self.assertNotIn(flat, set(completed.tolist()))
+
 
 class MergeTransactionLogicTests(unittest.TestCase):
     """合并内存事务风格的撤销/重做栈逻辑（纯数据）。"""

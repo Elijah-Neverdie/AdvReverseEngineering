@@ -389,150 +389,220 @@ def grow_ridge_cut_to_boundary(
     vertices: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    从一条种子短边两端沿硬边代价延伸，直到抵达领域边界，形成完整分割棱。
+    从种子短边两端沿棱线方向贪心延伸，形成完整分割硬棱。
 
-    不限制搜索半径；每步优先走更硬（代价更低）且方向更连续的内部边，
-    碰到领域边界边则纳入并终止该方向。
+    关键：不再用「到任意领域边界的最短路」——那会横向抄近道，
+    只留下极短切线。改为每步在当前顶点选取「方向最连续 × 最硬」
+    的下一条边，直到碰到领域边界或无合格续边。
     """
+    del edge_mids  # 保留参数签名兼容调用方
     seed = int(seed_edge)
     face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
     face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
     edge_vert_a = np.asarray(edge_vert_a, dtype=np.int32)
     edge_vert_b = np.asarray(edge_vert_b, dtype=np.int32)
     edge_costs = np.asarray(edge_costs, dtype=np.float64)
-    edge_mids = np.asarray(edge_mids, dtype=np.float64)
     if seed < 0 or seed >= len(edge_vert_a):
         return np.empty(0, dtype=np.int32)
 
-    completed: set[int] = {seed}
     verts = (
         np.asarray(vertices, dtype=np.float64)
-        if vertices is not None
+        if vertices is not None and len(vertices)
         else None
     )
+    seed_hardness = max(0.0, 1.0 - float(edge_costs[seed]))
+    # 续边硬度下限：允许比种子略软（缓棱中段），但不走明显平坦边
+    min_hardness = max(0.05, seed_hardness * 0.25)
+    min_align = 0.2
+    max_steps = 200000
+
+    def other_vert(edge_index: int, from_vert: int) -> int:
+        va = int(edge_vert_a[edge_index])
+        vb = int(edge_vert_b[edge_index])
+        return vb if va == from_vert else va
 
     def edge_dir(edge_index: int, from_vert: int) -> np.ndarray | None:
         if verts is None:
             return None
-        va = int(edge_vert_a[edge_index])
-        vb = int(edge_vert_b[edge_index])
-        other = vb if va == from_vert else va
+        other = other_vert(edge_index, from_vert)
+        if other < 0 or other >= len(verts) or from_vert >= len(verts):
+            return None
         delta = verts[other] - verts[from_vert]
         length = float(np.linalg.norm(delta))
         if length < 1e-12:
             return None
         return delta / length
 
-    def extend_from(start_vert: int, incoming_dir: np.ndarray | None) -> list[int]:
-        """从顶点沿硬棱 Dijkstra 到最近领域边界。"""
-        dist: dict[int, float] = {start_vert: 0.0}
-        prev_edge: dict[int, int | None] = {start_vert: None}
-        prev_vert: dict[int, int | None] = {start_vert: None}
-        heap: list[tuple[float, int]] = [(0.0, start_vert)]
-        goal_vert: int | None = None
-        best_vert = start_vert
-        best_score = -1.0
+    def hardness(edge_index: int) -> float:
+        return max(0.0, 1.0 - float(edge_costs[edge_index]))
 
-        while heap:
-            cost_u, u = heapq.heappop(heap)
-            if cost_u > dist.get(u, float("inf")) + 1e-12:
-                continue
+    def score_edge(
+        edge_index: int,
+        from_vert: int,
+        travel: np.ndarray | None,
+        *,
+        is_boundary: bool,
+    ) -> float:
+        hard = hardness(edge_index)
+        align = 1.0
+        if travel is not None:
+            ed = edge_dir(edge_index, from_vert)
+            if ed is None:
+                return -1.0
+            align = float(np.dot(travel, ed))
+            if align < min_align:
+                return -1.0
+        if is_boundary:
+            # 方向对上的边界：作为终点优先结束
+            return 2.0 + align
+        if hard < min_hardness:
+            return -1.0
+        # 方向权重大于绝对硬度，保证沿棱走而非横向抄近
+        return hard * (0.25 + 0.75 * align)
 
-            # 当前行进方向：来自父边，否则用种子方向
-            parent_e = prev_edge.get(u)
-            if parent_e is not None and prev_vert.get(u) is not None:
-                travel = edge_dir(int(parent_e), int(prev_vert[u]))
-            else:
-                travel = incoming_dir
+    def greedy_extend(start_vert: int, prev_vert: int) -> list[int]:
+        path: list[int] = []
+        current = int(start_vert)
+        previous = int(prev_vert)
+        used: set[int] = {seed}
+        for _ in range(max_steps):
+            travel = None
+            if verts is not None and 0 <= previous < len(verts) and 0 <= current < len(verts):
+                delta = verts[current] - verts[previous]
+                length = float(np.linalg.norm(delta))
+                if length > 1e-12:
+                    travel = delta / length
+            elif verts is None:
+                # 无坐标时用种子边作为弱方向提示（无法算 align，靠硬度）
+                travel = None
 
-            begin = int(vert_edge_offsets[u])
-            end = int(vert_edge_offsets[u + 1])
+            begin = int(vert_edge_offsets[current])
+            end = int(vert_edge_offsets[current + 1])
+            best_edge = None
+            best_score = -1.0
+            best_other = -1
+            best_is_boundary = False
+
             for edge_index in vert_edge_indices[begin:end].tolist():
                 edge_index = int(edge_index)
-                if edge_index in completed and edge_index != seed:
-                    # 允许免费穿过已走路径，避免绕圈代价爆炸
-                    pass
-
-                va = int(edge_vert_a[edge_index])
-                vb = int(edge_vert_b[edge_index])
-                v_other = vb if va == u else va
+                if edge_index in used:
+                    continue
+                v_other = other_vert(edge_index, current)
+                if v_other == previous:
+                    continue
 
                 if _is_region_boundary_edge(
                     edge_index, face_a, face_b, region_ids, target_rid
                 ):
-                    # 边界边：低代价纳入并作为终点
-                    step = 0.02
-                    if travel is not None:
-                        ed = edge_dir(edge_index, u)
-                        if ed is not None:
-                            step += 0.08 * max(0.0, 1.0 - float(np.dot(travel, ed)))
-                    new_cost = cost_u + step
-                    if new_cost < dist.get(v_other, float("inf")):
-                        dist[v_other] = new_cost
-                        prev_edge[v_other] = edge_index
-                        prev_vert[v_other] = u
-                        goal_vert = v_other
-                        heap.clear()
-                    break
+                    score = score_edge(
+                        edge_index, current, travel, is_boundary=True
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_edge = edge_index
+                        best_other = v_other
+                        best_is_boundary = True
+                    continue
 
                 if not _is_internal_region_edge(
                     edge_index, face_a, face_b, region_ids, target_rid
                 ):
                     continue
 
-                if edge_index in completed:
-                    step = 1e-6
-                else:
-                    step = float(edge_costs[edge_index])
-                    if travel is not None:
-                        ed = edge_dir(edge_index, u)
-                        if ed is not None:
-                            # 偏向继续沿棱线方向，抑制横向分叉
-                            align = float(np.dot(travel, ed))
-                            step *= 1.0 + 0.85 * max(0.0, 1.0 - align)
-
-                new_cost = cost_u + step
-                if new_cost >= dist.get(v_other, float("inf")):
-                    continue
-                dist[v_other] = new_cost
-                prev_edge[v_other] = edge_index
-                prev_vert[v_other] = u
-
-                hardness = max(0.0, 1.0 - float(edge_costs[edge_index]))
-                # 更硬且走得更远优先作为兜底终点
-                score = hardness * (1.0 + float(np.linalg.norm(
-                    edge_mids[edge_index] - edge_mids[seed]
-                )))
+                score = score_edge(
+                    edge_index, current, travel, is_boundary=False
+                )
                 if score > best_score:
                     best_score = score
-                    best_vert = v_other
+                    best_edge = edge_index
+                    best_other = v_other
+                    best_is_boundary = False
 
-                heapq.heappush(heap, (new_cost, v_other))
+            # 无坐标时：在合格边中选最硬者
+            if best_edge is None and travel is None:
+                for edge_index in vert_edge_indices[begin:end].tolist():
+                    edge_index = int(edge_index)
+                    if edge_index in used:
+                        continue
+                    v_other = other_vert(edge_index, current)
+                    if v_other == previous:
+                        continue
+                    if _is_region_boundary_edge(
+                        edge_index, face_a, face_b, region_ids, target_rid
+                    ):
+                        score = 1.0 + hardness(edge_index)
+                        if score > best_score:
+                            best_score = score
+                            best_edge = edge_index
+                            best_other = v_other
+                            best_is_boundary = True
+                        continue
+                    if not _is_internal_region_edge(
+                        edge_index, face_a, face_b, region_ids, target_rid
+                    ):
+                        continue
+                    hard = hardness(edge_index)
+                    if hard < min_hardness:
+                        continue
+                    if hard > best_score:
+                        best_score = hard
+                        best_edge = edge_index
+                        best_other = v_other
+                        best_is_boundary = False
 
-            if goal_vert is not None:
+            if best_edge is None and travel is not None:
+                # 缓棱中段：绝对硬度不够时，取方向合格的局部最硬边
+                local: list[tuple[float, float, int, int]] = []
+                for edge_index in vert_edge_indices[begin:end].tolist():
+                    edge_index = int(edge_index)
+                    if edge_index in used:
+                        continue
+                    v_other = other_vert(edge_index, current)
+                    if v_other == previous:
+                        continue
+                    if not _is_internal_region_edge(
+                        edge_index, face_a, face_b, region_ids, target_rid
+                    ):
+                        continue
+                    ed = edge_dir(edge_index, current)
+                    if ed is None:
+                        continue
+                    align = float(np.dot(travel, ed))
+                    if align < min_align:
+                        continue
+                    hard = hardness(edge_index)
+                    local.append((hard, align, edge_index, v_other))
+                if local:
+                    local.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                    hard0, align0, edge0, other0 = local[0]
+                    # 要求明显是该方向上的局部硬棱（相对次优更硬）
+                    if hard0 >= 0.05 and (
+                        len(local) == 1 or hard0 >= local[1][0] * 0.85
+                    ):
+                        best_edge = edge0
+                        best_other = other0
+                        best_is_boundary = False
+                        best_score = hard0
+
+            if best_edge is None:
                 break
 
-        if goal_vert is None:
-            goal_vert = best_vert
+            path.append(int(best_edge))
+            used.add(int(best_edge))
+            if best_is_boundary:
+                break
+            previous = current
+            current = int(best_other)
 
-        path: list[int] = []
-        cursor = goal_vert
-        while cursor is not None and prev_edge.get(cursor) is not None:
-            edge_index = int(prev_edge[cursor])
-            if edge_index not in completed:
-                path.append(edge_index)
-            cursor = prev_vert.get(cursor)
         return path
 
+    completed: set[int] = {seed}
     va = int(edge_vert_a[seed])
     vb = int(edge_vert_b[seed])
-    seed_dir_ab = edge_dir(seed, va)
-    seed_dir_ba = edge_dir(seed, vb)
-    for edge_index in extend_from(va, seed_dir_ab):
+    for edge_index in greedy_extend(va, vb):
         completed.add(int(edge_index))
-    for edge_index in extend_from(vb, seed_dir_ba):
+    for edge_index in greedy_extend(vb, va):
         completed.add(int(edge_index))
-
     return np.asarray(sorted(completed), dtype=np.int32)
 
 
