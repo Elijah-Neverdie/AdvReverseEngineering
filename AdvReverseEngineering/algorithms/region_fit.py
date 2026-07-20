@@ -1273,13 +1273,14 @@ def collect_interior_angle_labels(
     min_deviation_deg: float = 4.0,
     lift: float = 0.0,
     normal: np.ndarray | None = None,
+    force_indices: Sequence[int] | None = None,
 ) -> list[dict]:
     """
     为闭环折线各显著内角生成标注数据。
 
     points 与返回的 world_co / face_center 使用同一坐标空间
     （拟合流程里来自 extract_mesh_data，已是世界坐标）。
-    返回元素含: text, angle_deg, hairpin_deg, world_co, face_center, normal。
+    force_indices：强制标注的下标（折角/凹折等），不受 min_deviation 过滤。
     """
     pts = _as_float_array(points)
     if len(pts) < 3:
@@ -1305,9 +1306,13 @@ def collect_interior_angle_labels(
             normal_vec = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
     extent = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
-    # 仅沿法线略抬，避免平面偏移把标签甩出边界
-    lift_dist = float(max(lift, extent * 0.015, 1e-4))
+    lift_dist = float(max(lift, extent * 0.02, 1e-4))
     min_dev = float(max(min_deviation_deg, 0.0))
+    forced = {
+        int(i) % len(pts)
+        for i in (force_indices or ())
+        if int(i) >= 0
+    }
 
     labels: list[dict] = []
     count = len(pts)
@@ -1315,8 +1320,9 @@ def collect_interior_angle_labels(
         local = _vertex_interior_angle_deg_2d(pts2, index)
         hairpin = _vertex_hairpin_interior_angle_deg_2d(pts2, index)
         angle = float(max(local, hairpin))
-        if abs(angle - 180.0) < min_dev and abs(local - 180.0) < min_dev:
-            continue
+        if index not in forced:
+            if abs(angle - 180.0) < min_dev and abs(local - 180.0) < min_dev:
+                continue
 
         face_center = pts[index].copy()
         world_co = face_center + normal_vec * lift_dist
@@ -3977,11 +3983,6 @@ def extract_island_longest_sides(
         sample_count = len(loop_rs)
         pts_2d = project_points_to_plane(loop_rs, origin, axis_u, axis_v)
         normal_guess = _normalize(np.cross(axis_u, axis_v))
-        angle_labels = collect_interior_angle_labels(
-            loop_rs,
-            min_deviation_deg=12.0,
-            normal=normal_guess,
-        )
         corners = detect_corner_indices(
             pts_2d,
             corner_angle_deg,
@@ -4009,6 +4010,14 @@ def extract_island_longest_sides(
         if len(split_indices) < 2:
             half = max(sample_count // 2, 1)
             split_indices = [0, half]
+
+        # 折角/凹折点强制出度数标注（调试用，不受平直过滤）
+        angle_labels = collect_interior_angle_labels(
+            loop_rs,
+            min_deviation_deg=15.0,
+            normal=normal_guess,
+            force_indices=split_indices,
+        )
 
         island_folds = [loop_rs[index].copy() for index in fold_indices]
         ordered_splits = sorted(

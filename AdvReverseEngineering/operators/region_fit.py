@@ -887,9 +887,13 @@ class ARE_OT_fit_region(bpy.types.Operator):
             {
                 "labels": labels,
                 "object_name": self._object.name,
-                "preview_version": int(getattr(self, "_preview_serial", 0)),
+                "preview_version": int(getattr(self, "_preview_serial", 0)) + 1,
+                # 调试标注：不做朝向/遮挡剔除，否则边界点几乎全被滤掉
+                "skip_facing": True,
+                "skip_occlusion": True,
             }
         )
+        self._preview_serial = int(getattr(self, "_preview_serial", 0)) + 1
         register_label_draw_handler()
 
     def confirm_from_panel(self, context: bpy.types.Context) -> None:

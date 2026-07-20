@@ -220,17 +220,21 @@ def _update_label_session_projections(
         exclude_obj = bpy.data.objects.get(object_name)
 
     labels = session.get("labels", [])
+    skip_facing = bool(session.get("skip_facing", False))
+    skip_occlusion = bool(session.get("skip_occlusion", False))
     for label in labels:
         world = label.get("world_co")
         normal = label.get("normal")
-        if world is None or normal is None:
+        if world is None:
             label["visible"] = False
             label["screen_xy"] = None
             label["face_screen_xy"] = None
             continue
+        if normal is None:
+            normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
         view_dir = view_direction_to_point(rv3d, world)
-        if not is_label_facing_camera(normal, view_dir):
+        if not skip_facing and not is_label_facing_camera(normal, view_dir):
             label["visible"] = False
             label["screen_xy"] = None
             label["face_screen_xy"] = None
@@ -241,7 +245,7 @@ def _update_label_session_projections(
         else:
             ray_origin = view_origin
 
-        if is_world_point_occluded(
+        if (not skip_occlusion) and is_world_point_occluded(
             depsgraph,
             ray_origin,
             world,
