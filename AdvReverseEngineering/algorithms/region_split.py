@@ -15,7 +15,9 @@ from .regions import (
     REGION_IGNORED_ID,
     blender_wire_edge_fac,
     blender_wire_step_param,
+    compact_region_ids,
     generate_region_colors,
+    remap_region_colors,
 )
 
 
@@ -1014,6 +1016,152 @@ def complete_cut_edges_dijkstra(
     return np.asarray(sorted(completed), dtype=np.int32)
 
 
+def _merge_component_into_best_keeper(
+    component: list[int],
+    keeper_faces: dict[int, set[int]],
+    keeper_rids: list[int],
+    offsets: np.ndarray,
+    adj: np.ndarray,
+    ids: np.ndarray,
+) -> int:
+    """按共享边数把碎块并入最佳保留分量，返回目标 rid。"""
+    votes: dict[int, int] = {rid: 0 for rid in keeper_rids}
+    face_to_keeper: dict[int, int] = {}
+    for rid, faces in keeper_faces.items():
+        for face in faces:
+            face_to_keeper[face] = rid
+    for face in component:
+        begin = int(offsets[face])
+        end = int(offsets[face + 1])
+        for neighbor in adj[begin:end].tolist():
+            neighbor = int(neighbor)
+            kr = face_to_keeper.get(neighbor)
+            if kr is not None:
+                votes[kr] = votes.get(kr, 0) + 1
+    best_rid = max(keeper_rids, key=lambda rid: (votes.get(rid, 0), -rid))
+    return int(best_rid)
+
+
+def smooth_region_boundaries(
+    region_ids: np.ndarray,
+    topology: dict,
+    focus_ids: set[int] | None = None,
+    iterations: int = 3,
+) -> np.ndarray:
+    """
+    对领域边界做保守多数投票平滑，去掉单面锯齿/毛刺。
+
+    仅翻转「自身邻接极少、对侧成多数」的毛刺面，避免吞掉整块新领域。
+    """
+    ids = np.asarray(region_ids, dtype=np.int32).copy()
+    offsets = np.asarray(topology["adjacency_offsets"], dtype=np.int32)
+    adj = np.asarray(topology["adjacency_indices"], dtype=np.int32)
+    face_count = len(ids)
+    if face_count == 0 or iterations <= 0:
+        return ids
+
+    for _ in range(int(iterations)):
+        nxt = ids.copy()
+        flipped = 0
+        for face in range(face_count):
+            rid = int(ids[face])
+            if rid < 0:
+                continue
+            if focus_ids is not None and rid not in focus_ids:
+                continue
+            begin = int(offsets[face])
+            end = int(offsets[face + 1])
+            if end <= begin:
+                continue
+            votes: dict[int, int] = {}
+            for neighbor in adj[begin:end].tolist():
+                nr = int(ids[int(neighbor)])
+                if nr < 0:
+                    continue
+                votes[nr] = votes.get(nr, 0) + 1
+            if not votes:
+                continue
+            own = votes.get(rid, 0)
+            best_rid, best_n = max(
+                votes.items(),
+                key=lambda item: (item[1], -item[0]),
+            )
+            # 只剔「单面毛刺」：自己一侧 ≤1，对侧 ≥2 且严格更多
+            if best_rid != rid and own <= 1 and best_n >= 2 and best_n > own:
+                nxt[face] = int(best_rid)
+                flipped += 1
+        ids = nxt
+        if flipped == 0:
+            break
+    return ids
+
+
+def absorb_small_regions_by_face_count(
+    region_ids: np.ndarray,
+    topology: dict,
+    min_faces: int,
+    colors: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """按面数吸收碎屑领域并压缩 ID / 重排颜色。"""
+    ids = np.asarray(region_ids, dtype=np.int32).copy()
+    colors = np.asarray(colors, dtype=np.float32)
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    min_faces = max(1, int(min_faces))
+
+    for _ in range(32):
+        if not np.any(ids >= 0):
+            break
+        region_total = int(ids.max()) + 1
+        counts = np.bincount(ids[ids >= 0], minlength=region_total)
+        small = [
+            rid
+            for rid in range(region_total)
+            if int(counts[rid]) > 0 and int(counts[rid]) < min_faces
+        ]
+        if not small:
+            break
+        small_set = set(small)
+        border: dict[int, dict[int, int]] = {rid: {} for rid in small}
+        for edge_index in range(len(face_a)):
+            fa = int(face_a[edge_index])
+            fb = int(face_b[edge_index])
+            ra = int(ids[fa])
+            rb = int(ids[fb])
+            if ra < 0 or rb < 0 or ra == rb:
+                continue
+            if ra in small_set and rb not in small_set:
+                border[ra][rb] = border[ra].get(rb, 0) + 1
+            elif rb in small_set and ra not in small_set:
+                border[rb][ra] = border[rb].get(ra, 0) + 1
+            elif ra in small_set and rb in small_set:
+                border[ra][rb] = border[ra].get(rb, 0) + 1
+                border[rb][ra] = border[rb].get(ra, 0) + 1
+        changed = 0
+        for rid in small:
+            neighbors = border.get(rid) or {}
+            if not neighbors:
+                continue
+            best_rid = None
+            best_key = None
+            for nbr, shared in neighbors.items():
+                nbr_faces = int(counts[nbr]) if nbr < len(counts) else 0
+                key = (1 if nbr not in small_set else 0, shared, nbr_faces)
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_rid = int(nbr)
+            if best_rid is None or best_rid == rid:
+                continue
+            ids[ids == rid] = best_rid
+            changed += 1
+        if changed == 0:
+            break
+
+    compacted, remap, count = compact_region_ids(ids)
+    new_colors = remap_region_colors(colors, remap, count)
+    return compacted, new_colors, count
+
+
 def split_region_by_cut_edges(
     region_ids: np.ndarray,
     topology: dict,
@@ -1021,14 +1169,13 @@ def split_region_by_cut_edges(
     colors: np.ndarray,
     target_rid: int | None = None,
     min_component_faces: int | None = None,
+    smooth_iterations: int = 3,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
     将补全边作为邻接屏障，在受影响领域内做连通分量拆分。
 
-    最大分量保留原 ID/颜色；其余分量分配新 ID/新色。忽略面不变。
-    target_rid 非空时只拆分该领域，且只使用两侧都属于该领域的内部切边。
-    min_component_faces: 新分量最少面数；None 时大领域默认约 1%，
-    手动点选切分请传 1，避免「看起来切开却无预览」。
+    最大分量保留原 ID/颜色；主要新块分配新 ID；锯齿碎块并入邻块，
+    再做边界平滑，避免拆出大量零碎彩色面。
     """
     ids = np.asarray(region_ids, dtype=np.int32).copy()
     colors = np.asarray(colors, dtype=np.float32)
@@ -1042,7 +1189,6 @@ def split_region_by_cut_edges(
     offsets = np.asarray(topology["adjacency_offsets"], dtype=np.int32)
     adj = np.asarray(topology["adjacency_indices"], dtype=np.int32)
 
-    # 仅内部边（两侧同属目标/同一领域）才构成切开屏障
     barrier_pairs: set[tuple[int, int]] = set()
     affected: set[int] = set()
     for edge_index in cut_set:
@@ -1071,6 +1217,7 @@ def split_region_by_cut_edges(
 
     next_id = int(ids.max()) + 1 if np.any(ids >= 0) else 0
     new_color_rows: list[np.ndarray] = []
+    touched_ids: set[int] = set()
 
     for rid in sorted(affected):
         members = np.flatnonzero(ids == rid)
@@ -1109,39 +1256,121 @@ def split_region_by_cut_edges(
 
         components.sort(key=len, reverse=True)
         total_faces = sum(len(c) for c in components)
-        # 手动点选（指定 min_component_faces）或指定目标领域：保留所有非空新分量
+        largest = len(components[0])
+
+        # 保留阈值：显式传入优先；否则按领域规模，且保证「第二大块够大」也能拆
         if min_component_faces is not None:
             min_faces = max(1, int(min_component_faces))
-        elif target_rid is not None:
-            min_faces = 1
-        elif total_faces >= 100:
-            min_faces = max(3, int(total_faces * 0.01))
+        elif total_faces >= 200:
+            min_faces = max(12, int(total_faces * 0.008))
+        elif total_faces >= 40:
+            min_faces = max(5, int(total_faces * 0.02))
         else:
             min_faces = 1
-        new_parts = [c for c in components[1:] if len(c) >= min_faces]
-        if not new_parts:
+
+        keepers: list[list[int]] = [components[0]]
+        keeper_index_set = {0}
+        for index, component in enumerate(components[1:], start=1):
+            size = len(component)
+            if size >= min_faces:
+                keepers.append(component)
+                keeper_index_set.add(index)
+            elif index == 1 and size >= max(1, int(largest * 0.03)):
+                # 第二大块至少约为最大块 3%：视为有效对切，而非锯齿碎屑
+                keepers.append(component)
+                keeper_index_set.add(index)
+
+        if len(keepers) < 2:
             continue
 
+        # 至多保留「原块 + 若干主新块」，避免一次拆出几十个彩色碎面
+        max_new = 3
+        if len(keepers) > 1 + max_new:
+            # 只保留最大的几个；其余改回「非 keeper」
+            keepers = keepers[: 1 + max_new]
+            keeper_index_set = set()
+            # 重新按 components 匹配 keepers（按对象身份）
+            keeper_id_set = {id(c) for c in keepers}
+            for index, component in enumerate(components):
+                if id(component) in keeper_id_set:
+                    keeper_index_set.add(index)
+
+        keeper_rids: list[int] = [int(rid)]
+        keeper_faces: dict[int, set[int]] = {
+            int(rid): set(keepers[0]),
+        }
         base = colors[rid] if rid < len(colors) else np.array(
             [0.5, 0.5, 0.8, 0.55],
             dtype=np.float32,
         )
-        for offset_index, component in enumerate(new_parts):
+        touched_ids.add(int(rid))
+
+        for offset_index, component in enumerate(keepers[1:]):
             new_rid = next_id
             next_id += 1
             for face in component:
                 ids[face] = new_rid
+            keeper_rids.append(new_rid)
+            keeper_faces[new_rid] = set(component)
             new_color_rows.append(_contrast_color(base, offset_index))
+            touched_ids.add(new_rid)
 
-    region_count = int(ids.max()) + 1 if np.any(ids >= 0) else 0
+        # 锯齿碎块并入共享边最多的主块（不单独成色）
+        for index, component in enumerate(components):
+            if index in keeper_index_set:
+                continue
+            target_keep = _merge_component_into_best_keeper(
+                component,
+                keeper_faces,
+                keeper_rids,
+                offsets,
+                adj,
+                ids,
+            )
+            for face in component:
+                ids[face] = target_keep
+                keeper_faces[target_keep].add(face)
+
     if new_color_rows:
         colors = np.vstack(
             (colors, np.vstack(new_color_rows))
         ).astype(np.float32)
-    if len(colors) < region_count:
-        extra = generate_region_colors(region_count - len(colors))
-        colors = np.vstack((colors, extra)) if len(colors) else extra
-    return ids, colors[:region_count].copy(), region_count
+
+    if not touched_ids:
+        region_count = int(ids.max()) + 1 if np.any(ids >= 0) else 0
+        if len(colors) < region_count:
+            extra = generate_region_colors(region_count - len(colors))
+            colors = np.vstack((colors, extra)) if len(colors) else extra
+        return ids, colors[:region_count].copy(), region_count
+
+    # 边界平滑：去掉锯齿毛刺
+    if smooth_iterations > 0:
+        ids = smooth_region_boundaries(
+            ids,
+            topology,
+            focus_ids=touched_ids,
+            iterations=int(smooth_iterations),
+        )
+
+    # 再吸收残留碎屑（平滑可能产生的小岛）；上限封顶，避免吞掉有效新块
+    members = (
+        int(np.count_nonzero(region_ids == int(target_rid)))
+        if target_rid is not None
+        else int(np.count_nonzero(region_ids >= 0))
+    )
+    if members >= 200:
+        absorb_min = max(3, min(24, int(members * 0.0015)))
+    elif members >= 40:
+        absorb_min = max(2, min(8, int(members * 0.02)))
+    else:
+        absorb_min = 1
+    ids, colors, region_count = absorb_small_regions_by_face_count(
+        ids,
+        topology,
+        absorb_min,
+        colors,
+    )
+    return ids, colors, region_count
 
 
 def count_components_after_cut(
@@ -1580,5 +1809,7 @@ __all__ = (
     "stroke_hits_to_seed_edges",
     "complete_cut_edges_dijkstra",
     "split_region_by_cut_edges",
+    "smooth_region_boundaries",
+    "absorb_small_regions_by_face_count",
     "cut_edges_from_paint_corridor",
 )

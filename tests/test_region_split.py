@@ -423,11 +423,33 @@ class RegionSplitTests(unittest.TestCase):
             chain_splits_region(unified, region_ids, topology, 0)
         )
 
-    def test_target_split_keeps_small_component(self) -> None:
-        """指定目标领域时，即使新块很小也要拆出（手动点选不被 1% 过滤）。"""
+    def test_target_split_keeps_main_component(self) -> None:
+        """对切应保留主块；碎屑不会各自成色。"""
         topology, centers, normals = _quad_strip_topology()
         del centers, normals
-        # 放大「领域面数」语义：用重复 id 模拟不了；直接测 6 面切开上下
+        region_ids = np.zeros(6, dtype=np.int32)
+        colors = generate_region_colors(1)
+        cut_edges = np.array([4, 5, 6], dtype=np.int32)
+        new_ids, new_colors, new_count = split_region_by_cut_edges(
+            region_ids,
+            topology,
+            cut_edges,
+            colors,
+            target_rid=0,
+            smooth_iterations=0,
+        )
+        self.assertEqual(new_count, 2)
+        self.assertEqual(new_colors.shape[0], 2)
+        self.assertEqual(
+            count_components_after_cut(region_ids, topology, cut_edges, 0),
+            2,
+        )
+
+    def test_split_absorbs_sliver_components(self) -> None:
+        """锯齿切线产生的碎屑应并入主块，不产生大量新色。"""
+        topology, centers, normals = _quad_strip_topology()
+        del centers, normals
+        # 6 面全领域；切断后若人为多块，优化后仍应是干净两块或一块
         region_ids = np.zeros(6, dtype=np.int32)
         colors = generate_region_colors(1)
         cut_edges = np.array([4, 5, 6], dtype=np.int32)
@@ -438,13 +460,11 @@ class RegionSplitTests(unittest.TestCase):
             colors,
             target_rid=0,
             min_component_faces=1,
+            smooth_iterations=2,
         )
-        self.assertEqual(new_count, 2)
-        self.assertEqual(new_colors.shape[0], 2)
-        self.assertEqual(
-            count_components_after_cut(region_ids, topology, cut_edges, 0),
-            2,
-        )
+        self.assertLessEqual(new_count, 3)
+        self.assertEqual(len(np.unique(new_ids[new_ids >= 0])), new_count)
+        self.assertEqual(new_colors.shape[0], new_count)
 
     def test_seal_extends_incomplete_vertical_cut(self) -> None:
         """悬空端应封到能切开；残缺竖切经 seal/unify 后应可分。"""
