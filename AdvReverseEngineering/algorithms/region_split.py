@@ -76,6 +76,35 @@ def prepare_edge_costs(
     return costs.astype(np.float64, copy=False), mids.astype(np.float64, copy=False)
 
 
+def candidate_hard_edges(
+    topology: dict,
+    region_ids: np.ndarray,
+    target_rid: int,
+    edge_costs: np.ndarray,
+    hardness_min: float,
+) -> np.ndarray:
+    """
+    目标领域内部、硬度不低于阈值的候选硬边索引。
+
+    硬度近似 hardness = clamp(1 - cost, 0, 1)；
+    跨领域边（代价被抬高）不会入选。
+    """
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    costs = np.asarray(edge_costs, dtype=np.float64)
+    if len(face_a) == 0 or len(costs) == 0:
+        return np.empty(0, dtype=np.int32)
+
+    rid = np.asarray(region_ids, dtype=np.int32)
+    target = int(target_rid)
+    internal = (rid[face_a] == target) & (rid[face_b] == target)
+    hardness = np.clip(1.0 - costs, 0.0, 1.0)
+    mask = internal & (hardness >= float(hardness_min))
+    if not np.any(mask):
+        return np.empty(0, dtype=np.int32)
+    return np.flatnonzero(mask).astype(np.int32)
+
+
 def stroke_hits_to_seed_edges(
     faces: Iterable[int],
     worlds: np.ndarray,
@@ -742,6 +771,7 @@ def cut_edges_from_paint_corridor(
 
 __all__ = (
     "prepare_edge_costs",
+    "candidate_hard_edges",
     "stroke_hits_to_seed_edges",
     "complete_cut_edges_dijkstra",
     "split_region_by_cut_edges",

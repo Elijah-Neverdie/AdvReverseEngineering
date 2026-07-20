@@ -14,7 +14,8 @@ from ..algorithms.regions import (
     segment_regions_by_normal,
 )
 from ..algorithms.region_split import (
-    cut_edges_from_paint_corridor,
+    candidate_hard_edges,
+    complete_cut_edges_dijkstra,
     prepare_edge_costs,
     split_region_by_cut_edges,
 )
@@ -40,13 +41,13 @@ from ..utils.viewport import hit_test_labels
 REGION_ID_ATTR = "are_region_id"
 REGION_VERSION_ATTR = "are_region_version"
 REGION_COLORS_ATTR = "are_region_colors"
-STROKE_SAMPLE_PX = 5.0
 MODAL_TIMER_STEP = 0.1
-SPLIT_DEBOUNCE_SEC = 0.5
-BRUSH_RADIUS_DEFAULT = 40.0
-BRUSH_RADIUS_MIN = 8.0
-BRUSH_RADIUS_MAX = 200.0
-BRUSH_RADIUS_STEP = 6.0
+EDGE_PICK_PX = 14.0
+HARD_THRESHOLD_DEFAULT = 0.35
+HARD_THRESHOLD_MIN = 0.15
+HARD_THRESHOLD_MAX = 0.95
+HARD_THRESHOLD_STEP = 0.05
+SPLIT_PREVIEW_DEBOUNCE_SEC = 0.12
 
 
 def _add_modal_timer(operator, context: bpy.types.Context):
@@ -909,14 +910,14 @@ class ARE_OT_confirm_split_regions(bpy.types.Operator):
 
 class ARE_OT_split_regions(bpy.types.Operator):
     """
-    先选编号领域，再用可调圆形笔刷涂红；
-    松开后 0.5 秒自动硬边补全并分色预览；确认后写入。
+    先选编号领域，再显示候选硬边粗线；
+    点选硬边（可多选），Ctrl+滚轮调阈值，自动补全并分色预览后确认写入。
     """
 
     bl_idname = "are.split_regions"
     bl_label = "拆分领域"
     bl_description = (
-        "点击编号选择领域，[] 调笔刷粗细，涂红后等待预览，确认拆分"
+        "点击编号选择领域，Ctrl+滚轮调硬边阈值，点选硬边拆分"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -963,17 +964,10 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._debounce_timer = None
         self._debounce_token = None
 
-    def _schedule_debounce(self, context: bpy.types.Context) -> None:
+    def _schedule_preview(self, context: bpy.types.Context) -> None:
         self._cancel_debounce_timer()
         token = object()
         self._debounce_token = token
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        scene_props.split_status = (
-            f"目标 {scene_props.split_target_id} · "
-            f"已涂 {len(self._paint_faces)} 面 · "
-            f"{SPLIT_DEBOUNCE_SEC:.1f}s 后自动预览"
-        )
-        _tag_redraw(context)
 
         def _callback():
             if getattr(self, "_debounce_token", None) is not token:
@@ -981,7 +975,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             if not getattr(self, "_alive", False):
                 return None
             try:
-                self._run_corridor_preview(bpy.context)
+                self._run_edge_preview(bpy.context)
             except Exception as exc:
                 scene = getattr(bpy.context.scene, SCENE_PROP_NAME, None)
                 if scene is not None:
@@ -989,30 +983,37 @@ class ARE_OT_split_regions(bpy.types.Operator):
             return None
 
         self._debounce_timer = _callback
-        bpy.app.timers.register(_callback, first_interval=SPLIT_DEBOUNCE_SEC)
+        bpy.app.timers.register(
+            _callback,
+            first_interval=SPLIT_PREVIEW_DEBOUNCE_SEC,
+        )
 
     def _refresh_session(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        paint = (
-            np.asarray(sorted(self._paint_faces), dtype=np.int32)
-            if self._paint_faces
+        hover_world = np.empty((0, 2, 3), dtype=np.float64)
+        hover = getattr(self, "_hover_edge", None)
+        if hover is not None:
+            hover_world = self._edges_to_world(
+                np.asarray([hover], dtype=np.int32)
+            )
+        selected = (
+            np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
+            if self._selected_cut_edges
             else np.empty(0, dtype=np.int32)
         )
         session = {
             "object_name": self._object.name,
-            "paint_faces": paint,
+            "candidate_edges_world": self._candidate_edges_world,
+            "selected_edges_world": self._edges_to_world(selected),
+            "hover_edge_world": hover_world,
             "completed_edges_world": self._completed_edges_world,
             "preview_ids": self._preview_ids,
             "preview_colors": self._preview_colors,
             "base_ids": self._region_ids,
             "preview_version": self._preview_serial,
-            "brush": {
-                "screen_xy": self._brush_xy,
-                "radius_px": float(self._brush_radius),
-            },
         }
         set_split_stroke_session(session)
-        scene_props.split_brush_radius = float(self._brush_radius)
+        scene_props.split_hard_threshold = float(self._hard_threshold)
         _tag_redraw(context)
 
     def _set_phase_select(self, context: bpy.types.Context) -> None:
@@ -1022,7 +1023,10 @@ class ARE_OT_split_regions(bpy.types.Operator):
         scene_props.split_status = (
             "点击编号选择要拆分的领域；Esc 取消"
         )
-        self._paint_faces.clear()
+        self._selected_cut_edges.clear()
+        self._candidate_edges = np.empty(0, dtype=np.int32)
+        self._candidate_edges_world = np.empty((0, 2, 3), dtype=np.float64)
+        self._hover_edge = None
         self._preview_ids = None
         self._preview_colors = None
         self._completed_edges = np.empty(0, dtype=np.int32)
@@ -1039,198 +1043,154 @@ class ARE_OT_split_regions(bpy.types.Operator):
         register_label_draw_handler()
         self._refresh_session(context)
 
-    def _set_phase_brush(self, context: bpy.types.Context, target_id: int) -> None:
+    def _set_phase_edge(self, context: bpy.types.Context, target_id: int) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        scene_props.split_phase = "BRUSH"
+        scene_props.split_phase = "EDGE"
         scene_props.split_target_id = int(target_id)
-        scene_props.split_status = (
-            f"已选领域 {target_id} · [] 调半径 · "
-            "按住左键涂红 · 松开 0.5s 后预览"
-        )
-        self._paint_faces.clear()
+        self._selected_cut_edges.clear()
+        self._hover_edge = None
         self._preview_ids = None
         self._preview_colors = None
         self._completed_edges = np.empty(0, dtype=np.int32)
         self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
         self._preview_serial += 1
-        # 保留标签以便换目标；也可隐藏。这里保留并高亮目标。
         session = get_merge_label_session()
         if session is not None:
             session["preview_version"] = self._preview_serial
+        self._rebuild_candidates(context)
+        scene_props.split_status = (
+            f"已选领域 {target_id} · "
+            f"阈值 {self._hard_threshold:.2f} · "
+            f"候选 {len(self._candidate_edges)} 条 · "
+            "点选硬边 · Ctrl+滚轮调阈值"
+        )
         self._refresh_session(context)
 
-    def _sample_hit(self, context: bpy.types.Context, event) -> dict | None:
-        from bpy_extras import view3d_utils
-        from mathutils.bvhtree import BVHTree
-
-        region = context.region
-        rv3d = context.region_data
-        if region is None or rv3d is None:
-            return None
-
-        coord = (event.mouse_region_x, event.mouse_region_y)
-        origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
-        direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
-        if direction.length < 1e-12:
-            return None
-        direction.normalize()
-
-        if self._bvh is None:
-            mesh = self._object.data
-            verts = [v.co.copy() for v in mesh.vertices]
-            polys = [tuple(p.vertices) for p in mesh.polygons]
-            self._bvh = BVHTree.FromPolygons(verts, polys)
-
-        matrix = self._object.matrix_world
-        inv = matrix.inverted()
-        local_origin = inv @ origin
-        local_direction = (inv.to_3x3() @ direction).normalized()
-        location, normal, index, _distance = self._bvh.ray_cast(
-            local_origin,
-            local_direction,
-        )
-        if location is None or index is None:
-            return None
-
-        world = matrix @ location
-        world_n = (matrix.to_3x3() @ normal).normalized()
-        view_dir = (world - origin).normalized()
-        if world_n.dot(-view_dir) < 0.05:
-            return None
-
-        rid = int(self._region_ids[int(index)])
-        if rid < 0:
-            return None
-
-        return {
-            "face": int(index),
-            "world": np.array((world.x, world.y, world.z), dtype=np.float64),
-            "normal": np.array(
-                (world_n.x, world_n.y, world_n.z),
-                dtype=np.float64,
-            ),
-            "screen": np.array(
-                (float(coord[0]), float(coord[1])),
-                dtype=np.float64,
-            ),
-            "region_id": rid,
-            "view_origin": np.array(
-                (origin.x, origin.y, origin.z),
-                dtype=np.float64,
-            ),
-        }
-
-    def _world_brush_radius(
-        self,
-        context: bpy.types.Context,
-        hit: dict,
-    ) -> float:
-        """把屏幕像素半径换算为命中点切平面上的世界半径。"""
-        from bpy_extras import view3d_utils
-        from mathutils import Vector
-
-        region = context.region
-        rv3d = context.region_data
-        if region is None or rv3d is None:
-            return float(self._max_radius * 0.05)
-
-        center = Vector(hit["world"])
-        screen = hit["screen"]
-        offset = (
-            float(screen[0]) + float(self._brush_radius),
-            float(screen[1]),
-        )
-        # 与中心同深度的偏移点
-        depth_loc = view3d_utils.location_3d_to_region_2d(
-            region,
-            rv3d,
-            center,
-        )
-        if depth_loc is None:
-            return float(self._max_radius * 0.05)
-        # region_2d_to_location_3d 需要深度参考点
-        offset_world = view3d_utils.region_2d_to_location_3d(
-            region,
-            rv3d,
-            offset,
-            center,
-        )
-        radius = float((Vector(offset_world) - center).length)
-        return max(radius, 1e-6)
-
-    def _paint_at(self, context: bpy.types.Context, event) -> None:
-        hit = self._sample_hit(context, event)
-        self._brush_xy = (
-            float(event.mouse_region_x),
-            float(event.mouse_region_y),
-        )
-        if hit is None:
-            self._refresh_session(context)
-            return
-
-        target = int(
-            getattr(context.scene, SCENE_PROP_NAME).split_target_id
-        )
-        if int(hit["region_id"]) != target:
-            self._refresh_session(context)
-            return
-
-        world_radius = self._world_brush_radius(context, hit)
-        center = hit["world"]
-        centers = self._mesh_data["face_centers"]
-        deltas = centers - center
-        dist_sq = np.sum(deltas * deltas, axis=1)
-        radius_sq = world_radius * world_radius
-        candidates = np.flatnonzero(dist_sq <= radius_sq * 1.05)
-        if len(candidates) == 0:
-            candidates = np.asarray([hit["face"]], dtype=np.int32)
-
-        added = False
-        for face in candidates.tolist():
-            if int(self._region_ids[face]) != target:
-                continue
-            if face not in self._paint_faces:
-                self._paint_faces.add(int(face))
-                added = True
-            self._stroke_worlds.append(centers[face].copy())
-
-        # 保证中心命中面一定在内
-        if hit["face"] not in self._paint_faces:
-            self._paint_faces.add(int(hit["face"]))
-            added = True
-
-        if added:
-            # 新涂绘使旧预览失效
-            self._preview_ids = None
-            self._preview_colors = None
-            self._completed_edges = np.empty(0, dtype=np.int32)
-            self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
-            self._preview_serial += 1
-        self._refresh_session(context)
-
-    def _run_corridor_preview(self, context: bpy.types.Context) -> None:
+    def _rebuild_candidates(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         target = int(scene_props.split_target_id)
-        if target < 0 or not self._paint_faces:
-            scene_props.split_status = "请先涂绘拆分区域"
+        if target < 0:
+            self._candidate_edges = np.empty(0, dtype=np.int32)
+            self._candidate_edges_world = np.empty((0, 2, 3), dtype=np.float64)
+            return
+        self._candidate_edges = candidate_hard_edges(
+            self._topology,
+            self._region_ids,
+            target,
+            self._edge_costs,
+            float(self._hard_threshold),
+        )
+        cand_set = set(int(e) for e in self._candidate_edges.tolist())
+        self._selected_cut_edges = {
+            e for e in self._selected_cut_edges if e in cand_set
+        }
+        self._candidate_edges_world = self._edges_to_world(self._candidate_edges)
+        if self._hover_edge is not None and self._hover_edge not in cand_set:
+            self._hover_edge = None
+
+    def _adjust_threshold(self, context: bpy.types.Context, delta: float) -> None:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        self._hard_threshold = float(
+            min(
+                HARD_THRESHOLD_MAX,
+                max(HARD_THRESHOLD_MIN, self._hard_threshold + delta),
+            )
+        )
+        scene_props.split_hard_threshold = float(self._hard_threshold)
+        self._rebuild_candidates(context)
+        scene_props.split_status = (
+            f"硬边阈值 {self._hard_threshold:.2f} · "
+            f"候选 {len(self._candidate_edges)} 条 · "
+            f"已选 {len(self._selected_cut_edges)} 条"
+        )
+        self._preview_serial += 1
+        if self._selected_cut_edges:
+            self._schedule_preview(context)
+        else:
+            self._clear_preview_keep_selection(context)
+        self._refresh_session(context)
+
+    def _clear_preview_keep_selection(self, context: bpy.types.Context) -> None:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        self._preview_ids = None
+        self._preview_colors = None
+        self._completed_edges = np.empty(0, dtype=np.int32)
+        self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
+        if scene_props.split_target_id >= 0:
+            scene_props.split_phase = "EDGE"
+
+    def _pick_candidate_edge(self, context: bpy.types.Context, event):
+        """屏幕空间最近候选边中点；超出拾取半径返回 None。"""
+        from bpy_extras import view3d_utils
+
+        region = context.region
+        rv3d = context.region_data
+        if region is None or rv3d is None:
+            return None
+        if len(self._candidate_edges) == 0:
+            return None
+        mx = float(event.mouse_region_x)
+        my = float(event.mouse_region_y)
+        best_edge = None
+        best_dist = float(EDGE_PICK_PX)
+        for edge_index in self._candidate_edges.tolist():
+            mid = self._edge_mids[int(edge_index)]
+            screen = view3d_utils.location_3d_to_region_2d(
+                region,
+                rv3d,
+                mid,
+            )
+            if screen is None:
+                continue
+            dx = float(screen.x) - mx
+            dy = float(screen.y) - my
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_edge = int(edge_index)
+        return best_edge
+
+    def _toggle_edge(self, context: bpy.types.Context, edge_index: int) -> None:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        if edge_index in self._selected_cut_edges:
+            self._selected_cut_edges.discard(edge_index)
+        else:
+            self._selected_cut_edges.add(int(edge_index))
+        self._preview_serial += 1
+        if self._selected_cut_edges:
+            scene_props.split_status = (
+                f"已选 {len(self._selected_cut_edges)} 条硬边 · "
+                f"阈值 {self._hard_threshold:.2f} · 正在预览…"
+            )
+            self._schedule_preview(context)
+        else:
+            self._clear_preview_keep_selection(context)
+            scene_props.split_status = (
+                f"已选领域 {scene_props.split_target_id} · "
+                f"阈值 {self._hard_threshold:.2f} · "
+                f"候选 {len(self._candidate_edges)} 条 · 点选硬边"
+            )
+        self._refresh_session(context)
+
+    def _run_edge_preview(self, context: bpy.types.Context) -> None:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        target = int(scene_props.split_target_id)
+        if target < 0 or not self._selected_cut_edges:
+            self._clear_preview_keep_selection(context)
             self._refresh_session(context)
             return
 
-        stroke = (
-            np.asarray(self._stroke_worlds, dtype=np.float64)
-            if self._stroke_worlds
-            else self._mesh_data["face_centers"][
-                np.asarray(sorted(self._paint_faces), dtype=np.int32)
-            ]
-        )
-        completed, message = cut_edges_from_paint_corridor(
-            np.asarray(sorted(self._paint_faces), dtype=np.int32),
+        seed = np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
+        stroke = self._edge_mids[seed]
+        completed = complete_cut_edges_dijkstra(
             self._topology,
             self._mesh_data["normals"],
             self._mesh_data["face_centers"],
             self._region_ids,
             target,
+            seed,
             stroke,
+            np.empty((0, 2), dtype=np.float64),
             self._edge_costs,
             self._edge_mids,
             self._vert_edge_offsets,
@@ -1239,14 +1199,13 @@ class ARE_OT_split_regions(bpy.types.Operator):
             self._edge_vert_b,
             max_radius=self._max_radius,
         )
-        if message:
-            scene_props.split_status = message
-            scene_props.split_phase = "BRUSH"
+        if len(completed) == 0:
+            scene_props.split_phase = "EDGE"
+            scene_props.split_status = "未能补全切线，请再选几条硬边"
+            self._completed_edges = seed
+            self._completed_edges_world = self._edges_to_world(seed)
             self._preview_ids = None
             self._preview_colors = None
-            self._completed_edges = completed
-            # 仍显示已找到的边提示
-            self._completed_edges_world = self._edges_to_world(completed)
             self._preview_serial += 1
             self._refresh_session(context)
             return
@@ -1257,19 +1216,30 @@ class ARE_OT_split_regions(bpy.types.Operator):
             completed,
             self._colors,
         )
+        # 若未真正拆出新分量，仍进入预览但给出提示
+        changed = bool(np.any(new_ids != self._region_ids))
         self._completed_edges = completed
         self._completed_edges_world = self._edges_to_world(completed)
         self._preview_ids = new_ids
         self._preview_colors = new_colors
         self._preview_count = int(new_count)
         self._preview_serial += 1
-        scene_props.split_phase = "PREVIEW"
-        scene_props.split_status = (
-            f"预览完成：{self._live_base_count} → {new_count} 个领域 · "
-            "确认拆分保存 · Ctrl+Z 清除涂绘 · Esc 取消"
-        )
+        if changed:
+            scene_props.split_phase = "PREVIEW"
+            scene_props.split_status = (
+                f"预览：{self._live_base_count} → {new_count} 个领域 · "
+                "确认拆分保存 · Ctrl+Z 清除选中 · Esc 取消"
+            )
+        else:
+            scene_props.split_phase = "EDGE"
+            scene_props.split_status = (
+                "切线未能把领域分成两块，请继续点选硬边"
+            )
+            self._preview_ids = None
+            self._preview_colors = None
         self._refresh_session(context)
-        self.report({"INFO"}, scene_props.split_status)
+        if changed:
+            self.report({"INFO"}, scene_props.split_status)
 
     def _edges_to_world(self, edges: np.ndarray) -> np.ndarray:
         verts = self._mesh_data["vertices"]
@@ -1283,24 +1253,24 @@ class ARE_OT_split_regions(bpy.types.Operator):
             return np.empty((0, 2, 3), dtype=np.float64)
         return np.asarray(lines, dtype=np.float64)
 
-    def _undo_paint(self, context: bpy.types.Context) -> None:
+    def _undo_selection(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         self._cancel_debounce_timer()
-        if self._preview_ids is not None or self._paint_faces:
-            self._paint_faces.clear()
-            self._stroke_worlds.clear()
+        if self._preview_ids is not None or self._selected_cut_edges:
+            self._selected_cut_edges.clear()
+            self._hover_edge = None
             self._preview_ids = None
             self._preview_colors = None
             self._completed_edges = np.empty(0, dtype=np.int32)
             self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
             self._preview_serial += 1
             scene_props.split_phase = (
-                "BRUSH" if scene_props.split_target_id >= 0 else "SELECT"
+                "EDGE" if scene_props.split_target_id >= 0 else "SELECT"
             )
-            scene_props.split_status = "已清除涂绘/预览，可重新涂绘"
+            scene_props.split_status = "已清除选中边/预览，可重新点选"
             self._refresh_session(context)
             return
-        scene_props.split_status = "没有可撤销的涂绘"
+        scene_props.split_status = "没有可撤销的选中边"
         _tag_redraw(context)
 
     def _commit_splits(self, context: bpy.types.Context) -> bool:
@@ -1401,22 +1371,26 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._edge_vert_b = edge_vert_b
         self._vert_edge_offsets = offsets
         self._vert_edge_indices = both_e.astype(np.int32, copy=False)
-        self._bvh = None
-        self._paint_faces: set[int] = set()
-        self._stroke_worlds: list[np.ndarray] = []
+        self._candidate_edges = np.empty(0, dtype=np.int32)
+        self._candidate_edges_world = np.empty((0, 2, 3), dtype=np.float64)
+        self._selected_cut_edges: set[int] = set()
+        self._hover_edge = None
         self._preview_ids = None
         self._preview_colors = None
         self._preview_count = region_count
         self._completed_edges = np.empty(0, dtype=np.int32)
         self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
         self._preview_serial = 0
-        self._brush_radius = float(
-            getattr(scene_props, "split_brush_radius", BRUSH_RADIUS_DEFAULT)
-            or BRUSH_RADIUS_DEFAULT
+        self._hard_threshold = float(
+            getattr(scene_props, "split_hard_threshold", HARD_THRESHOLD_DEFAULT)
+            or HARD_THRESHOLD_DEFAULT
         )
-        self._brush_xy = None
-        self._painting = False
-        self._last_sample_xy = None
+        self._hard_threshold = float(
+            min(
+                HARD_THRESHOLD_MAX,
+                max(HARD_THRESHOLD_MIN, self._hard_threshold),
+            )
+        )
         self._committed = False
         self._closed = False
         self._alive = True
@@ -1427,7 +1401,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         scene_props.split_mode_active = True
         scene_props.split_confirm_requested = False
         scene_props.split_hover_id = -1
-        scene_props.split_brush_radius = float(self._brush_radius)
+        scene_props.split_hard_threshold = float(self._hard_threshold)
         scene_props.region_object = obj
         register_split_draw_handler()
         self._set_phase_select(context)
@@ -1457,7 +1431,6 @@ class ARE_OT_split_regions(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         obj = self._object
 
-        # 侧栏确认已直接完成提交并清理，模态只需静默结束。
         if getattr(self, "_closed", False):
             return {"FINISHED"}
 
@@ -1483,7 +1456,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             return {"RUNNING_MODAL"}
 
         if _is_undo_event(event):
-            self._undo_paint(context)
+            self._undo_selection(context)
             return {"RUNNING_MODAL"}
 
         if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
@@ -1514,28 +1487,35 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 return {"FINISHED"}
             return {"RUNNING_MODAL"}
 
-        # [] 调整笔刷半径
-        if event.value == "PRESS" and event.type in {
-            "LEFT_BRACKET",
-            "RIGHT_BRACKET",
-        }:
-            if event.type == "LEFT_BRACKET":
-                self._brush_radius = max(
-                    BRUSH_RADIUS_MIN,
-                    self._brush_radius - BRUSH_RADIUS_STEP,
+        # Ctrl + 滚轮：调节硬边阈值
+        if event.ctrl and event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
+            phase = str(scene_props.split_phase)
+            if phase in {"EDGE", "PREVIEW"}:
+                delta = (
+                    HARD_THRESHOLD_STEP
+                    if event.type == "WHEELUPMOUSE"
+                    else -HARD_THRESHOLD_STEP
                 )
-            else:
-                self._brush_radius = min(
-                    BRUSH_RADIUS_MAX,
-                    self._brush_radius + BRUSH_RADIUS_STEP,
-                )
-            scene_props.split_brush_radius = float(self._brush_radius)
-            scene_props.split_status = (
-                f"笔刷半径 {self._brush_radius:.0f}px · "
-                f"目标 {scene_props.split_target_id}"
+                self._adjust_threshold(context, delta)
+                return {"RUNNING_MODAL"}
+
+        # 面板滑条改阈值时同步（任意事件轮询）
+        panel_thr = float(
+            getattr(scene_props, "split_hard_threshold", self._hard_threshold)
+        )
+        if abs(panel_thr - self._hard_threshold) > 1e-6 and str(
+            scene_props.split_phase
+        ) in {"EDGE", "PREVIEW"}:
+            self._hard_threshold = float(
+                min(HARD_THRESHOLD_MAX, max(HARD_THRESHOLD_MIN, panel_thr))
             )
+            self._rebuild_candidates(context)
+            self._preview_serial += 1
+            if self._selected_cut_edges:
+                self._schedule_preview(context)
+            else:
+                self._clear_preview_keep_selection(context)
             self._refresh_session(context)
-            return {"RUNNING_MODAL"}
 
         if context.space_data is None or context.space_data.type != "VIEW_3D":
             return {"PASS_THROUGH"}
@@ -1571,48 +1551,24 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 )
                 if hit is None:
                     return {"RUNNING_MODAL"}
-                self._set_phase_brush(context, int(hit))
+                self._set_phase_edge(context, int(hit))
                 return {"RUNNING_MODAL"}
             return {"PASS_THROUGH"}
 
-        # BRUSH / PREVIEW
-        self._brush_xy = (
-            float(event.mouse_region_x),
-            float(event.mouse_region_y),
-        )
-
-        if event.type == "LEFTMOUSE" and event.value == "PRESS":
-            self._cancel_debounce_timer()
-            self._painting = True
-            self._last_sample_xy = None
-            self._paint_at(context, event)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
-            if self._painting:
-                self._painting = False
-                if self._paint_faces:
-                    self._schedule_debounce(context)
-                else:
-                    self._refresh_session(context)
-            return {"RUNNING_MODAL"}
-
+        # EDGE / PREVIEW：硬边点选
         if event.type == "MOUSEMOVE":
-            if self._painting:
-                if self._last_sample_xy is not None:
-                    dx = event.mouse_region_x - self._last_sample_xy[0]
-                    dy = event.mouse_region_y - self._last_sample_xy[1]
-                    if (dx * dx + dy * dy) < STROKE_SAMPLE_PX * STROKE_SAMPLE_PX:
-                        self._refresh_session(context)
-                        return {"RUNNING_MODAL"}
-                self._last_sample_xy = (
-                    event.mouse_region_x,
-                    event.mouse_region_y,
-                )
-                self._paint_at(context, event)
-            else:
+            hover = self._pick_candidate_edge(context, event)
+            if hover != self._hover_edge:
+                self._hover_edge = hover
                 self._refresh_session(context)
             return {"PASS_THROUGH"}
+
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            hit = self._pick_candidate_edge(context, event)
+            if hit is None:
+                return {"RUNNING_MODAL"}
+            self._toggle_edge(context, int(hit))
+            return {"RUNNING_MODAL"}
 
         return {"PASS_THROUGH"}
 

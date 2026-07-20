@@ -448,15 +448,29 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
     split_phase: StringProperty(
         name="拆分阶段",
-        description="SELECT / BRUSH / PREVIEW / IDLE",
+        description="SELECT / EDGE / PREVIEW / IDLE",
         default="IDLE",
     )
     split_brush_radius: FloatProperty(
         name="拆分笔刷半径",
-        description="圆形笔刷屏幕像素半径，可用 [ ] 调节",
+        description="旧版圆形笔刷半径（兼容保留）",
         default=40.0,
         min=8.0,
         max=200.0,
+    )
+    split_hard_threshold: FloatProperty(
+        name="硬边阈值",
+        description=(
+            "候选硬边最低硬度（0~1）；Ctrl+滚轮调节。"
+            "越高只显示更硬的边"
+        ),
+        default=0.35,
+        min=0.15,
+        max=0.95,
+        soft_min=0.2,
+        soft_max=0.8,
+        precision=2,
+        step=5,
     )
     show_split_help: BoolProperty(
         name="拆分说明",

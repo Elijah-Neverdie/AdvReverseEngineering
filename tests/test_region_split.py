@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 
 from AdvReverseEngineering.algorithms.region_split import (
+    candidate_hard_edges,
     complete_cut_edges_dijkstra,
     cut_edges_from_paint_corridor,
     prepare_edge_costs,
@@ -288,6 +289,41 @@ class RegionSplitTests(unittest.TestCase):
         )
         self.assertEqual(len(completed), 0)
         self.assertTrue(message)
+
+    def test_candidate_hard_edges_filters(self) -> None:
+        topology, centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        costs, _mids = prepare_edge_costs(
+            topology, normals, centers, region_ids
+        )
+        # 垂直硬边 4,5,6 硬度高；水平平坦边硬度低
+        hard = candidate_hard_edges(
+            topology, region_ids, 0, costs, hardness_min=0.35
+        )
+        hard_set = set(hard.tolist())
+        self.assertTrue(hard_set.issuperset({4, 5, 6}))
+        # 平坦边在高阈值下不应入选
+        soft = candidate_hard_edges(
+            topology, region_ids, 0, costs, hardness_min=0.9
+        )
+        soft_set = set(soft.tolist())
+        self.assertTrue(soft_set.issubset(hard_set))
+        for flat_edge in (0, 1, 2, 3):
+            self.assertNotIn(flat_edge, soft_set)
+
+    def test_candidate_excludes_cross_region_edges(self) -> None:
+        topology, centers, normals = _quad_strip_topology()
+        # 上下分成两个领域：0,1,2 vs 3,4,5；垂直边成跨领域边
+        region_ids = np.array([0, 0, 0, 1, 1, 1], dtype=np.int32)
+        costs, _mids = prepare_edge_costs(
+            topology, normals, centers, region_ids
+        )
+        hard = candidate_hard_edges(
+            topology, region_ids, 0, costs, hardness_min=0.1
+        )
+        # 跨领域垂直边 4,5,6 不得作为领域 0 内部候选
+        for cross in (4, 5, 6):
+            self.assertNotIn(cross, set(hard.tolist()))
 
 
 class MergeTransactionLogicTests(unittest.TestCase):

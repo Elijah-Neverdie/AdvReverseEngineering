@@ -397,40 +397,34 @@ def get_split_stroke_session() -> dict | None:
 
 
 def draw_split_brush_cursor() -> None:
-    """POST_PIXEL：圆形笔刷光标。"""
-    context = bpy.context
-    if context is None or context.scene is None:
+    """POST_PIXEL：旧版笔刷光标（硬边点选模式不再使用）。"""
+    return
+
+
+def _draw_edge_lines_world(edges_world, color, width: float) -> None:
+    """绘制 (N,2,3) 世界空间线段。"""
+    if edges_world is None or len(edges_world) == 0:
         return
-    scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
-    if scene_props is None or not scene_props.split_mode_active:
+    segments = []
+    for edge in np.asarray(edges_world):
+        if len(edge) < 2:
+            continue
+        segments.append(tuple(map(float, edge[0])))
+        segments.append(tuple(map(float, edge[1])))
+    if not segments:
         return
-    session = _SPLIT_STROKE_SESSION
-    if session is None:
-        return
-    brush = session.get("brush")
-    if not brush:
-        return
-    xy = brush.get("screen_xy")
-    radius = float(brush.get("radius_px", 0.0))
-    if xy is None or radius <= 1.0:
-        return
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "LINES", {"pos": segments})
     gpu.state.blend_set("ALPHA")
+    gpu.state.depth_test_set("LESS_EQUAL")
+    gpu.state.line_width_set(float(width))
     try:
-        # 外环
-        _draw_circle_outline_2d(
-            float(xy[0]),
-            float(xy[1]),
-            radius,
-            (1.0, 0.25, 0.15, 0.95),
-            segments=48,
-        )
-        _draw_circle_2d(
-            float(xy[0]),
-            float(xy[1]),
-            2.5,
-            (1.0, 0.3, 0.2, 0.9),
-        )
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
     finally:
+        gpu.state.line_width_set(1.0)
+        gpu.state.depth_test_set("NONE")
         gpu.state.blend_set("NONE")
 
 
@@ -465,7 +459,7 @@ def _draw_circle_outline_2d(
 
 
 def draw_split_stroke_preview() -> None:
-    """POST_VIEW：涂红面、补全硬边与可选分色预览。"""
+    """POST_VIEW：候选硬边、悬停/已选边与补全切线。"""
     context = bpy.context
     if context is None or context.scene is None:
         return
@@ -481,53 +475,28 @@ def draw_split_stroke_preview() -> None:
     if obj is None or obj.type != "MESH":
         return
 
-    # 若已有内存分色预览，由 draw_overlays 绘制对比色；
-    # 此时隐藏涂红面，避免盖住分色结果。
-    paint_faces = session.get("paint_faces")
-    has_preview = session.get("preview_ids") is not None
-    if (
-        not has_preview
-        and paint_faces is not None
-        and len(paint_faces) > 0
-    ):
-        paint_key = (
-            obj.as_pointer(),
-            session.get("preview_version", 0),
-            int(len(paint_faces)),
-            int(np.min(paint_faces)) if len(paint_faces) else -1,
-            int(np.max(paint_faces)) if len(paint_faces) else -1,
-        )
-        entry = _HIGHLIGHT_CACHE.get("paint")
-        if entry is None or entry.get("key") != paint_key:
-            entry = {
-                "key": paint_key,
-                "coords": _build_paint_face_coords(obj, paint_faces),
-            }
-            _HIGHLIGHT_CACHE["paint"] = entry
-        _draw_uniform_tris(entry["coords"], PAINT_FACE_COLOR)
-
-    completed = session.get("completed_edges_world")
-    if completed is not None and len(completed) > 0:
-        segments = []
-        for edge in np.asarray(completed):
-            if len(edge) < 2:
-                continue
-            segments.append(tuple(map(float, edge[0])))
-            segments.append(tuple(map(float, edge[1])))
-        if segments:
-            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-            batch = batch_for_shader(shader, "LINES", {"pos": segments})
-            gpu.state.blend_set("ALPHA")
-            gpu.state.depth_test_set("LESS_EQUAL")
-            gpu.state.line_width_set(3.0)
-            try:
-                shader.bind()
-                shader.uniform_float("color", (1.0, 0.05, 0.05, 0.95))
-                batch.draw(shader)
-            finally:
-                gpu.state.line_width_set(1.0)
-                gpu.state.depth_test_set("NONE")
-                gpu.state.blend_set("NONE")
+    # 候选硬边：半透明青绿粗线
+    _draw_edge_lines_world(
+        session.get("candidate_edges_world"),
+        (0.15, 0.95, 0.75, 0.75),
+        2.5,
+    )
+    # 悬停边：更亮更粗
+    hover = session.get("hover_edge_world")
+    if hover is not None and len(hover) > 0:
+        _draw_edge_lines_world(hover, (1.0, 0.95, 0.2, 0.95), 4.0)
+    # 已选种子边：品红
+    _draw_edge_lines_world(
+        session.get("selected_edges_world"),
+        (1.0, 0.2, 0.85, 0.95),
+        4.5,
+    )
+    # 补全切线：红色（预览切分路径）
+    _draw_edge_lines_world(
+        session.get("completed_edges_world"),
+        (1.0, 0.05, 0.05, 0.95),
+        3.0,
+    )
 
 
 def register_split_draw_handler() -> None:
