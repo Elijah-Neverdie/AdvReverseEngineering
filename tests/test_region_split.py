@@ -8,8 +8,11 @@ import numpy as np
 
 from AdvReverseEngineering.algorithms.region_split import (
     candidate_hard_edges,
+    chain_splits_region,
     complete_cut_edges_dijkstra,
     cut_edges_from_paint_corridor,
+    filter_bisecting_candidate_chains,
+    group_candidate_edge_chains,
     prepare_edge_costs,
     split_region_by_cut_edges,
     stroke_hits_to_seed_edges,
@@ -342,6 +345,54 @@ class RegionSplitTests(unittest.TestCase):
         )
         self.assertNotIn(0, low)
         self.assertTrue(high.issuperset({0, 2}))
+
+    def test_group_candidate_edge_chains(self) -> None:
+        topology, _centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        edges = candidate_hard_edges(
+            topology, normals, region_ids, 0, wireframe_threshold=0.1
+        )
+        chains = group_candidate_edge_chains(
+            edges,
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+        )
+        self.assertEqual(len(chains), 1)
+        self.assertEqual(len(chains[0]), 3)
+
+    def test_filter_bisecting_chains_keeps_full_ridge(self) -> None:
+        topology, _centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        raw = candidate_hard_edges(
+            topology, normals, region_ids, 0, wireframe_threshold=0.1
+        )
+        flat, chains = filter_bisecting_candidate_chains(
+            raw,
+            region_ids,
+            topology,
+            0,
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+        )
+        self.assertEqual(len(chains), 1)
+        self.assertTrue(
+            chain_splits_region(chains[0], region_ids, topology, 0)
+        )
+        self.assertEqual(set(flat.tolist()), {4, 5, 6})
+
+    def test_filter_rejects_partial_chain(self) -> None:
+        topology, _centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        raw = np.array([5], dtype=np.int32)
+        _flat, chains = filter_bisecting_candidate_chains(
+            raw,
+            region_ids,
+            topology,
+            0,
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+        )
+        self.assertEqual(len(chains), 0)
 
 
 class MergeTransactionLogicTests(unittest.TestCase):

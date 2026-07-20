@@ -115,6 +115,139 @@ def candidate_hard_edges(
     return np.flatnonzero(mask).astype(np.int32)
 
 
+def group_candidate_edge_chains(
+    candidate_edges: np.ndarray,
+    edge_vert_a: np.ndarray,
+    edge_vert_b: np.ndarray,
+) -> list[np.ndarray]:
+    """
+    将候选硬边按共享顶点连通性合并为连续棱线链。
+
+    同一折棱上的相邻小边会归为一条链，供点选时整链选中。
+    """
+    cand = np.asarray(candidate_edges, dtype=np.int32)
+    if len(cand) == 0:
+        return []
+
+    cand_set = {int(e) for e in cand.tolist()}
+    vert_to_edges: dict[int, list[int]] = {}
+    edge_vert_a = np.asarray(edge_vert_a, dtype=np.int32)
+    edge_vert_b = np.asarray(edge_vert_b, dtype=np.int32)
+    for edge_index in cand_set:
+        va = int(edge_vert_a[edge_index])
+        vb = int(edge_vert_b[edge_index])
+        vert_to_edges.setdefault(va, []).append(edge_index)
+        vert_to_edges.setdefault(vb, []).append(edge_index)
+
+    visited: set[int] = set()
+    chains: list[np.ndarray] = []
+    for start in cand.tolist():
+        start = int(start)
+        if start in visited:
+            continue
+        component: list[int] = []
+        queue = [start]
+        visited.add(start)
+        while queue:
+            edge_index = queue.pop()
+            component.append(edge_index)
+            for vert in (
+                int(edge_vert_a[edge_index]),
+                int(edge_vert_b[edge_index]),
+            ):
+                for neighbor in vert_to_edges.get(vert, []):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+        chains.append(np.asarray(sorted(component), dtype=np.int32))
+    return chains
+
+
+def chain_splits_region(
+    chain_edges: np.ndarray,
+    region_ids: np.ndarray,
+    topology: dict,
+    target_rid: int,
+) -> bool:
+    """链作为切线能否把目标领域恰好一分为二。"""
+    chain = np.asarray(chain_edges, dtype=np.int32)
+    if len(chain) == 0:
+        return False
+
+    ids = np.asarray(region_ids, dtype=np.int32)
+    target = int(target_rid)
+    members = np.flatnonzero(ids == target)
+    if len(members) == 0:
+        return False
+
+    cut_set = {int(e) for e in chain.tolist()}
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    offsets = np.asarray(topology["adjacency_offsets"], dtype=np.int32)
+    adj = np.asarray(topology["adjacency_indices"], dtype=np.int32)
+    face_count = len(ids)
+
+    barrier_pairs: set[tuple[int, int]] = set()
+    for edge_index in cut_set:
+        if edge_index < 0 or edge_index >= len(face_a):
+            continue
+        fa = int(face_a[edge_index])
+        fb = int(face_b[edge_index])
+        barrier_pairs.add((min(fa, fb), max(fa, fb)))
+
+    visited = np.zeros(face_count, dtype=bool)
+    components = 0
+    for start in members.tolist():
+        if visited[start]:
+            continue
+        components += 1
+        stack = [int(start)]
+        visited[start] = True
+        while stack:
+            face = stack.pop()
+            begin = int(offsets[face])
+            end = int(offsets[face + 1])
+            for neighbor in adj[begin:end].tolist():
+                neighbor = int(neighbor)
+                if visited[neighbor] or int(ids[neighbor]) != target:
+                    continue
+                pair = (min(face, neighbor), max(face, neighbor))
+                if pair in barrier_pairs:
+                    continue
+                visited[neighbor] = True
+                stack.append(neighbor)
+    return components == 2
+
+
+def filter_bisecting_candidate_chains(
+    candidate_edges: np.ndarray,
+    region_ids: np.ndarray,
+    topology: dict,
+    target_rid: int,
+    edge_vert_a: np.ndarray,
+    edge_vert_b: np.ndarray,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """
+    仅保留能把目标领域一分为二的候选棱线链。
+
+    返回 (扁平边索引, 链列表)。
+    """
+    chains = group_candidate_edge_chains(
+        candidate_edges,
+        edge_vert_a,
+        edge_vert_b,
+    )
+    good = [
+        chain
+        for chain in chains
+        if chain_splits_region(chain, region_ids, topology, target_rid)
+    ]
+    if not good:
+        return np.empty(0, dtype=np.int32), []
+    flat = np.concatenate(good).astype(np.int32, copy=False)
+    return flat, good
+
+
 def stroke_hits_to_seed_edges(
     faces: Iterable[int],
     worlds: np.ndarray,
@@ -782,6 +915,9 @@ def cut_edges_from_paint_corridor(
 __all__ = (
     "prepare_edge_costs",
     "candidate_hard_edges",
+    "group_candidate_edge_chains",
+    "chain_splits_region",
+    "filter_bisecting_candidate_chains",
     "stroke_hits_to_seed_edges",
     "complete_cut_edges_dijkstra",
     "split_region_by_cut_edges",

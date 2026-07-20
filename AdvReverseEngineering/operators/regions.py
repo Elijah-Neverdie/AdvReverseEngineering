@@ -16,6 +16,7 @@ from ..algorithms.regions import (
 from ..algorithms.region_split import (
     candidate_hard_edges,
     complete_cut_edges_dijkstra,
+    filter_bisecting_candidate_chains,
     prepare_edge_costs,
     split_region_by_cut_edges,
 )
@@ -994,7 +995,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         hover = getattr(self, "_hover_edge", None)
         if hover is not None:
             hover_world = self._edges_to_world(
-                np.asarray([hover], dtype=np.int32)
+                np.asarray(sorted(self._chain_edges_for(int(hover))), dtype=np.int32)
             )
         selected = (
             np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
@@ -1058,13 +1059,20 @@ class ARE_OT_split_regions(bpy.types.Operator):
         if session is not None:
             session["preview_version"] = self._preview_serial
         self._rebuild_candidates(context)
+        chain_count = len(self._candidate_chains)
         scene_props.split_status = (
             f"已选领域 {target_id} · "
             f"线框阈值 {self._hard_threshold:.2f} · "
-            f"候选 {len(self._candidate_edges)} 条 · "
-            "点选硬边 · Ctrl+滚轮调阈值"
+            f"候选 {chain_count} 条棱线 · "
+            "点选整条硬棱 · Ctrl+滚轮调阈值"
         )
         self._refresh_session(context)
+
+    def _chain_edges_for(self, edge_index: int) -> set[int]:
+        chain_id = self._edge_to_chain.get(int(edge_index))
+        if chain_id is None:
+            return {int(edge_index)}
+        return {int(e) for e in self._candidate_chains[chain_id].tolist()}
 
     def _rebuild_candidates(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
@@ -1072,18 +1080,37 @@ class ARE_OT_split_regions(bpy.types.Operator):
         if target < 0:
             self._candidate_edges = np.empty(0, dtype=np.int32)
             self._candidate_edges_world = np.empty((0, 2, 3), dtype=np.float64)
+            self._candidate_chains = []
+            self._edge_to_chain = {}
             return
-        self._candidate_edges = candidate_hard_edges(
+        raw = candidate_hard_edges(
             self._topology,
             self._mesh_data["normals"],
             self._region_ids,
             target,
             float(self._hard_threshold),
         )
+        flat, chains = filter_bisecting_candidate_chains(
+            raw,
+            self._region_ids,
+            self._topology,
+            target,
+            self._edge_vert_a,
+            self._edge_vert_b,
+        )
+        self._candidate_edges = flat
+        self._candidate_chains = chains
+        self._edge_to_chain = {}
+        for chain_id, chain in enumerate(chains):
+            for edge_index in chain.tolist():
+                self._edge_to_chain[int(edge_index)] = chain_id
+
         cand_set = set(int(e) for e in self._candidate_edges.tolist())
-        self._selected_cut_edges = {
-            e for e in self._selected_cut_edges if e in cand_set
-        }
+        # 保留仍有效的整链选中
+        kept: set[int] = set()
+        for edge_index in list(self._selected_cut_edges):
+            kept.update(self._chain_edges_for(edge_index))
+        self._selected_cut_edges = {e for e in kept if e in cand_set}
         self._candidate_edges_world = self._edges_to_world(self._candidate_edges)
         if self._hover_edge is not None and self._hover_edge not in cand_set:
             self._hover_edge = None
@@ -1100,8 +1127,8 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._rebuild_candidates(context)
         scene_props.split_status = (
             f"线框阈值 {self._hard_threshold:.2f} · "
-            f"候选 {len(self._candidate_edges)} 条 · "
-            f"已选 {len(self._selected_cut_edges)} 条"
+            f"候选 {len(self._candidate_chains)} 条棱线 · "
+            f"已选 {self._selected_chain_count()} 条"
         )
         self._preview_serial += 1
         if self._selected_cut_edges:
@@ -1150,16 +1177,25 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 best_edge = int(edge_index)
         return best_edge
 
+    def _selected_chain_count(self) -> int:
+        chain_ids: set[int] = set()
+        for edge_index in self._selected_cut_edges:
+            chain_id = self._edge_to_chain.get(int(edge_index))
+            if chain_id is not None:
+                chain_ids.add(chain_id)
+        return len(chain_ids)
+
     def _toggle_edge(self, context: bpy.types.Context, edge_index: int) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        if edge_index in self._selected_cut_edges:
-            self._selected_cut_edges.discard(edge_index)
+        chain_edges = self._chain_edges_for(int(edge_index))
+        if chain_edges.issubset(self._selected_cut_edges):
+            self._selected_cut_edges -= chain_edges
         else:
-            self._selected_cut_edges.add(int(edge_index))
+            self._selected_cut_edges |= chain_edges
         self._preview_serial += 1
         if self._selected_cut_edges:
             scene_props.split_status = (
-                f"已选 {len(self._selected_cut_edges)} 条硬边 · "
+                f"已选 {self._selected_chain_count()} 条棱线 · "
                 f"线框阈值 {self._hard_threshold:.2f} · 正在预览…"
             )
             self._schedule_preview(context)
@@ -1168,7 +1204,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             scene_props.split_status = (
                 f"已选领域 {scene_props.split_target_id} · "
                 f"线框阈值 {self._hard_threshold:.2f} · "
-                f"候选 {len(self._candidate_edges)} 条 · 点选硬边"
+                f"候选 {len(self._candidate_chains)} 条棱线 · 点选硬棱"
             )
         self._refresh_session(context)
 
@@ -1182,46 +1218,57 @@ class ARE_OT_split_regions(bpy.types.Operator):
 
         seed = np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
         stroke = self._edge_mids[seed]
-        completed = complete_cut_edges_dijkstra(
-            self._topology,
-            self._mesh_data["normals"],
-            self._mesh_data["face_centers"],
-            self._region_ids,
-            target,
-            seed,
-            stroke,
-            np.empty((0, 2), dtype=np.float64),
-            self._edge_costs,
-            self._edge_mids,
-            self._vert_edge_offsets,
-            self._vert_edge_indices,
-            self._edge_vert_a,
-            self._edge_vert_b,
-            max_radius=self._max_radius,
-        )
-        if len(completed) == 0:
-            scene_props.split_phase = "EDGE"
-            scene_props.split_status = "未能补全切线，请再选几条硬边"
-            self._completed_edges = seed
-            self._completed_edges_world = self._edges_to_world(seed)
-            self._preview_ids = None
-            self._preview_colors = None
-            self._preview_serial += 1
-            self._refresh_session(context)
-            return
 
         new_ids, new_colors, new_count = split_region_by_cut_edges(
             self._region_ids,
             self._topology,
-            completed,
+            seed,
             self._colors,
         )
-        # 若未真正拆出新分量，仍进入预览但给出提示
         changed = bool(np.any(new_ids != self._region_ids))
+        completed = seed
+
+        if not changed:
+            completed = complete_cut_edges_dijkstra(
+                self._topology,
+                self._mesh_data["normals"],
+                self._mesh_data["face_centers"],
+                self._region_ids,
+                target,
+                seed,
+                stroke,
+                np.empty((0, 2), dtype=np.float64),
+                self._edge_costs,
+                self._edge_mids,
+                self._vert_edge_offsets,
+                self._vert_edge_indices,
+                self._edge_vert_a,
+                self._edge_vert_b,
+                max_radius=self._max_radius,
+            )
+            if len(completed) == 0:
+                scene_props.split_phase = "EDGE"
+                scene_props.split_status = "未能补全切线，请换一条棱线"
+                self._completed_edges = seed
+                self._completed_edges_world = self._edges_to_world(seed)
+                self._preview_ids = None
+                self._preview_colors = None
+                self._preview_serial += 1
+                self._refresh_session(context)
+                return
+
+            new_ids, new_colors, new_count = split_region_by_cut_edges(
+                self._region_ids,
+                self._topology,
+                completed,
+                self._colors,
+            )
+            changed = bool(np.any(new_ids != self._region_ids))
+
         self._completed_edges = completed
         self._completed_edges_world = self._edges_to_world(completed)
-        self._preview_ids = new_ids
-        self._preview_colors = new_colors
+        self._preview_ids = new_ids if changed else None
+        self._preview_colors = new_colors if changed else None
         self._preview_count = int(new_count)
         self._preview_serial += 1
         if changed:
@@ -1233,7 +1280,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         else:
             scene_props.split_phase = "EDGE"
             scene_props.split_status = (
-                "切线未能把领域分成两块，请继续点选硬边"
+                "切线未能把领域分成两块，请换一条棱线"
             )
             self._preview_ids = None
             self._preview_colors = None
@@ -1373,6 +1420,8 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._vert_edge_indices = both_e.astype(np.int32, copy=False)
         self._candidate_edges = np.empty(0, dtype=np.int32)
         self._candidate_edges_world = np.empty((0, 2, 3), dtype=np.float64)
+        self._candidate_chains: list[np.ndarray] = []
+        self._edge_to_chain: dict[int, int] = {}
         self._selected_cut_edges: set[int] = set()
         self._hover_edge = None
         self._preview_ids = None
