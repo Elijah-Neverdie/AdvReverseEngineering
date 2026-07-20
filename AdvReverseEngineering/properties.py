@@ -24,6 +24,24 @@ def _on_viewport_simplify_percent_update(self, context) -> None:
     schedule_simplify_rebuild(context)
 
 
+def _on_show_region_highlight_update(self, context) -> None:
+    """显示领域开关变化时同步编号标签覆盖层。"""
+
+    def _deferred() -> float | None:
+        try:
+            from .operators.regions import sync_region_label_overlay
+
+            sync_region_label_overlay(bpy.context)
+        except Exception:
+            pass
+        return None
+
+    try:
+        bpy.app.timers.register(_deferred, first_interval=0.0)
+    except Exception:
+        _deferred()
+
+
 def _on_fit_segments_update(self, context) -> None:
     """拟合模态中侧栏段数变化时重建预览。"""
     if not getattr(self, "fit_mode_active", False):
@@ -264,6 +282,13 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         name="显示领域",
         description="在 3D 视口中显示自动识别的领域颜色，以及作为前置固定领域的紫色底面",
         default=True,
+        update=_on_show_region_highlight_update,
+    )
+    label_hover_id: IntProperty(
+        name="标签悬停领域",
+        description="空闲状态下鼠标悬停的领域编号",
+        default=-1,
+        min=-1,
     )
     region_object: PointerProperty(
         name="领域对象",

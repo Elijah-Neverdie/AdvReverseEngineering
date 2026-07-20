@@ -117,8 +117,9 @@ def _schedule_force_exit_check() -> None:
             scene_props.fit_hover_id = -1
             scene_props.fit_phase = "IDLE"
             scene_props.fit_status = "拟合模态已失联，已强制退出"
-            unregister_label_draw_handler()
-            set_merge_label_session(None)
+            from .regions import _teardown_labels_then_sync
+
+            _teardown_labels_then_sync(bpy.context)
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
                 area.tag_redraw()
@@ -783,8 +784,9 @@ class ARE_OT_confirm_fit_region(bpy.types.Operator):
                 scene_props.fit_mode_active = False
                 scene_props.fit_confirm_requested = False
                 scene_props.fit_phase = "IDLE"
-                unregister_label_draw_handler()
-                set_merge_label_session(None)
+                from .regions import _teardown_labels_then_sync
+
+                _teardown_labels_then_sync(context)
             return {"FINISHED"}
         scene_props.fit_confirm_requested = True
         _schedule_force_exit_check()
@@ -811,8 +813,6 @@ class ARE_OT_fit_region(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         _remove_modal_timer(self, context)
         _clear_active_fit_op(self)
-        unregister_label_draw_handler()
-        set_merge_label_session(None)
         scene_props.fit_mode_active = False
         scene_props.fit_confirm_requested = False
         scene_props.fit_advance_requested = False
@@ -823,6 +823,9 @@ class ARE_OT_fit_region(bpy.types.Operator):
         scene_props.fit_hover_id = -1
         scene_props.fit_phase = "IDLE"
         self._fit_target_ids = []
+        from .regions import _teardown_labels_then_sync
+
+        _teardown_labels_then_sync(context)
         _tag_redraw(context)
 
     def _discard_preview(self) -> None:

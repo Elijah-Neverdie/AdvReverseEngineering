@@ -17,6 +17,7 @@ from .regions import (
     ARE_OT_remove_regions,
     ARE_OT_segment_regions,
     ARE_OT_split_regions,
+    ARE_OT_update_label_hover,
 )
 from .simplify import ARE_OT_simplify_apply, ARE_OT_simplify_rebuild
 from .update import (
@@ -32,6 +33,7 @@ classes = (
     ARE_OT_simplify_apply,
     ARE_OT_segment_regions,
     ARE_OT_clear_regions,
+    ARE_OT_update_label_hover,
     ARE_OT_merge_regions,
     ARE_OT_confirm_merge_regions,
     ARE_OT_remove_regions,

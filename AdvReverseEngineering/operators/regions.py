@@ -147,8 +147,7 @@ def _schedule_force_exit_check(kind: str) -> None:
                 scene_props.merge_anchor_id = -1
                 scene_props.merge_hover_id = -1
                 scene_props.merge_status = "合并模态已失联，已强制退出"
-                unregister_label_draw_handler()
-                set_merge_label_session(None)
+                _teardown_labels_then_sync(bpy.context)
         elif kind == "remove":
             stuck = (
                 getattr(scene_props, "remove_mode_active", False)
@@ -159,8 +158,7 @@ def _schedule_force_exit_check(kind: str) -> None:
                 scene_props.remove_mode_active = False
                 scene_props.remove_hover_id = -1
                 scene_props.remove_status = "移除模态已失联，已强制退出"
-                unregister_label_draw_handler()
-                set_merge_label_session(None)
+                _teardown_labels_then_sync(bpy.context)
         else:
             stuck = (
                 scene_props.split_mode_active
@@ -174,9 +172,8 @@ def _schedule_force_exit_check(kind: str) -> None:
                 scene_props.split_phase = "IDLE"
                 scene_props.split_status = "拆分模态已失联，已强制退出"
                 unregister_split_draw_handler()
-                unregister_label_draw_handler()
                 set_split_stroke_session(None)
-                set_merge_label_session(None)
+                _teardown_labels_then_sync(bpy.context)
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
                 area.tag_redraw()
@@ -311,6 +308,106 @@ def _modal_busy(scene_props) -> bool:
     )
 
 
+def _resolve_region_object(context: bpy.types.Context, scene_props):
+    """解析当前应显示标签的领域对象。"""
+    obj = getattr(scene_props, "region_object", None)
+    if (
+        obj is not None
+        and obj.name in bpy.data.objects
+        and obj.type == "MESH"
+        and obj.data.attributes.get(REGION_ID_ATTR) is not None
+    ):
+        return obj
+    obj = context.active_object
+    if (
+        obj is not None
+        and obj.type == "MESH"
+        and obj.data.attributes.get(REGION_ID_ATTR) is not None
+    ):
+        return obj
+    return None
+
+
+def sync_region_label_overlay(context: bpy.types.Context | None = None) -> None:
+    """
+    空闲状态下同步编号标签覆盖层。
+
+    有领域且开启「显示领域」时常驻显示编号；否则拆除。
+    模态进行中不改写会话（由模态算子接管）。
+    """
+    context = context or bpy.context
+    if context is None or context.scene is None:
+        return
+    scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+    if scene_props is None:
+        return
+    if hasattr(scene_props, "label_hover_id"):
+        scene_props.label_hover_id = -1
+    if _modal_busy(scene_props):
+        return
+    if not scene_props.show_region_highlight:
+        unregister_label_draw_handler()
+        set_merge_label_session(None)
+        return
+    obj = _resolve_region_object(context, scene_props)
+    if obj is None:
+        unregister_label_draw_handler()
+        set_merge_label_session(None)
+        return
+    region_ids = read_region_ids(obj.data)
+    if region_ids is None or not np.any(region_ids >= 0):
+        unregister_label_draw_handler()
+        set_merge_label_session(None)
+        return
+    valid = region_ids[region_ids >= 0]
+    region_count = max(int(valid.max()) + 1, int(scene_props.region_count))
+    colors = _read_region_colors(obj, region_count)
+    mesh_data = extract_mesh_data(obj)
+    session = _build_label_session(region_ids, mesh_data, colors)
+    session["object_name"] = obj.name
+    session["idle"] = True
+    session["preview_version"] = int(scene_props.region_version)
+    set_merge_label_session(session)
+    register_label_draw_handler()
+    scene_props.region_object = obj
+    _tag_redraw(context)
+
+
+def _teardown_labels_then_sync(context: bpy.types.Context) -> None:
+    """拆除当前标签会话后按空闲状态重建。"""
+    unregister_label_draw_handler()
+    set_merge_label_session(None)
+    sync_region_label_overlay(context)
+
+
+_addon_keymaps: list[tuple] = []
+
+
+def register_label_hover_keymap() -> None:
+    """注册视口鼠标移动时的标签悬停更新。"""
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon
+    if kc is None:
+        return
+    km = kc.keymaps.new(name="3D View", space_type="VIEW_3D")
+    kmi = km.keymap_items.new(
+        "are.update_label_hover",
+        type="MOUSEMOVE",
+        value="ANY",
+    )
+    _addon_keymaps.append((km, kmi))
+
+
+def unregister_label_hover_keymap() -> None:
+    """注销标签悬停快捷键。"""
+    for km, kmi in _addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass
+    _addon_keymaps.clear()
+
+
 def _is_undo_event(event) -> bool:
     """Ctrl/Cmd + Z（无 Shift）表示撤销。"""
     if event.type != "Z" or event.value != "PRESS":
@@ -433,6 +530,7 @@ class ARE_OT_segment_regions(bpy.types.Operator):
                     result["region_ids"],
                     result["colors"],
                 )
+                sync_region_label_overlay(context)
 
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
@@ -487,8 +585,59 @@ class ARE_OT_clear_regions(bpy.types.Operator):
             scene_props.region_version = int(scene_props.region_version) + 1
 
         clear_region_highlight(context, obj)
+        sync_region_label_overlay(context)
         self.report({"INFO"}, "已清除领域标记")
         return {"FINISHED"}
+
+
+class ARE_OT_update_label_hover(bpy.types.Operator):
+    """空闲状态下根据鼠标位置更新编号悬停高亮。"""
+
+    bl_idname = "are.update_label_hover"
+    bl_label = "更新领域标签悬停"
+    bl_options = {"INTERNAL", "PASS_THROUGH"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        if scene_props is None or not scene_props.show_region_highlight:
+            return False
+        if _modal_busy(scene_props):
+            return False
+        return get_merge_label_session() is not None or (
+            _resolve_region_object(context, scene_props) is not None
+        )
+
+    def invoke(self, context: bpy.types.Context, event):
+        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        if scene_props is None:
+            return {"PASS_THROUGH"}
+        if context.area is None or context.area.type != "VIEW_3D":
+            return {"PASS_THROUGH"}
+        if context.region is None or context.region.type != "WINDOW":
+            return {"PASS_THROUGH"}
+
+        if get_merge_label_session() is None:
+            sync_region_label_overlay(context)
+        session = get_merge_label_session()
+        if session is None:
+            if int(getattr(scene_props, "label_hover_id", -1)) != -1:
+                scene_props.label_hover_id = -1
+                _tag_redraw(context)
+            return {"PASS_THROUGH"}
+
+        update_merge_label_projections(context)
+        hover = hit_test_labels(
+            event.mouse_region_x,
+            event.mouse_region_y,
+            session.get("labels", []),
+            LABEL_RADIUS_PX,
+        )
+        new_hover = -1 if hover is None else int(hover)
+        if new_hover != int(getattr(scene_props, "label_hover_id", -1)):
+            scene_props.label_hover_id = new_hover
+            _tag_redraw(context)
+        return {"PASS_THROUGH"}
 
 
 class ARE_OT_confirm_remove_regions(bpy.types.Operator):
@@ -520,8 +669,7 @@ class ARE_OT_confirm_remove_regions(bpy.types.Operator):
             if scene_props.remove_mode_active:
                 scene_props.remove_mode_active = False
                 scene_props.remove_confirm_requested = False
-                unregister_label_draw_handler()
-                set_merge_label_session(None)
+                _teardown_labels_then_sync(context)
             return {"FINISHED"}
         scene_props.remove_confirm_requested = True
         _schedule_force_exit_check("remove")
@@ -547,11 +695,10 @@ class ARE_OT_remove_regions(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         _remove_modal_timer(self, context)
         _clear_active_remove_op(self)
-        unregister_label_draw_handler()
-        set_merge_label_session(None)
         scene_props.remove_mode_active = False
         scene_props.remove_hover_id = -1
         scene_props.remove_confirm_requested = False
+        _teardown_labels_then_sync(context)
         _tag_redraw(context)
 
     def confirm_from_panel(self, context: bpy.types.Context) -> None:
@@ -885,8 +1032,7 @@ class ARE_OT_confirm_merge_regions(bpy.types.Operator):
             if scene_props.merge_mode_active:
                 scene_props.merge_mode_active = False
                 scene_props.merge_confirm_requested = False
-                unregister_label_draw_handler()
-                set_merge_label_session(None)
+                _teardown_labels_then_sync(context)
             return {"FINISHED"}
         # 后备：置位标志，等待模态在下一次事件消费；
         # 若无人消费（模态已丢失），超时后强制清理残留状态。
@@ -914,12 +1060,11 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         _remove_modal_timer(self, context)
         _clear_active_merge_op(self)
-        unregister_label_draw_handler()
-        set_merge_label_session(None)
         scene_props.merge_mode_active = False
         scene_props.merge_anchor_id = -1
         scene_props.merge_hover_id = -1
         scene_props.merge_confirm_requested = False
+        _teardown_labels_then_sync(context)
         _tag_redraw(context)
 
     def confirm_from_panel(self, context: bpy.types.Context) -> None:
@@ -1299,9 +1444,8 @@ class ARE_OT_confirm_split_regions(bpy.types.Operator):
                 scene_props.split_confirm_requested = False
                 scene_props.split_phase = "IDLE"
                 unregister_split_draw_handler()
-                unregister_label_draw_handler()
                 set_split_stroke_session(None)
-                set_merge_label_session(None)
+                _teardown_labels_then_sync(context)
             return {"FINISHED"}
         scene_props.split_confirm_requested = True
         _schedule_force_exit_check("split")
@@ -1329,14 +1473,13 @@ class ARE_OT_split_regions(bpy.types.Operator):
         _remove_modal_timer(self, context)
         _clear_active_split_op(self)
         unregister_split_draw_handler()
-        unregister_label_draw_handler()
         set_split_stroke_session(None)
-        set_merge_label_session(None)
         scene_props.split_mode_active = False
         scene_props.split_confirm_requested = False
         scene_props.split_target_id = -1
         scene_props.split_hover_id = -1
         scene_props.split_phase = "IDLE"
+        _teardown_labels_then_sync(context)
         _tag_redraw(context)
 
     def confirm_from_panel(self, context: bpy.types.Context) -> bool:
@@ -2228,6 +2371,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
 __all__ = (
     "ARE_OT_segment_regions",
     "ARE_OT_clear_regions",
+    "ARE_OT_update_label_hover",
     "ARE_OT_merge_regions",
     "ARE_OT_confirm_merge_regions",
     "ARE_OT_remove_regions",
@@ -2240,4 +2384,7 @@ __all__ = (
     "write_region_ids",
     "clear_region_ids",
     "read_region_ids",
+    "sync_region_label_overlay",
+    "register_label_hover_keymap",
+    "unregister_label_hover_keymap",
 )

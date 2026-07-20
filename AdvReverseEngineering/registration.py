@@ -115,8 +115,35 @@ def _unregister_scene_properties() -> None:
 
 def register() -> None:
     """注册插件全部 Blender 类型。"""
+    from bpy.app.handlers import persistent
+
+    from .operators.regions import (
+        register_label_hover_keymap,
+        sync_region_label_overlay,
+    )
     from .operators.update import schedule_startup_update_check
     from .ui.overlay import register_draw_handler, register_overlay_ui
+
+    @persistent
+    def _sync_labels_on_load(_dummy):
+        def _deferred():
+            try:
+                sync_region_label_overlay(bpy.context)
+            except Exception:
+                pass
+            return None
+
+        try:
+            bpy.app.timers.register(_deferred, first_interval=0.1)
+        except Exception:
+            pass
+
+    namespace = bpy.app.driver_namespace
+    old = namespace.get("AdvReverseEngineering.load_post_labels")
+    if old is not None and old in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(old)
+    bpy.app.handlers.load_post.append(_sync_labels_on_load)
+    namespace["AdvReverseEngineering.load_post_labels"] = _sync_labels_on_load
 
     property_classes = _get_property_classes()
     operator_classes = _get_operator_classes()
@@ -132,6 +159,7 @@ def register() -> None:
     try:
         register_draw_handler()
         register_overlay_ui()
+        register_label_hover_keymap()
     except Exception as exc:
         print(
             "AdvReverseEngineering: 视口高亮注册失败"
@@ -142,6 +170,7 @@ def register() -> None:
 
 def unregister() -> None:
     """按相反顺序注销插件全部 Blender 类型。"""
+    from .operators.regions import unregister_label_hover_keymap
     from .operators.simplify import cancel_simplify_timers
     from .operators.update import cancel_update_check_timers
     from .ui.overlay import (
@@ -151,12 +180,18 @@ def unregister() -> None:
         unregister_split_draw_handler,
     )
 
+    namespace = bpy.app.driver_namespace
+    old = namespace.pop("AdvReverseEngineering.load_post_labels", None)
+    if old is not None and old in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(old)
+
     property_classes = _get_property_classes()
     operator_classes = _get_operator_classes()
     panel_classes = _get_panel_classes()
 
     cancel_update_check_timers()
     cancel_simplify_timers()
+    unregister_label_hover_keymap()
     unregister_overlay_ui()
     unregister_split_draw_handler()
     unregister_label_draw_handler()

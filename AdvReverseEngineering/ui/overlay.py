@@ -131,6 +131,21 @@ def get_merge_label_session() -> dict | None:
     return _MERGE_LABEL_SESSION
 
 
+def active_label_hover_id(scene_props) -> int:
+    """当前应高亮的悬停领域编号（模态优先，否则空闲标签悬停）。"""
+    if scene_props is None:
+        return -1
+    if scene_props.merge_mode_active:
+        return int(scene_props.merge_hover_id)
+    if getattr(scene_props, "remove_mode_active", False):
+        return int(getattr(scene_props, "remove_hover_id", -1))
+    if getattr(scene_props, "fit_mode_active", False):
+        return int(getattr(scene_props, "fit_hover_id", -1))
+    if scene_props.split_mode_active:
+        return int(getattr(scene_props, "split_hover_id", -1))
+    return int(getattr(scene_props, "label_hover_id", -1))
+
+
 def update_merge_label_projections(context: bpy.types.Context) -> None:
     """根据当前视角刷新标签屏幕坐标，并过滤背面/遮挡编号。"""
     from mathutils import Vector
@@ -291,14 +306,7 @@ def draw_region_merge_labels() -> None:
     if context is None or context.scene is None:
         return
     scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
-    if scene_props is None:
-        return
-    if not (
-        scene_props.merge_mode_active
-        or getattr(scene_props, "remove_mode_active", False)
-        or scene_props.split_mode_active
-        or getattr(scene_props, "fit_mode_active", False)
-    ):
+    if scene_props is None or not scene_props.show_region_highlight:
         return
     session = _MERGE_LABEL_SESSION
     if session is None:
@@ -307,16 +315,13 @@ def draw_region_merge_labels() -> None:
     update_merge_label_projections(context)
     if scene_props.merge_mode_active:
         anchor_id = int(scene_props.merge_anchor_id)
-        hover_id = int(scene_props.merge_hover_id)
-    elif getattr(scene_props, "remove_mode_active", False):
-        anchor_id = -1
-        hover_id = int(getattr(scene_props, "remove_hover_id", -1))
     elif getattr(scene_props, "fit_mode_active", False):
         anchor_id = int(getattr(scene_props, "fit_target_id", -1))
-        hover_id = int(getattr(scene_props, "fit_hover_id", -1))
-    else:
+    elif scene_props.split_mode_active:
         anchor_id = int(getattr(scene_props, "split_target_id", -1))
-        hover_id = int(getattr(scene_props, "split_hover_id", -1))
+    else:
+        anchor_id = -1
+    hover_id = active_label_hover_id(scene_props)
 
     selected_ids = session.get("selected_ids") or ()
 
@@ -1062,6 +1067,35 @@ def _draw_colored_tris(coords: np.ndarray, colors: np.ndarray) -> None:
         gpu.state.blend_set("NONE")
 
 
+def _draw_label_hover_highlight(
+    obj: bpy.types.Object,
+    region_ids: np.ndarray,
+    hover_id: int,
+    *,
+    skip_id: int = -1,
+    cache_token=None,
+) -> None:
+    """绘制悬停领域半透明高亮（跳过与锚点/目标相同的编号）。"""
+    if hover_id < 0 or hover_id == skip_id:
+        return
+    pointer = obj.as_pointer()
+    slot_key = (pointer, cache_token, hover_id, "label_hover")
+    entry = _HIGHLIGHT_CACHE.get("label_hover")
+    if entry is None or entry.get("key") != slot_key:
+        entry = {
+            "key": slot_key,
+            "coords": _build_selection_highlight_coords(
+                obj,
+                region_ids,
+                hover_id,
+            ),
+        }
+        _HIGHLIGHT_CACHE["label_hover"] = entry
+    coords = entry["coords"]
+    if coords is not None and len(coords) > 0:
+        _draw_uniform_tris(coords, HOVER_HIGHLIGHT_COLOR)
+
+
 def draw_overlays() -> None:
     """视口叠加回调：领域多色与底面紫色统一由“显示领域”控制。"""
     context = bpy.context
@@ -1105,6 +1139,7 @@ def draw_overlays() -> None:
             or region_obj.data.attributes.get(REGION_ID_ATTR) is not None
         )
     ):
+        hover_id = active_label_hover_id(scene_props)
         if use_merge_preview:
             live_ids = np.asarray(merge_session["region_ids"], dtype=np.int32)
             live_colors = merge_session.get("colors")
@@ -1126,29 +1161,32 @@ def draw_overlays() -> None:
                 _MERGE_PREVIEW_CACHE["colors"],
             )
 
-            anchor_id = int(scene_props.merge_anchor_id)
-            hover_id = int(scene_props.merge_hover_id)
-            for slot, region_id, color in (
-                ("hover", hover_id, HOVER_HIGHLIGHT_COLOR),
-                ("anchor", anchor_id, ANCHOR_HIGHLIGHT_COLOR),
-            ):
-                if region_id < 0:
-                    continue
-                if slot == "hover" and region_id == anchor_id:
-                    continue
-                slot_key = (pointer, version, region_id)
-                entry = _HIGHLIGHT_CACHE.get(slot)
+            anchor_id = (
+                int(scene_props.merge_anchor_id)
+                if scene_props.merge_mode_active
+                else -1
+            )
+            if anchor_id >= 0:
+                slot_key = (pointer, version, anchor_id)
+                entry = _HIGHLIGHT_CACHE.get("anchor")
                 if entry is None or entry.get("key") != slot_key:
                     entry = {
                         "key": slot_key,
                         "coords": _build_selection_highlight_coords(
                             region_obj,
                             live_ids,
-                            region_id,
+                            anchor_id,
                         ),
                     }
-                    _HIGHLIGHT_CACHE[slot] = entry
-                _draw_uniform_tris(entry["coords"], color)
+                    _HIGHLIGHT_CACHE["anchor"] = entry
+                _draw_uniform_tris(entry["coords"], ANCHOR_HIGHLIGHT_COLOR)
+            _draw_label_hover_highlight(
+                region_obj,
+                live_ids,
+                hover_id,
+                skip_id=anchor_id,
+                cache_token=("merge", version),
+            )
         elif use_split_preview:
             live_ids = np.asarray(split_session["preview_ids"], dtype=np.int32)
             live_colors = split_session.get("preview_colors")
@@ -1180,21 +1218,56 @@ def draw_overlays() -> None:
                         target_id,
                     )
                     _draw_uniform_tris(coords, ANCHOR_HIGHLIGHT_COLOR)
+            base_ids = split_session.get("base_ids")
+            hover_source = (
+                np.asarray(base_ids, dtype=np.int32)
+                if base_ids is not None
+                else live_ids
+            )
+            _draw_label_hover_highlight(
+                region_obj,
+                hover_source,
+                hover_id,
+                skip_id=target_id,
+                cache_token=("split", version),
+            )
         else:
             coords, colors = _cached_region_draw_arrays(region_obj)
             _draw_colored_tris(coords, colors)
+            target_id = -1
+            region_ids = _read_region_ids(region_obj.data)
             if (
                 scene_props.split_mode_active
                 and int(getattr(scene_props, "split_target_id", -1)) >= 0
             ):
-                region_ids = _read_region_ids(region_obj.data)
+                target_id = int(scene_props.split_target_id)
                 if region_ids is not None:
                     coords = _build_selection_highlight_coords(
                         region_obj,
                         region_ids,
-                        int(scene_props.split_target_id),
+                        target_id,
                     )
                     _draw_uniform_tris(coords, ANCHOR_HIGHLIGHT_COLOR)
+            elif getattr(scene_props, "fit_mode_active", False):
+                target_id = int(getattr(scene_props, "fit_target_id", -1))
+                if target_id >= 0 and region_ids is not None:
+                    coords = _build_selection_highlight_coords(
+                        region_obj,
+                        region_ids,
+                        target_id,
+                    )
+                    _draw_uniform_tris(coords, ANCHOR_HIGHLIGHT_COLOR)
+            if region_ids is not None:
+                _draw_label_hover_highlight(
+                    region_obj,
+                    region_ids,
+                    hover_id,
+                    skip_id=target_id,
+                    cache_token=(
+                        "idle",
+                        int(getattr(scene_props, "region_version", 0)),
+                    ),
+                )
 
     obj = scene_props.highlight_object
     if (
