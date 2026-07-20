@@ -28,6 +28,8 @@ _STRONG_CONCAVE_ANGLE_DEG = 35.0
 _MAX_SPLIT_CORNERS = 64
 # 相对闭环周长过短的碎段（常见于 T 接缝锯齿）并入邻边
 _MIN_SEGMENT_LOOP_FRAC = 0.025
+# 焊接过近采样点：阈值 = 当前拟合曲线最长边弧长 × 该比例
+_WELD_LONGEST_SIDE_FRAC = 0.05
 # 多岛：线/点邻近判定相对包围盒对角线的比例
 _MULTI_ISLAND_PROXIMITY_FRAC = 0.05
 # 多岛融并外轮廓：仅间隙小于该比例才合并；更大则分岛，禁止弦线桥接
@@ -1267,6 +1269,131 @@ def outer_contour_by_dissolving_facing_edges(
 _ULTRA_REFLEX_INTERIOR_DEG = 355.0
 
 
+def estimate_longest_fit_side_length(
+    points: np.ndarray,
+    corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+) -> float:
+    """
+    估计当前拟合曲线最长边弧长（折角拆段后各边的最大长度）。
+
+    折角不足时退回周长四分之一与包围盒对角线的较大值。
+    """
+    pts = _as_float_array(points)
+    if len(pts) < 3:
+        return 0.0
+    if float(np.linalg.norm(pts[0] - pts[-1])) < 1e-9:
+        pts = pts[:-1].copy()
+    if len(pts) < 3:
+        return 0.0
+
+    origin, axis_u, axis_v = _loop_pca_basis(pts)
+    pts2 = project_points_to_plane(pts, origin, axis_u, axis_v)
+    work = pts
+    if _signed_area_2d(pts2) < 0.0:
+        work = pts[::-1].copy()
+        pts2 = pts2[::-1].copy()
+
+    corners = detect_corner_indices(
+        pts2,
+        corner_angle_deg,
+        max_corners=_MAX_SPLIT_CORNERS,
+        convex_only=False,
+        include_strong_concave=True,
+    )
+    if len(corners) >= 2:
+        sides = split_loop_into_sides(work, corners)
+        lengths = [polyline_length(side) for side in sides]
+        if lengths:
+            return float(max(lengths))
+
+    edge_lengths = np.linalg.norm(
+        np.roll(work, -1, axis=0) - work, axis=1
+    )
+    perimeter = float(np.sum(edge_lengths))
+    extent = float(np.linalg.norm(work.max(axis=0) - work.min(axis=0)))
+    return float(max(perimeter * 0.25, extent, 1e-6))
+
+
+def weld_close_points_closed_loop(
+    points: np.ndarray,
+    min_distance: float,
+    *,
+    min_points: int = 3,
+) -> np.ndarray:
+    """
+    将闭环折线上间距小于阈值的相邻点焊接为一点（取中点）。
+
+    用于消除密采样在同一拐角簇出的多重折点，再算内角/收束。
+    """
+    pts = _as_float_array(points).copy()
+    if len(pts) < int(min_points):
+        return pts
+    if float(np.linalg.norm(pts[0] - pts[-1])) < 1e-9:
+        pts = pts[:-1].copy()
+    if len(pts) < int(min_points):
+        return pts
+
+    min_d = float(max(min_distance, 0.0))
+    if min_d <= 0.0:
+        return pts
+
+    floor = int(max(min_points, 3))
+    for _ in range(len(pts) + 2):
+        count = len(pts)
+        if count <= floor:
+            break
+        keep: list[np.ndarray] = [pts[0].copy()]
+        merged = False
+        for index in range(1, count):
+            cur = pts[index]
+            if float(np.linalg.norm(cur - keep[-1])) >= min_d:
+                keep.append(cur.copy())
+            else:
+                keep[-1] = 0.5 * (keep[-1] + cur)
+                merged = True
+        if (
+            len(keep) > floor
+            and float(np.linalg.norm(keep[0] - keep[-1])) < min_d
+        ):
+            keep[0] = 0.5 * (keep[0] + keep[-1])
+            keep.pop()
+            merged = True
+        if len(keep) < floor:
+            break
+        pts = np.asarray(keep, dtype=np.float64)
+        if not merged:
+            break
+    return pts
+
+
+def weld_then_collapse_fit_loop(
+    points: np.ndarray,
+    *,
+    corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
+    weld_frac: float = _WELD_LONGEST_SIDE_FRAC,
+    longest_side_length: float | None = None,
+) -> np.ndarray:
+    """
+    准备用于内角计算的拟合闭环：收束尖刺 → 焊接过近点 → 再收束。
+
+    焊接阈值 = 最长拟合边弧长 × weld_frac（默认 5%）。
+    先收束可避免焊接抹平圆滑尖端后漏检；焊后再收束处理焊接形成的新尖刺。
+    """
+    pts = _as_float_array(points)
+    if len(pts) < 3:
+        return pts.copy()
+    pts = collapse_ultra_reflex_spike_vertices_closed_loop(pts)
+    longest = (
+        float(longest_side_length)
+        if longest_side_length is not None and float(longest_side_length) > 0.0
+        else estimate_longest_fit_side_length(pts, corner_angle_deg)
+    )
+    min_dist = max(float(longest) * float(max(weld_frac, 0.0)), 0.0)
+    if min_dist > 0.0:
+        pts = weld_close_points_closed_loop(pts, min_dist)
+    return collapse_ultra_reflex_spike_vertices_closed_loop(pts)
+
+
 def collect_interior_angle_labels(
     points: np.ndarray,
     *,
@@ -1546,9 +1673,10 @@ def bridge_reentrant_corners_closed_loop(
     缝合后外轮廓上的内阴角：用弦切除凹口，使相邻孤岛接缝成连续外缘。
 
     仅处理逆时针环上的凹折（叉积为负）；弦长超过包围盒对角线比例则跳过，
-    避免把整条内弧裁掉。远岛弦线桥接不在此处理。先收束内角>355°的尖刺。
+    避免把整条内弧裁掉。远岛弦线桥接不在此处理。
+    先焊接过近点并收束内角>355°的尖刺。
     """
-    pts = collapse_ultra_reflex_spike_vertices_closed_loop(points)
+    pts = weld_then_collapse_fit_loop(points)
     pts = _as_float_array(pts).copy()
     if len(pts) < 4:
         return pts
@@ -3770,7 +3898,7 @@ def build_fit_work_items(
     if stage_key == "ISLANDS":
         items = [
             {
-                "points": collapse_ultra_reflex_spike_vertices_closed_loop(
+                "points": weld_then_collapse_fit_loop(
                     verts[np.asarray(loop, dtype=np.int32)]
                 ),
                 "loop_ids": loop,
@@ -3948,8 +4076,11 @@ def extract_island_longest_sides(
             if loop_ids is not None:
                 loop_ids = list(reversed(loop_ids))
 
-        # 内角>355°的尖刺收束到上一级交点（所有拟合阶段）
-        collapsed = collapse_ultra_reflex_spike_vertices_closed_loop(loop_pts)
+        # 焊接过近点并收束超大内角尖刺（所有拟合阶段）
+        collapsed = weld_then_collapse_fit_loop(
+            loop_pts,
+            corner_angle_deg=corner_angle_deg,
+        )
         if len(collapsed) != len(loop_pts) or not np.allclose(
             collapsed, loop_pts, atol=1e-9
         ):
@@ -3976,8 +4107,11 @@ def extract_island_longest_sides(
             )
         )
         loop_rs = resample_closed_polyline(loop_pts, sample_count)
-        # 重采样后可能再次出现圆滑尖刺，再收束一次
-        loop_rs = collapse_ultra_reflex_spike_vertices_closed_loop(loop_rs)
+        # 过近点焊接（最长边×5%）后再算内角并收束尖刺
+        loop_rs = weld_then_collapse_fit_loop(
+            loop_rs,
+            corner_angle_deg=corner_angle_deg,
+        )
         if len(loop_rs) < 3:
             continue
         sample_count = len(loop_rs)
@@ -4011,7 +4145,7 @@ def extract_island_longest_sides(
             half = max(sample_count // 2, 1)
             split_indices = [0, half]
 
-        # 折角/凹折点强制出度数标注（调试用，不受平直过滤）
+        # 折角/凹折点强制出度数标注（焊接后的环，不受平直过滤）
         angle_labels = collect_interior_angle_labels(
             loop_rs,
             min_deviation_deg=15.0,
@@ -5414,6 +5548,7 @@ __all__ = (
     "coons_patch",
     "detect_corner_indices",
     "detect_concave_fold_indices",
+    "estimate_longest_fit_side_length",
     "extend_quad_corners_by_tangents",
     "extract_island_longest_sides",
     "extract_region_boundary_loops",
@@ -5442,4 +5577,6 @@ __all__ = (
     "select_primary_boundary_loop",
     "side_interior_max_turn_deg",
     "soft_snap_quad_grid_to_points",
+    "weld_close_points_closed_loop",
+    "weld_then_collapse_fit_loop",
 )

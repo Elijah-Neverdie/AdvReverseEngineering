@@ -1382,6 +1382,75 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertGreaterEqual(float(tip["angle_deg"]), 350.0)
         self.assertTrue(str(tip["text"]).isdigit())
 
+    def test_weld_close_corner_cluster_before_angles(self) -> None:
+        """拐角处过近采样点应按最长边 5% 焊成一点，避免多重内角标注。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            collect_interior_angle_labels,
+            estimate_longest_fit_side_length,
+            weld_close_points_closed_loop,
+            weld_then_collapse_fit_loop,
+        )
+
+        # 4×2 矩形，右上角拆成三个极近点（间距约 0.02）
+        loop = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 2.0, 0.0],
+                [3.98, 2.01, 0.0],
+                [3.96, 1.99, 0.0],
+                [0.0, 2.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        longest = estimate_longest_fit_side_length(loop, corner_angle_deg=35.0)
+        self.assertGreaterEqual(longest, 3.5)
+        min_dist = longest * 0.05
+        welded = weld_close_points_closed_loop(loop, min_dist)
+        self.assertLess(len(welded), len(loop))
+        near_tr = welded[
+            (welded[:, 0] > 3.5) & (welded[:, 1] > 1.5)
+        ]
+        self.assertEqual(len(near_tr), 1)
+
+        raw_labels = collect_interior_angle_labels(loop, min_deviation_deg=4.0)
+        near_raw = [
+            item
+            for item in raw_labels
+            if float(item["world_co"][0]) > 3.5
+            and float(item["world_co"][1]) > 1.5
+        ]
+        prepared = weld_then_collapse_fit_loop(loop, corner_angle_deg=35.0)
+        prep_labels = collect_interior_angle_labels(
+            prepared, min_deviation_deg=4.0
+        )
+        near_prep = [
+            item
+            for item in prep_labels
+            if float(item["world_co"][0]) > 3.5
+            and float(item["world_co"][1]) > 1.5
+        ]
+        self.assertGreaterEqual(len(near_raw), 2)
+        self.assertLessEqual(len(near_prep), 1)
+
+    def test_weld_then_collapse_clustered_soft_spike(self) -> None:
+        """密采样圆滑尖端：先焊接再收束，尖刺应消失。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            weld_then_collapse_fit_loop,
+        )
+
+        ys = [0.3, 0.8, 1.4, 1.9, 2.2, 2.35, 2.2, 1.9, 1.4, 0.8, 0.3]
+        xs = [1.92, 1.93, 1.95, 1.97, 1.99, 2.0, 2.01, 2.03, 2.05, 2.07, 2.08]
+        spiked = np.array(
+            [[0.0, 0.0, 0.0], [1.9, 0.0, 0.0]]
+            + [[xs[i], ys[i], 0.0] for i in range(len(xs))]
+            + [[2.1, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float64,
+        )
+        cleaned = weld_then_collapse_fit_loop(spiked, corner_angle_deg=35.0)
+        self.assertLess(len(cleaned), len(spiked))
+        self.assertLess(float(cleaned[:, 1].max()), 1.05)
+
     def test_stitch_bridges_reentrant_notch_to_continuous_rim(self) -> None:
         """缝合后内阴角应被切除，外轮廓不再钻进 V 形凹口。"""
         from AdvReverseEngineering.algorithms.region_fit import (
