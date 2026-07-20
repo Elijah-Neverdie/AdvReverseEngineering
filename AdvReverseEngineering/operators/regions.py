@@ -595,7 +595,7 @@ class ARE_OT_update_label_hover(bpy.types.Operator):
 
     bl_idname = "are.update_label_hover"
     bl_label = "更新领域标签悬停"
-    bl_options = {"INTERNAL", "PASS_THROUGH"}
+    bl_options = {"INTERNAL"}
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
