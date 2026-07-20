@@ -1261,7 +1261,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             return
 
         target = int(scene_props.split_target_id)
-        # 从短边两端沿硬棱延伸；结果只保留目标领域内部边
+        # 从短边两端沿硬棱主方向延伸（禁止拐到周界横边）
         completed = grow_ridge_cut_to_boundary(
             edge_index,
             self._topology,
@@ -1275,24 +1275,6 @@ class ARE_OT_split_regions(bpy.types.Operator):
             self._edge_vert_b,
             vertices=self._mesh_data["vertices"],
         )
-        if len(completed) <= 1:
-            completed = complete_cut_edges_dijkstra(
-                self._topology,
-                self._mesh_data["normals"],
-                self._mesh_data["face_centers"],
-                self._region_ids,
-                target,
-                np.asarray([edge_index], dtype=np.int32),
-                self._edge_mids[[edge_index]],
-                np.empty((0, 2), dtype=np.float64),
-                self._edge_costs,
-                self._edge_mids,
-                self._vert_edge_offsets,
-                self._vert_edge_indices,
-                self._edge_vert_a,
-                self._edge_vert_b,
-                max_radius=self._max_radius,
-            )
         completed = filter_internal_cut_edges(
             completed,
             self._topology,

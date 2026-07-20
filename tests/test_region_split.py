@@ -421,8 +421,8 @@ class RegionSplitTests(unittest.TestCase):
             chain_splits_region(completed, region_ids, topology, 0)
         )
 
-    def test_grow_ridge_follows_direction_not_side_boundary(self) -> None:
-        """有坐标时沿竖棱方向延伸，补全整条竖硬边。"""
+    def test_grow_ridge_does_not_turn_onto_side_boundary(self) -> None:
+        """延伸不得拐到与主方向垂直的周界边。"""
         topology, centers, normals = _quad_strip_topology()
         region_ids = np.zeros(6, dtype=np.int32)
         costs, mids = prepare_edge_costs(
@@ -445,8 +445,8 @@ class RegionSplitTests(unittest.TestCase):
             topology["edge_vert_b"],
             vertices=vertices,
         )
+        # 竖棱 4/5/6；水平边 0/1/2/3 不得出现
         self.assertTrue(set(completed.tolist()).issuperset({4, 5, 6}))
-        # 不应把平坦水平边卷进来
         for flat in (0, 1, 2, 3):
             self.assertNotIn(flat, set(completed.tolist()))
 

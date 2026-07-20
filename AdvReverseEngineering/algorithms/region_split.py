@@ -469,7 +469,9 @@ def grow_ridge_cut_to_boundary(
     seed_hardness = max(0.0, 1.0 - float(edge_costs[seed]))
     # 续边硬度下限：允许比种子略软（缓棱中段），但不走明显平坦边
     min_hardness = max(0.05, seed_hardness * 0.25)
-    min_align = 0.2
+    # 相对种子主方向：约 <50° 才续；禁止拐到横边/周界
+    min_principal_align = 0.64
+    min_local_align = 0.45
     max_steps = 200000
 
     def other_vert(edge_index: int, from_vert: int) -> int:
@@ -492,40 +494,23 @@ def grow_ridge_cut_to_boundary(
     def hardness(edge_index: int) -> float:
         return max(0.0, 1.0 - float(edge_costs[edge_index]))
 
-    def score_edge(
-        edge_index: int,
-        from_vert: int,
-        travel: np.ndarray | None,
-        *,
-        is_boundary: bool,
-    ) -> float:
-        hard = hardness(edge_index)
-        align = 1.0
-        if travel is not None:
-            ed = edge_dir(edge_index, from_vert)
-            if ed is None:
-                return -1.0
-            align = float(np.dot(travel, ed))
-            if align < min_align:
-                return -1.0
-        if is_boundary:
-            # 方向对上的边界：作为终点优先结束
-            return 2.0 + align
-        if hard < min_hardness:
-            return -1.0
-        score = hard * (0.25 + 0.75 * align)
-        # 贴着已有领域分界的周界边大幅降权，避免沿着 39/9 这类边界长出「假切线」
-        if _edge_touches_foreign_region(
-            edge_index, face_a, face_b, offsets, adj, rid, target_rid
-        ):
-            score *= 0.12
-        return score
-
     def greedy_extend(start_vert: int, prev_vert: int) -> list[int]:
+        """
+        从 start 沿「种子主方向」延伸。
+        只走与主方向同向的内部边；贴周界的边一律不续，避免端点拐到横边上。
+        """
         path: list[int] = []
         current = int(start_vert)
         previous = int(prev_vert)
         used: set[int] = {seed}
+
+        principal: np.ndarray | None = None
+        if verts is not None and 0 <= previous < len(verts) and 0 <= current < len(verts):
+            delta = verts[current] - verts[previous]
+            length = float(np.linalg.norm(delta))
+            if length > 1e-12:
+                principal = delta / length
+
         for _ in range(max_steps):
             travel = None
             if verts is not None and 0 <= previous < len(verts) and 0 <= current < len(verts):
@@ -533,18 +518,15 @@ def grow_ridge_cut_to_boundary(
                 length = float(np.linalg.norm(delta))
                 if length > 1e-12:
                     travel = delta / length
-            elif verts is None:
-                # 无坐标时用种子边作为弱方向提示（无法算 align，靠硬度）
-                travel = None
+            if principal is None and travel is not None:
+                principal = travel
 
             begin = int(vert_edge_offsets[current])
             end = int(vert_edge_offsets[current + 1])
             best_internal = None
             best_internal_score = -1.0
             best_internal_other = -1
-            best_boundary = None
-            best_boundary_score = -1.0
-            best_boundary_other = -1
+            hit_forward_boundary = False
 
             for edge_index in vert_edge_indices[begin:end].tolist():
                 edge_index = int(edge_index)
@@ -554,16 +536,20 @@ def grow_ridge_cut_to_boundary(
                 if v_other == previous:
                     continue
 
+                ed = edge_dir(edge_index, current) if verts is not None else None
+                align_p = 1.0
+                align_t = 1.0
+                if principal is not None and ed is not None:
+                    align_p = float(np.dot(principal, ed))
+                if travel is not None and ed is not None:
+                    align_t = float(np.dot(travel, ed))
+
+                # 真·领域边界：仅当大致朝主方向时结束延伸（不加入切线）
                 if _is_region_boundary_edge(
                     edge_index, face_a, face_b, region_ids, target_rid
                 ):
-                    score = score_edge(
-                        edge_index, current, travel, is_boundary=True
-                    )
-                    if score > best_boundary_score:
-                        best_boundary_score = score
-                        best_boundary = edge_index
-                        best_boundary_other = v_other
+                    if align_p >= min_principal_align:
+                        hit_forward_boundary = True
                     continue
 
                 if not _is_internal_region_edge(
@@ -571,16 +557,31 @@ def grow_ridge_cut_to_boundary(
                 ):
                     continue
 
-                score = score_edge(
-                    edge_index, current, travel, is_boundary=False
-                )
+                # 禁止贴着外领域周界续走（端点拐弯溢出的主因）
+                if _edge_touches_foreign_region(
+                    edge_index, face_a, face_b, offsets, adj, rid, target_rid
+                ):
+                    continue
+
+                if verts is not None:
+                    if align_p < min_principal_align:
+                        continue
+                    if align_t < min_local_align:
+                        continue
+
+                hard = hardness(edge_index)
+                if hard < min_hardness:
+                    continue
+
+                # 主方向对齐权重大，抑制逐渐漂向横边
+                score = hard * (0.15 + 0.55 * align_p + 0.30 * align_t)
                 if score > best_internal_score:
                     best_internal_score = score
                     best_internal = edge_index
                     best_internal_other = v_other
 
-            # 无坐标时：在合格边中选最硬者
-            if best_internal is None and travel is None:
+            # 无坐标：仅按硬度，仍禁止周界贴边
+            if best_internal is None and verts is None:
                 for edge_index in vert_edge_indices[begin:end].tolist():
                     edge_index = int(edge_index)
                     if edge_index in used:
@@ -591,14 +592,14 @@ def grow_ridge_cut_to_boundary(
                     if _is_region_boundary_edge(
                         edge_index, face_a, face_b, region_ids, target_rid
                     ):
-                        score = 1.0 + hardness(edge_index)
-                        if score > best_boundary_score:
-                            best_boundary_score = score
-                            best_boundary = edge_index
-                            best_boundary_other = v_other
+                        hit_forward_boundary = True
                         continue
                     if not _is_internal_region_edge(
                         edge_index, face_a, face_b, region_ids, target_rid
+                    ):
+                        continue
+                    if _edge_touches_foreign_region(
+                        edge_index, face_a, face_b, offsets, adj, rid, target_rid
                     ):
                         continue
                     hard = hardness(edge_index)
@@ -609,50 +610,20 @@ def grow_ridge_cut_to_boundary(
                         best_internal = edge_index
                         best_internal_other = v_other
 
-            if best_internal is None and travel is not None:
-                # 缓棱中段：绝对硬度不够时，取方向合格的局部最硬边
-                local: list[tuple[float, float, int, int]] = []
-                for edge_index in vert_edge_indices[begin:end].tolist():
-                    edge_index = int(edge_index)
-                    if edge_index in used:
-                        continue
-                    v_other = other_vert(edge_index, current)
-                    if v_other == previous:
-                        continue
-                    if not _is_internal_region_edge(
-                        edge_index, face_a, face_b, region_ids, target_rid
-                    ):
-                        continue
-                    ed = edge_dir(edge_index, current)
-                    if ed is None:
-                        continue
-                    align = float(np.dot(travel, ed))
-                    if align < min_align:
-                        continue
-                    hard = hardness(edge_index)
-                    local.append((hard, align, edge_index, v_other))
-                if local:
-                    local.sort(key=lambda item: (item[0], item[1]), reverse=True)
-                    hard0, _align0, edge0, other0 = local[0]
-                    if hard0 >= 0.05 and (
-                        len(local) == 1 or hard0 >= local[1][0] * 0.85
-                    ):
-                        best_internal = edge0
-                        best_internal_other = other0
-                        best_internal_score = hard0
-
-            # 优先沿内部硬棱继续；只有没有合格内部续边时才碰到边界结束
-            # （绝不把边界边加入切线——边界边两侧分属不同领域，不能切开目标）
             if best_internal is not None:
                 path.append(int(best_internal))
                 used.add(int(best_internal))
                 previous = current
                 current = int(best_internal_other)
+                # 主方向缓慢跟随，避免三角网锯齿被当成转向
+                if travel is not None and principal is not None:
+                    blended = principal * 0.7 + travel * 0.3
+                    norm = float(np.linalg.norm(blended))
+                    if norm > 1e-12:
+                        principal = blended / norm
                 continue
 
-            if best_boundary is not None:
-                break
-
+            # 无合格前进边：到边界或棱线尽头，停止（不拐弯）
             break
 
         return path
