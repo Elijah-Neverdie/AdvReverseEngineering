@@ -375,6 +375,167 @@ def _is_internal_region_edge(
     )
 
 
+def grow_ridge_cut_to_boundary(
+    seed_edge: int,
+    topology: dict,
+    region_ids: np.ndarray,
+    target_rid: int,
+    edge_costs: np.ndarray,
+    edge_mids: np.ndarray,
+    vert_edge_offsets: np.ndarray,
+    vert_edge_indices: np.ndarray,
+    edge_vert_a: np.ndarray,
+    edge_vert_b: np.ndarray,
+    vertices: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    从一条种子短边两端沿硬边代价延伸，直到抵达领域边界，形成完整分割棱。
+
+    不限制搜索半径；每步优先走更硬（代价更低）且方向更连续的内部边，
+    碰到领域边界边则纳入并终止该方向。
+    """
+    seed = int(seed_edge)
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    edge_vert_a = np.asarray(edge_vert_a, dtype=np.int32)
+    edge_vert_b = np.asarray(edge_vert_b, dtype=np.int32)
+    edge_costs = np.asarray(edge_costs, dtype=np.float64)
+    edge_mids = np.asarray(edge_mids, dtype=np.float64)
+    if seed < 0 or seed >= len(edge_vert_a):
+        return np.empty(0, dtype=np.int32)
+
+    completed: set[int] = {seed}
+    verts = (
+        np.asarray(vertices, dtype=np.float64)
+        if vertices is not None
+        else None
+    )
+
+    def edge_dir(edge_index: int, from_vert: int) -> np.ndarray | None:
+        if verts is None:
+            return None
+        va = int(edge_vert_a[edge_index])
+        vb = int(edge_vert_b[edge_index])
+        other = vb if va == from_vert else va
+        delta = verts[other] - verts[from_vert]
+        length = float(np.linalg.norm(delta))
+        if length < 1e-12:
+            return None
+        return delta / length
+
+    def extend_from(start_vert: int, incoming_dir: np.ndarray | None) -> list[int]:
+        """从顶点沿硬棱 Dijkstra 到最近领域边界。"""
+        dist: dict[int, float] = {start_vert: 0.0}
+        prev_edge: dict[int, int | None] = {start_vert: None}
+        prev_vert: dict[int, int | None] = {start_vert: None}
+        heap: list[tuple[float, int]] = [(0.0, start_vert)]
+        goal_vert: int | None = None
+        best_vert = start_vert
+        best_score = -1.0
+
+        while heap:
+            cost_u, u = heapq.heappop(heap)
+            if cost_u > dist.get(u, float("inf")) + 1e-12:
+                continue
+
+            # 当前行进方向：来自父边，否则用种子方向
+            parent_e = prev_edge.get(u)
+            if parent_e is not None and prev_vert.get(u) is not None:
+                travel = edge_dir(int(parent_e), int(prev_vert[u]))
+            else:
+                travel = incoming_dir
+
+            begin = int(vert_edge_offsets[u])
+            end = int(vert_edge_offsets[u + 1])
+            for edge_index in vert_edge_indices[begin:end].tolist():
+                edge_index = int(edge_index)
+                if edge_index in completed and edge_index != seed:
+                    # 允许免费穿过已走路径，避免绕圈代价爆炸
+                    pass
+
+                va = int(edge_vert_a[edge_index])
+                vb = int(edge_vert_b[edge_index])
+                v_other = vb if va == u else va
+
+                if _is_region_boundary_edge(
+                    edge_index, face_a, face_b, region_ids, target_rid
+                ):
+                    # 边界边：低代价纳入并作为终点
+                    step = 0.02
+                    if travel is not None:
+                        ed = edge_dir(edge_index, u)
+                        if ed is not None:
+                            step += 0.08 * max(0.0, 1.0 - float(np.dot(travel, ed)))
+                    new_cost = cost_u + step
+                    if new_cost < dist.get(v_other, float("inf")):
+                        dist[v_other] = new_cost
+                        prev_edge[v_other] = edge_index
+                        prev_vert[v_other] = u
+                        goal_vert = v_other
+                        heap.clear()
+                    break
+
+                if not _is_internal_region_edge(
+                    edge_index, face_a, face_b, region_ids, target_rid
+                ):
+                    continue
+
+                if edge_index in completed:
+                    step = 1e-6
+                else:
+                    step = float(edge_costs[edge_index])
+                    if travel is not None:
+                        ed = edge_dir(edge_index, u)
+                        if ed is not None:
+                            # 偏向继续沿棱线方向，抑制横向分叉
+                            align = float(np.dot(travel, ed))
+                            step *= 1.0 + 0.85 * max(0.0, 1.0 - align)
+
+                new_cost = cost_u + step
+                if new_cost >= dist.get(v_other, float("inf")):
+                    continue
+                dist[v_other] = new_cost
+                prev_edge[v_other] = edge_index
+                prev_vert[v_other] = u
+
+                hardness = max(0.0, 1.0 - float(edge_costs[edge_index]))
+                # 更硬且走得更远优先作为兜底终点
+                score = hardness * (1.0 + float(np.linalg.norm(
+                    edge_mids[edge_index] - edge_mids[seed]
+                )))
+                if score > best_score:
+                    best_score = score
+                    best_vert = v_other
+
+                heapq.heappush(heap, (new_cost, v_other))
+
+            if goal_vert is not None:
+                break
+
+        if goal_vert is None:
+            goal_vert = best_vert
+
+        path: list[int] = []
+        cursor = goal_vert
+        while cursor is not None and prev_edge.get(cursor) is not None:
+            edge_index = int(prev_edge[cursor])
+            if edge_index not in completed:
+                path.append(edge_index)
+            cursor = prev_vert.get(cursor)
+        return path
+
+    va = int(edge_vert_a[seed])
+    vb = int(edge_vert_b[seed])
+    seed_dir_ab = edge_dir(seed, va)
+    seed_dir_ba = edge_dir(seed, vb)
+    for edge_index in extend_from(va, seed_dir_ab):
+        completed.add(int(edge_index))
+    for edge_index in extend_from(vb, seed_dir_ba):
+        completed.add(int(edge_index))
+
+    return np.asarray(sorted(completed), dtype=np.int32)
+
+
 def complete_cut_edges_dijkstra(
     topology: dict,
     normals: np.ndarray,
@@ -918,6 +1079,7 @@ __all__ = (
     "group_candidate_edge_chains",
     "chain_splits_region",
     "filter_bisecting_candidate_chains",
+    "grow_ridge_cut_to_boundary",
     "stroke_hits_to_seed_edges",
     "complete_cut_edges_dijkstra",
     "split_region_by_cut_edges",

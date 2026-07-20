@@ -13,6 +13,7 @@ from AdvReverseEngineering.algorithms.region_split import (
     cut_edges_from_paint_corridor,
     filter_bisecting_candidate_chains,
     group_candidate_edge_chains,
+    grow_ridge_cut_to_boundary,
     prepare_edge_costs,
     split_region_by_cut_edges,
     stroke_hits_to_seed_edges,
@@ -393,6 +394,32 @@ class RegionSplitTests(unittest.TestCase):
             topology["edge_vert_b"],
         )
         self.assertEqual(len(chains), 0)
+
+    def test_grow_ridge_completes_vertical_cut(self) -> None:
+        """点一条竖硬边应延伸出整条竖棱，并能切开条带。"""
+        topology, centers, normals = _quad_strip_topology()
+        region_ids = np.zeros(6, dtype=np.int32)
+        costs, mids = prepare_edge_costs(
+            topology, normals, centers, region_ids
+        )
+        # 只点中间竖边 5，应补出 4、6
+        completed = grow_ridge_cut_to_boundary(
+            5,
+            topology,
+            region_ids,
+            0,
+            costs,
+            mids,
+            topology["vert_edge_offsets"],
+            topology["vert_edge_indices"],
+            topology["edge_vert_a"],
+            topology["edge_vert_b"],
+            vertices=None,
+        )
+        self.assertTrue(set(completed.tolist()).issuperset({4, 5, 6}))
+        self.assertTrue(
+            chain_splits_region(completed, region_ids, topology, 0)
+        )
 
 
 class MergeTransactionLogicTests(unittest.TestCase):
