@@ -16,7 +16,7 @@ from ..algorithms.regions import (
 from ..algorithms.region_split import (
     candidate_hard_edges,
     complete_cut_edges_dijkstra,
-    filter_bisecting_candidate_chains,
+    group_candidate_edge_chains,
     prepare_edge_costs,
     split_region_by_cut_edges,
 )
@@ -49,6 +49,7 @@ HARD_THRESHOLD_MIN = 0.02
 HARD_THRESHOLD_MAX = 1.0
 HARD_THRESHOLD_STEP = 0.05
 SPLIT_PREVIEW_DEBOUNCE_SEC = 0.12
+SPLIT_CANDIDATE_DEBOUNCE_SEC = 0.08
 
 
 def _add_modal_timer(operator, context: bpy.types.Context):
@@ -925,6 +926,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
     def _cleanup_ui(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         self._cancel_debounce_timer()
+        self._cancel_candidate_timer()
         _remove_modal_timer(self, context)
         _clear_active_split_op(self)
         unregister_split_draw_handler()
@@ -965,6 +967,62 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._debounce_timer = None
         self._debounce_token = None
 
+    def _cancel_candidate_timer(self) -> None:
+        timer = getattr(self, "_candidate_timer", None)
+        if timer is None:
+            return
+        try:
+            bpy.app.timers.unregister(timer)
+        except Exception:
+            pass
+        self._candidate_timer = None
+        self._candidate_token = None
+
+    def _schedule_candidate_rebuild(self, context: bpy.types.Context) -> None:
+        """滚轮连调时防抖重建候选，避免每帧对大网格做连通分组。"""
+        self._cancel_candidate_timer()
+        token = object()
+        self._candidate_token = token
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        scene_props.split_status = (
+            f"线框阈值 {self._hard_threshold:.2f} · 正在更新候选…"
+        )
+        _tag_redraw(context)
+
+        def _callback():
+            if getattr(self, "_candidate_token", None) is not token:
+                return None
+            if not getattr(self, "_alive", False):
+                return None
+            try:
+                ctx = bpy.context
+                self._rebuild_candidates(ctx)
+                props = getattr(ctx.scene, SCENE_PROP_NAME, None)
+                if props is not None:
+                    props.split_status = (
+                        f"线框阈值 {self._hard_threshold:.2f} · "
+                        f"候选 {len(self._candidate_edges)} 条边 / "
+                        f"{len(self._candidate_chains)} 条棱线 · "
+                        f"已选 {self._selected_chain_count()} 条"
+                    )
+                self._preview_serial += 1
+                if self._selected_cut_edges:
+                    self._schedule_preview(ctx)
+                else:
+                    self._clear_preview_keep_selection(ctx)
+                self._refresh_session(ctx)
+            except Exception as exc:
+                scene = getattr(bpy.context.scene, SCENE_PROP_NAME, None)
+                if scene is not None:
+                    scene.split_status = f"候选更新失败: {exc}"
+            return None
+
+        self._candidate_timer = _callback
+        bpy.app.timers.register(
+            _callback,
+            first_interval=SPLIT_CANDIDATE_DEBOUNCE_SEC,
+        )
+
     def _schedule_preview(self, context: bpy.types.Context) -> None:
         self._cancel_debounce_timer()
         token = object()
@@ -994,8 +1052,9 @@ class ARE_OT_split_regions(bpy.types.Operator):
         hover_world = np.empty((0, 2, 3), dtype=np.float64)
         hover = getattr(self, "_hover_edge", None)
         if hover is not None:
+            # 悬停只高亮当前小边，避免大棱线每帧重建世界坐标
             hover_world = self._edges_to_world(
-                np.asarray(sorted(self._chain_edges_for(int(hover))), dtype=np.int32)
+                np.asarray([int(hover)], dtype=np.int32)
             )
         selected = (
             np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
@@ -1059,11 +1118,11 @@ class ARE_OT_split_regions(bpy.types.Operator):
         if session is not None:
             session["preview_version"] = self._preview_serial
         self._rebuild_candidates(context)
-        chain_count = len(self._candidate_chains)
         scene_props.split_status = (
             f"已选领域 {target_id} · "
             f"线框阈值 {self._hard_threshold:.2f} · "
-            f"候选 {chain_count} 条棱线 · "
+            f"候选 {len(self._candidate_edges)} 条边 / "
+            f"{len(self._candidate_chains)} 条棱线 · "
             "点选整条硬棱 · Ctrl+滚轮调阈值"
         )
         self._refresh_session(context)
@@ -1075,8 +1134,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         return {int(e) for e in self._candidate_chains[chain_id].tolist()}
 
     def _rebuild_candidates(self, context: bpy.types.Context) -> None:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        target = int(scene_props.split_target_id)
+        target = int(getattr(context.scene, SCENE_PROP_NAME).split_target_id)
         if target < 0:
             self._candidate_edges = np.empty(0, dtype=np.int32)
             self._candidate_edges_world = np.empty((0, 2, 3), dtype=np.float64)
@@ -1090,15 +1148,14 @@ class ARE_OT_split_regions(bpy.types.Operator):
             target,
             float(self._hard_threshold),
         )
-        flat, chains = filter_bisecting_candidate_chains(
+        # 只做连通分组，不做「能否一分为二」预筛——后者在大领域上极慢，
+        # 且模糊硬棱带常被误杀成 0 候选。
+        chains = group_candidate_edge_chains(
             raw,
-            self._region_ids,
-            self._topology,
-            target,
             self._edge_vert_a,
             self._edge_vert_b,
         )
-        self._candidate_edges = flat
+        self._candidate_edges = np.asarray(raw, dtype=np.int32)
         self._candidate_chains = chains
         self._edge_to_chain = {}
         for chain_id, chain in enumerate(chains):
@@ -1106,7 +1163,6 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 self._edge_to_chain[int(edge_index)] = chain_id
 
         cand_set = set(int(e) for e in self._candidate_edges.tolist())
-        # 保留仍有效的整链选中
         kept: set[int] = set()
         for edge_index in list(self._selected_cut_edges):
             kept.update(self._chain_edges_for(edge_index))
@@ -1124,18 +1180,8 @@ class ARE_OT_split_regions(bpy.types.Operator):
             )
         )
         scene_props.split_hard_threshold = float(self._hard_threshold)
-        self._rebuild_candidates(context)
-        scene_props.split_status = (
-            f"线框阈值 {self._hard_threshold:.2f} · "
-            f"候选 {len(self._candidate_chains)} 条棱线 · "
-            f"已选 {self._selected_chain_count()} 条"
-        )
-        self._preview_serial += 1
-        if self._selected_cut_edges:
-            self._schedule_preview(context)
-        else:
-            self._clear_preview_keep_selection(context)
-        self._refresh_session(context)
+        # 立即反馈数值，候选重建防抖，避免滚轮连调卡死
+        self._schedule_candidate_rebuild(context)
 
     def _clear_preview_keep_selection(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
@@ -1204,7 +1250,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             scene_props.split_status = (
                 f"已选领域 {scene_props.split_target_id} · "
                 f"线框阈值 {self._hard_threshold:.2f} · "
-                f"候选 {len(self._candidate_chains)} 条棱线 · 点选硬棱"
+                f"候选 {len(self._candidate_edges)} 条边 · 点选硬棱"
             )
         self._refresh_session(context)
 
@@ -1289,16 +1335,15 @@ class ARE_OT_split_regions(bpy.types.Operator):
             self.report({"INFO"}, scene_props.split_status)
 
     def _edges_to_world(self, edges: np.ndarray) -> np.ndarray:
-        verts = self._mesh_data["vertices"]
-        lines = []
-        for edge_index in np.asarray(edges, dtype=np.int32).tolist():
-            va = int(self._edge_vert_a[edge_index])
-            vb = int(self._edge_vert_b[edge_index])
-            if 0 <= va < len(verts) and 0 <= vb < len(verts):
-                lines.append([verts[va], verts[vb]])
-        if not lines:
+        edge_arr = np.asarray(edges, dtype=np.int32)
+        if len(edge_arr) == 0:
             return np.empty((0, 2, 3), dtype=np.float64)
-        return np.asarray(lines, dtype=np.float64)
+        verts = self._mesh_data["vertices"]
+        va = self._edge_vert_a[edge_arr]
+        vb = self._edge_vert_b[edge_arr]
+        return np.stack((verts[va], verts[vb]), axis=1).astype(
+            np.float64, copy=False
+        )
 
     def _undo_selection(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
@@ -1454,6 +1499,8 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._timer = None
         self._debounce_timer = None
         self._debounce_token = None
+        self._candidate_timer = None
+        self._candidate_token = None
 
         scene_props.split_mode_active = True
         scene_props.split_confirm_requested = False
@@ -1566,13 +1613,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             self._hard_threshold = float(
                 min(HARD_THRESHOLD_MAX, max(HARD_THRESHOLD_MIN, panel_thr))
             )
-            self._rebuild_candidates(context)
-            self._preview_serial += 1
-            if self._selected_cut_edges:
-                self._schedule_preview(context)
-            else:
-                self._clear_preview_keep_selection(context)
-            self._refresh_session(context)
+            self._schedule_candidate_rebuild(context)
 
         if context.space_data is None or context.space_data.type != "VIEW_3D":
             return {"PASS_THROUGH"}
