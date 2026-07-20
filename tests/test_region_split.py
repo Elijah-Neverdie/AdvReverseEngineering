@@ -293,37 +293,55 @@ class RegionSplitTests(unittest.TestCase):
     def test_candidate_hard_edges_filters(self) -> None:
         topology, centers, normals = _quad_strip_topology()
         region_ids = np.zeros(6, dtype=np.int32)
-        costs, _mids = prepare_edge_costs(
-            topology, normals, centers, region_ids
-        )
-        # 垂直硬边 4,5,6 硬度高；水平平坦边硬度低
+        # 垂直硬边 4,5,6 线框可见；水平平坦边不应入选
         hard = candidate_hard_edges(
-            topology, region_ids, 0, costs, hardness_min=0.35
+            topology, normals, region_ids, 0, wireframe_threshold=0.1
         )
         hard_set = set(hard.tolist())
         self.assertTrue(hard_set.issuperset({4, 5, 6}))
-        # 平坦边在高阈值下不应入选
-        soft = candidate_hard_edges(
-            topology, region_ids, 0, costs, hardness_min=0.9
-        )
-        soft_set = set(soft.tolist())
-        self.assertTrue(soft_set.issubset(hard_set))
         for flat_edge in (0, 1, 2, 3):
-            self.assertNotIn(flat_edge, soft_set)
+            self.assertNotIn(flat_edge, hard_set)
 
     def test_candidate_excludes_cross_region_edges(self) -> None:
         topology, centers, normals = _quad_strip_topology()
         # 上下分成两个领域：0,1,2 vs 3,4,5；垂直边成跨领域边
         region_ids = np.array([0, 0, 0, 1, 1, 1], dtype=np.int32)
-        costs, _mids = prepare_edge_costs(
-            topology, normals, centers, region_ids
-        )
         hard = candidate_hard_edges(
-            topology, region_ids, 0, costs, hardness_min=0.1
+            topology, normals, region_ids, 0, wireframe_threshold=0.5
         )
         # 跨领域垂直边 4,5,6 不得作为领域 0 内部候选
         for cross in (4, 5, 6):
             self.assertNotIn(cross, set(hard.tolist()))
+
+    def test_candidate_wire_threshold_reveals_mild_crease(self) -> None:
+        """提高线框阈值后，缓折棱应进入候选。"""
+        topology, _centers, _normals = _quad_strip_topology()
+        # 左右缓折约 3°：低阈值不可见，高阈值可见
+        angle = np.radians(3.0)
+        normals = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [np.sin(angle), 0.0, np.cos(angle)],
+                [np.sin(angle), 0.0, np.cos(angle)],
+                [0.0, 0.0, 1.0],
+                [np.sin(angle), 0.0, np.cos(angle)],
+                [np.sin(angle), 0.0, np.cos(angle)],
+            ],
+            dtype=np.float64,
+        )
+        region_ids = np.zeros(6, dtype=np.int32)
+        low = set(
+            candidate_hard_edges(
+                topology, normals, region_ids, 0, wireframe_threshold=0.02
+            ).tolist()
+        )
+        high = set(
+            candidate_hard_edges(
+                topology, normals, region_ids, 0, wireframe_threshold=0.6
+            ).tolist()
+        )
+        self.assertNotIn(0, low)
+        self.assertTrue(high.issuperset({0, 2}))
 
 
 class MergeTransactionLogicTests(unittest.TestCase):

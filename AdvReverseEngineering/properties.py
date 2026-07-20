@@ -459,15 +459,15 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         max=200.0,
     )
     split_hard_threshold: FloatProperty(
-        name="硬边阈值",
+        name="线框阈值",
         description=(
-            "候选硬边最低硬度（0~1）；Ctrl+滚轮调节。"
-            "越高只显示更硬的边"
+            "与「识别领域」相同的 Blender 线框阈值；Ctrl+滚轮调节。"
+            "越大越敏感，会显示曲面上更缓的折棱作为候选硬边"
         ),
-        default=0.35,
-        min=0.15,
-        max=0.95,
-        soft_min=0.2,
+        default=0.25,
+        min=0.02,
+        max=1.0,
+        soft_min=0.05,
         soft_max=0.8,
         precision=2,
         step=5,

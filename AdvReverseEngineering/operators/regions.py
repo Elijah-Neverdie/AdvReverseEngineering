@@ -43,9 +43,9 @@ REGION_VERSION_ATTR = "are_region_version"
 REGION_COLORS_ATTR = "are_region_colors"
 MODAL_TIMER_STEP = 0.1
 EDGE_PICK_PX = 14.0
-HARD_THRESHOLD_DEFAULT = 0.35
-HARD_THRESHOLD_MIN = 0.15
-HARD_THRESHOLD_MAX = 0.95
+HARD_THRESHOLD_DEFAULT = 0.25
+HARD_THRESHOLD_MIN = 0.02
+HARD_THRESHOLD_MAX = 1.0
 HARD_THRESHOLD_STEP = 0.05
 SPLIT_PREVIEW_DEBOUNCE_SEC = 0.12
 
@@ -917,7 +917,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
     bl_idname = "are.split_regions"
     bl_label = "拆分领域"
     bl_description = (
-        "点击编号选择领域，Ctrl+滚轮调硬边阈值，点选硬边拆分"
+        "点击编号选择领域，Ctrl+滚轮调线框阈值，点选硬边拆分"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1060,7 +1060,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         self._rebuild_candidates(context)
         scene_props.split_status = (
             f"已选领域 {target_id} · "
-            f"阈值 {self._hard_threshold:.2f} · "
+            f"线框阈值 {self._hard_threshold:.2f} · "
             f"候选 {len(self._candidate_edges)} 条 · "
             "点选硬边 · Ctrl+滚轮调阈值"
         )
@@ -1075,9 +1075,9 @@ class ARE_OT_split_regions(bpy.types.Operator):
             return
         self._candidate_edges = candidate_hard_edges(
             self._topology,
+            self._mesh_data["normals"],
             self._region_ids,
             target,
-            self._edge_costs,
             float(self._hard_threshold),
         )
         cand_set = set(int(e) for e in self._candidate_edges.tolist())
@@ -1099,7 +1099,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
         scene_props.split_hard_threshold = float(self._hard_threshold)
         self._rebuild_candidates(context)
         scene_props.split_status = (
-            f"硬边阈值 {self._hard_threshold:.2f} · "
+            f"线框阈值 {self._hard_threshold:.2f} · "
             f"候选 {len(self._candidate_edges)} 条 · "
             f"已选 {len(self._selected_cut_edges)} 条"
         )
@@ -1160,14 +1160,14 @@ class ARE_OT_split_regions(bpy.types.Operator):
         if self._selected_cut_edges:
             scene_props.split_status = (
                 f"已选 {len(self._selected_cut_edges)} 条硬边 · "
-                f"阈值 {self._hard_threshold:.2f} · 正在预览…"
+                f"线框阈值 {self._hard_threshold:.2f} · 正在预览…"
             )
             self._schedule_preview(context)
         else:
             self._clear_preview_keep_selection(context)
             scene_props.split_status = (
                 f"已选领域 {scene_props.split_target_id} · "
-                f"阈值 {self._hard_threshold:.2f} · "
+                f"线框阈值 {self._hard_threshold:.2f} · "
                 f"候选 {len(self._candidate_edges)} 条 · 点选硬边"
             )
         self._refresh_session(context)
@@ -1385,6 +1385,14 @@ class ARE_OT_split_regions(bpy.types.Operator):
             getattr(scene_props, "split_hard_threshold", HARD_THRESHOLD_DEFAULT)
             or HARD_THRESHOLD_DEFAULT
         )
+        # 旧版「硬度 0~1」默认偏高；若明显高于识别线框阈值，回落到识别参数以便调出缓棱。
+        identify_wire = float(
+            getattr(scene_props, "region_wireframe_threshold", 0.1) or 0.1
+        )
+        if self._hard_threshold > 0.6 and identify_wire <= 0.5:
+            self._hard_threshold = float(
+                max(identify_wire, HARD_THRESHOLD_DEFAULT)
+            )
         self._hard_threshold = float(
             min(
                 HARD_THRESHOLD_MAX,
@@ -1487,7 +1495,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 return {"FINISHED"}
             return {"RUNNING_MODAL"}
 
-        # Ctrl + 滚轮：调节硬边阈值
+        # Ctrl + 滚轮：调节线框阈值（与识别领域相同语义）
         if event.ctrl and event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
             phase = str(scene_props.split_phase)
             if phase in {"EDGE", "PREVIEW"}:

@@ -297,7 +297,7 @@ class ARE_PT_main(bpy.types.Panel):
                 tip.prop(
                     scene_props,
                     "split_hard_threshold",
-                    text="硬边阈值",
+                    text="线框阈值",
                 )
                 if scene_props.split_status:
                     tip.label(text=scene_props.split_status)
@@ -317,8 +317,9 @@ class ARE_PT_main(bpy.types.Panel):
                 ):
                     help_box = tip.box()
                     help_box.label(text="1. 点击编号选择要拆分的领域")
-                    help_box.label(text="2. Ctrl+滚轮调节硬边阈值")
-                    help_box.label(text="3. 点击候选硬边（可多选）拆分")
+                    help_box.label(text="2. Ctrl+滚轮调线框阈值（同识别领域）")
+                    help_box.label(text="3. 增大阈值可显示曲面上的缓棱")
+                    help_box.label(text="4. 点击候选硬边（可多选）拆分")
                     help_box.label(text="Ctrl+Z 清除选中边")
                     help_box.label(text="点击确认拆分或 Enter 写入并退出")
                     help_box.label(text="Esc 取消")

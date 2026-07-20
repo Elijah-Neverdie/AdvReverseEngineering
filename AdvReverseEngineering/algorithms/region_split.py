@@ -11,7 +11,12 @@ from typing import Iterable
 
 import numpy as np
 
-from .regions import REGION_IGNORED_ID, generate_region_colors
+from .regions import (
+    REGION_IGNORED_ID,
+    blender_wire_edge_fac,
+    blender_wire_step_param,
+    generate_region_colors,
+)
 
 
 def _contrast_color(base_rgba: np.ndarray, offset_index: int = 0) -> np.ndarray:
@@ -45,7 +50,8 @@ def prepare_edge_costs(
     """
     为每条共享边计算硬边偏好代价与中点。
 
-    二面角越大（越硬）代价越低；平坦边代价高；跨领域边用作终止目标。
+    代价对齐 Blender 线框 edge_fac：越硬（fac→0）代价越低；
+    跨领域边抬高代价，供 Dijkstra 规避，但仍可作终止。
     """
     face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
     face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
@@ -58,48 +64,52 @@ def prepare_edge_costs(
     n0 = normals[face_a]
     n1 = normals[face_b]
     dots = np.clip(np.sum(n0 * n1, axis=1), -1.0, 1.0)
-    # 二面角（0=共面平坦，π=对折）；硬边 → 低代价
-    dihedral = np.arccos(dots)
-    hardness = dihedral / np.pi  # 0..1
-    flat_penalty = (1.0 - hardness) ** 2
+    # 0=硬边，接近 1=平坦（与视图线框一致）
+    fac = np.asarray(blender_wire_edge_fac(dots), dtype=np.float64)
 
     centers = np.asarray(face_centers, dtype=np.float64)
     mids = 0.5 * (centers[face_a] + centers[face_b])
 
     # 基础代价：硬边接近 0.05，平坦接近 1.0
-    costs = 0.05 + 0.95 * flat_penalty
+    costs = 0.05 + 0.95 * fac
 
     rid = np.asarray(region_ids, dtype=np.int32)
     cross = rid[face_a] != rid[face_b]
-    # 跨领域边不作为切割路径内部边，代价抬高供搜索规避；但仍可作终止。
     costs = np.where(cross, costs + 50.0, costs)
     return costs.astype(np.float64, copy=False), mids.astype(np.float64, copy=False)
 
 
 def candidate_hard_edges(
     topology: dict,
+    normals: np.ndarray,
     region_ids: np.ndarray,
     target_rid: int,
-    edge_costs: np.ndarray,
-    hardness_min: float,
+    wireframe_threshold: float,
 ) -> np.ndarray:
     """
-    目标领域内部、硬度不低于阈值的候选硬边索引。
+    目标领域内部的候选硬边（与「识别领域」同一套 Blender 线框判据）。
 
-    硬度近似 hardness = clamp(1 - cost, 0, 1)；
-    跨领域边（代价被抬高）不会入选。
+    边在线框中可见（edge_fac <= wire_step(T)）则入选。
+    Ctrl+滚轮增大 T 会纳入更缓的折棱（例如曲面上的棱线）。
     """
     face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
     face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
-    costs = np.asarray(edge_costs, dtype=np.float64)
-    if len(face_a) == 0 or len(costs) == 0:
+    if len(face_a) == 0:
         return np.empty(0, dtype=np.int32)
 
     rid = np.asarray(region_ids, dtype=np.int32)
     target = int(target_rid)
     internal = (rid[face_a] == target) & (rid[face_b] == target)
-    hardness = np.clip(1.0 - costs, 0.0, 1.0)
-    mask = internal & (hardness >= float(hardness_min))
+    if not np.any(internal):
+        return np.empty(0, dtype=np.int32)
+
+    normals_arr = np.asarray(normals, dtype=np.float64)
+    n0 = normals_arr[face_a]
+    n1 = normals_arr[face_b]
+    dots = np.clip(np.sum(n0 * n1, axis=1), -1.0, 1.0)
+    fac = np.asarray(blender_wire_edge_fac(dots), dtype=np.float64)
+    step = float(blender_wire_step_param(wireframe_threshold))
+    mask = internal & (fac <= step)
     if not np.any(mask):
         return np.empty(0, dtype=np.int32)
     return np.flatnonzero(mask).astype(np.int32)
