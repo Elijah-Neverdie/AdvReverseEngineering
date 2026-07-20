@@ -295,6 +295,7 @@ def draw_region_merge_labels() -> None:
         return
     if not (
         scene_props.merge_mode_active
+        or getattr(scene_props, "remove_mode_active", False)
         or scene_props.split_mode_active
         or getattr(scene_props, "fit_mode_active", False)
     ):
@@ -307,6 +308,9 @@ def draw_region_merge_labels() -> None:
     if scene_props.merge_mode_active:
         anchor_id = int(scene_props.merge_anchor_id)
         hover_id = int(scene_props.merge_hover_id)
+    elif getattr(scene_props, "remove_mode_active", False):
+        anchor_id = -1
+        hover_id = int(getattr(scene_props, "remove_hover_id", -1))
     elif getattr(scene_props, "fit_mode_active", False):
         anchor_id = int(getattr(scene_props, "fit_target_id", -1))
         hover_id = int(getattr(scene_props, "fit_hover_id", -1))
@@ -1075,7 +1079,10 @@ def draw_overlays() -> None:
     merge_session = _MERGE_LABEL_SESSION
     split_session = _SPLIT_STROKE_SESSION
     use_merge_preview = (
-        bool(scene_props.merge_mode_active)
+        (
+            bool(scene_props.merge_mode_active)
+            or bool(getattr(scene_props, "remove_mode_active", False))
+        )
         and merge_session is not None
         and merge_session.get("region_ids") is not None
     )

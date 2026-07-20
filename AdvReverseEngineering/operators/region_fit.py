@@ -1202,6 +1202,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
         if (
             scene_props.merge_mode_active
             or scene_props.split_mode_active
+            or getattr(scene_props, "remove_mode_active", False)
             or scene_props.fit_mode_active
         ):
             return False

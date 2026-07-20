@@ -11,8 +11,10 @@ from .region_fit import (
 from .regions import (
     ARE_OT_clear_regions,
     ARE_OT_confirm_merge_regions,
+    ARE_OT_confirm_remove_regions,
     ARE_OT_confirm_split_regions,
     ARE_OT_merge_regions,
+    ARE_OT_remove_regions,
     ARE_OT_segment_regions,
     ARE_OT_split_regions,
 )
@@ -32,6 +34,8 @@ classes = (
     ARE_OT_clear_regions,
     ARE_OT_merge_regions,
     ARE_OT_confirm_merge_regions,
+    ARE_OT_remove_regions,
+    ARE_OT_confirm_remove_regions,
     ARE_OT_split_regions,
     ARE_OT_confirm_split_regions,
     ARE_OT_fit_region,

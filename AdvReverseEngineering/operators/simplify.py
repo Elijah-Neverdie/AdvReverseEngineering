@@ -411,6 +411,8 @@ class ARE_OT_simplify_apply(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
         if scene_props is not None and (
             scene_props.merge_mode_active or scene_props.split_mode_active
+            or getattr(scene_props, "remove_mode_active", False)
+            or getattr(scene_props, "fit_mode_active", False)
         ):
             return False
         return (
@@ -449,6 +451,8 @@ class ARE_OT_simplify_rebuild(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
         if scene_props is not None and (
             scene_props.merge_mode_active or scene_props.split_mode_active
+            or getattr(scene_props, "remove_mode_active", False)
+            or getattr(scene_props, "fit_mode_active", False)
         ):
             return False
         if scene_props is not None and scene_props.simplify_active:

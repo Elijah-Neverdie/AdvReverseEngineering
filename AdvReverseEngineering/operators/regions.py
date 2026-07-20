@@ -11,6 +11,7 @@ import numpy as np
 from ..algorithms.regions import (
     compute_region_label_anchors,
     merge_region_ids,
+    remove_region_ids,
     segment_regions_by_normal,
 )
 from ..algorithms.region_split import (
@@ -82,6 +83,7 @@ def _remove_modal_timer(operator, context: bpy.types.Context) -> None:
 # 存放在 driver_namespace 中，插件热重载后按钮仍能取到旧模态实例。
 _MERGE_OP_KEY = "are_active_merge_op"
 _SPLIT_OP_KEY = "are_active_split_op"
+_REMOVE_OP_KEY = "are_active_remove_op"
 
 
 def _set_active_merge_op(operator) -> None:
@@ -95,6 +97,19 @@ def _get_active_merge_op():
 def _clear_active_merge_op(operator) -> None:
     if bpy.app.driver_namespace.get(_MERGE_OP_KEY) is operator:
         bpy.app.driver_namespace[_MERGE_OP_KEY] = None
+
+
+def _set_active_remove_op(operator) -> None:
+    bpy.app.driver_namespace[_REMOVE_OP_KEY] = operator
+
+
+def _get_active_remove_op():
+    return bpy.app.driver_namespace.get(_REMOVE_OP_KEY)
+
+
+def _clear_active_remove_op(operator) -> None:
+    if bpy.app.driver_namespace.get(_REMOVE_OP_KEY) is operator:
+        bpy.app.driver_namespace[_REMOVE_OP_KEY] = None
 
 
 def _set_active_split_op(operator) -> None:
@@ -132,6 +147,18 @@ def _schedule_force_exit_check(kind: str) -> None:
                 scene_props.merge_anchor_id = -1
                 scene_props.merge_hover_id = -1
                 scene_props.merge_status = "合并模态已失联，已强制退出"
+                unregister_label_draw_handler()
+                set_merge_label_session(None)
+        elif kind == "remove":
+            stuck = (
+                getattr(scene_props, "remove_mode_active", False)
+                and getattr(scene_props, "remove_confirm_requested", False)
+            )
+            if stuck:
+                scene_props.remove_confirm_requested = False
+                scene_props.remove_mode_active = False
+                scene_props.remove_hover_id = -1
+                scene_props.remove_status = "移除模态已失联，已强制退出"
                 unregister_label_draw_handler()
                 set_merge_label_session(None)
         else:
@@ -275,9 +302,10 @@ def _build_label_session(
 
 
 def _modal_busy(scene_props) -> bool:
-    """合并、拆分或拟合模态进行中。"""
+    """合并、移除、拆分或拟合模态进行中。"""
     return bool(
         scene_props.merge_mode_active
+        or getattr(scene_props, "remove_mode_active", False)
         or scene_props.split_mode_active
         or getattr(scene_props, "fit_mode_active", False)
     )
@@ -461,6 +489,371 @@ class ARE_OT_clear_regions(bpy.types.Operator):
         clear_region_highlight(context, obj)
         self.report({"INFO"}, "已清除领域标记")
         return {"FINISHED"}
+
+
+class ARE_OT_confirm_remove_regions(bpy.types.Operator):
+    """面板确认按钮：通知移除模态提交。"""
+
+    bl_idname = "are.confirm_remove_regions"
+    bl_label = "确认"
+    bl_description = "结束移除领域并保留当前结果"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        return scene_props is not None and bool(
+            getattr(scene_props, "remove_mode_active", False)
+        )
+
+    def execute(self, context: bpy.types.Context):
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        op = _get_active_remove_op()
+        if op is not None:
+            try:
+                op.confirm_from_panel(context)
+            except Exception as exc:
+                self.report({"ERROR"}, f"确认移除失败: {exc}")
+                scene_props.remove_confirm_requested = True
+                _schedule_force_exit_check("remove")
+                return {"FINISHED"}
+            if scene_props.remove_mode_active:
+                scene_props.remove_mode_active = False
+                scene_props.remove_confirm_requested = False
+                unregister_label_draw_handler()
+                set_merge_label_session(None)
+            return {"FINISHED"}
+        scene_props.remove_confirm_requested = True
+        _schedule_force_exit_check("remove")
+        return {"FINISHED"}
+
+
+class ARE_OT_remove_regions(bpy.types.Operator):
+    """
+    模态移除领域（内存事务）。
+
+    点击编号移除该领域（面标为忽略）；Ctrl+Z 撤销；
+    确认时一次写入 Mesh。
+    """
+
+    bl_idname = "are.remove_regions"
+    bl_label = "移除领域"
+    bl_description = (
+        "点击编号移除领域；Ctrl+Z 撤销上次；确认写入，Esc 取消"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def _cleanup_ui(self, context: bpy.types.Context) -> None:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        _remove_modal_timer(self, context)
+        _clear_active_remove_op(self)
+        unregister_label_draw_handler()
+        set_merge_label_session(None)
+        scene_props.remove_mode_active = False
+        scene_props.remove_hover_id = -1
+        scene_props.remove_confirm_requested = False
+        _tag_redraw(context)
+
+    def confirm_from_panel(self, context: bpy.types.Context) -> None:
+        if getattr(self, "_closed", False):
+            return
+        try:
+            if not self._committed:
+                self._commit_to_mesh(context)
+        finally:
+            self._finish_mode(context, cancelled=False)
+            self._closed = True
+
+    def _commit_to_mesh(self, context: bpy.types.Context) -> None:
+        obj = self._object
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        write_region_ids(obj.data, self._live_ids)
+        version = int(self._snapshot_version) + 1
+        obj[REGION_VERSION_ATTR] = version
+        obj[REGION_COLORS_ATTR] = (
+            self._live_colors.astype(np.float32).ravel().tolist()
+        )
+        scene_props.region_version = version
+        scene_props.region_count = int(self._live_count)
+        scene_props.region_object = obj
+        ignored = int(np.count_nonzero(self._live_ids < 0))
+        scene_props.region_ignored_face_count = ignored
+        set_region_highlight(
+            context,
+            obj,
+            self._live_ids,
+            self._live_colors,
+        )
+        self._committed = True
+
+    def _finish_mode(self, context: bpy.types.Context, cancelled: bool) -> set:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        if cancelled and getattr(self, "_committed", False):
+            cancelled = False
+        self._cleanup_ui(context)
+        if cancelled:
+            scene_props.remove_status = "已取消移除"
+            try:
+                set_region_highlight(
+                    context,
+                    self._object,
+                    self._snapshot_ids,
+                    self._snapshot_colors,
+                )
+                scene_props.region_count = int(self._snapshot_count)
+            except Exception:
+                pass
+        else:
+            scene_props.remove_status = (
+                f"移除完成，当前 {scene_props.region_count} 个领域"
+            )
+            scene_props.region_status = (
+                f"已识别 {scene_props.region_count} 个领域"
+            )
+        return {"CANCELLED"} if cancelled else {"FINISHED"}
+
+    def _refresh_preview(self, context: bpy.types.Context) -> None:
+        obj = self._object
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        session = _build_label_session(
+            self._live_ids,
+            self._mesh_data,
+            self._live_colors,
+        )
+        session["object_name"] = obj.name
+        self._preview_serial += 1
+        session["preview_version"] = self._preview_serial
+        set_merge_label_session(session)
+        scene_props.region_count = int(self._live_count)
+        scene_props.region_object = obj
+        scene_props.remove_status = (
+            f"点击编号移除 · 当前 {self._live_count} 个领域 · "
+            f"已操作 {len(self._history)} 次 · Ctrl+Z 撤销"
+        )
+        _tag_redraw(context)
+
+    def _push_history(self) -> None:
+        self._history.append(
+            {
+                "ids": self._live_ids.copy(),
+                "colors": self._live_colors.copy(),
+                "count": int(self._live_count),
+            }
+        )
+        self._redo.clear()
+
+    def _undo_remove(self, context: bpy.types.Context) -> None:
+        if not self._history:
+            getattr(context.scene, SCENE_PROP_NAME).remove_status = (
+                "没有可撤销的移除"
+            )
+            _tag_redraw(context)
+            return
+        self._redo.append(
+            {
+                "ids": self._live_ids.copy(),
+                "colors": self._live_colors.copy(),
+                "count": int(self._live_count),
+            }
+        )
+        previous = self._history.pop()
+        self._live_ids = previous["ids"]
+        self._live_colors = previous["colors"]
+        self._live_count = int(previous["count"])
+        self._refresh_preview(context)
+
+    def _redo_remove(self, context: bpy.types.Context) -> None:
+        if not self._redo:
+            return
+        self._history.append(
+            {
+                "ids": self._live_ids.copy(),
+                "colors": self._live_colors.copy(),
+                "count": int(self._live_count),
+            }
+        )
+        nxt = self._redo.pop()
+        self._live_ids = nxt["ids"]
+        self._live_colors = nxt["colors"]
+        self._live_count = int(nxt["count"])
+        self._refresh_preview(context)
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        obj = context.active_object
+        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        if scene_props is not None and _modal_busy(scene_props):
+            return False
+        if obj is None or obj.type != "MESH" or obj.mode == "EDIT":
+            return False
+        return obj.data.attributes.get(REGION_ID_ATTR) is not None
+
+    def invoke(self, context: bpy.types.Context, event):
+        obj = context.active_object
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        region_ids = read_region_ids(obj.data)
+        if region_ids is None or not np.any(region_ids >= 0):
+            self.report({"ERROR"}, "请先识别领域")
+            return {"CANCELLED"}
+
+        region_count = int(region_ids.max()) + 1
+        colors = _read_region_colors(obj, region_count)
+        mesh_data = extract_mesh_data(obj)
+
+        self._object = obj
+        self._mesh_data = mesh_data
+        self._snapshot_ids = region_ids.copy()
+        self._snapshot_colors = colors.copy()
+        self._snapshot_version = int(scene_props.region_version)
+        self._snapshot_count = int(scene_props.region_count) or region_count
+        self._live_ids = region_ids.copy()
+        self._live_colors = colors.copy()
+        self._live_count = int(region_count)
+        self._history: list[dict] = []
+        self._redo: list[dict] = []
+        self._preview_serial = 0
+        self._committed = False
+        self._closed = False
+        self._timer = None
+
+        session = _build_label_session(region_ids, mesh_data, colors)
+        session["object_name"] = obj.name
+        session["preview_version"] = 0
+        set_merge_label_session(session)
+        register_label_draw_handler()
+        _set_active_remove_op(self)
+
+        scene_props.remove_mode_active = True
+        scene_props.remove_hover_id = -1
+        scene_props.remove_confirm_requested = False
+        scene_props.remove_status = (
+            "点击编号移除领域；Ctrl+Z 撤销；确认写入；Esc 取消"
+        )
+        scene_props.region_object = obj
+
+        _add_modal_timer(self, context)
+        context.window_manager.modal_handler_add(self)
+        _tag_redraw(context)
+        return {"RUNNING_MODAL"}
+
+    def cancel(self, context: bpy.types.Context):
+        if getattr(self, "_committed", False):
+            self._cleanup_ui(context)
+            return {"FINISHED"}
+        self._cleanup_ui(context)
+        return {"CANCELLED"}
+
+    def modal(self, context: bpy.types.Context, event):
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        obj = self._object
+
+        if getattr(self, "_closed", False):
+            return {"FINISHED"}
+
+        try:
+            if obj is None or obj.name not in bpy.data.objects:
+                return self.cancel(context)
+            if obj.mode == "EDIT":
+                return self.cancel(context)
+        except ReferenceError:
+            return self.cancel(context)
+
+        if scene_props.remove_confirm_requested and not self._committed:
+            scene_props.remove_confirm_requested = False
+            self._commit_to_mesh(context)
+            self.report(
+                {"INFO"},
+                f"移除完成，当前 {self._live_count} 个领域",
+            )
+            return self._finish_mode(context, cancelled=False)
+
+        if event.type == "TIMER":
+            return {"RUNNING_MODAL"}
+
+        if _is_undo_event(event):
+            if self._committed:
+                return {"RUNNING_MODAL"}
+            self._undo_remove(context)
+            return {"RUNNING_MODAL"}
+        if _is_redo_event(event):
+            if self._committed:
+                return {"RUNNING_MODAL"}
+            self._redo_remove(context)
+            return {"RUNNING_MODAL"}
+
+        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            if self._committed:
+                return self._finish_mode(context, cancelled=False)
+            self.report({"INFO"}, "已取消移除")
+            return self._finish_mode(context, cancelled=True)
+
+        if event.type in {"RET", "NUMPAD_ENTER"} and event.value == "PRESS":
+            if not self._committed:
+                self._commit_to_mesh(context)
+            self.report(
+                {"INFO"},
+                f"移除完成，当前 {self._live_count} 个领域",
+            )
+            return self._finish_mode(context, cancelled=False)
+
+        if context.space_data is None or context.space_data.type != "VIEW_3D":
+            return {"PASS_THROUGH"}
+        if context.region is None or context.region.type != "WINDOW":
+            return {"PASS_THROUGH"}
+
+        if event.type == "MOUSEMOVE":
+            update_merge_label_projections(context)
+            session = get_merge_label_session() or {"labels": []}
+            hover = hit_test_labels(
+                event.mouse_region_x,
+                event.mouse_region_y,
+                session.get("labels", []),
+                LABEL_RADIUS_PX,
+            )
+            new_hover = -1 if hover is None else int(hover)
+            if new_hover != int(scene_props.remove_hover_id):
+                scene_props.remove_hover_id = new_hover
+                _tag_redraw(context)
+            return {"PASS_THROUGH"}
+
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            update_merge_label_projections(context)
+            session = get_merge_label_session() or {"labels": []}
+            hit = hit_test_labels(
+                event.mouse_region_x,
+                event.mouse_region_y,
+                session.get("labels", []),
+                LABEL_RADIUS_PX,
+            )
+            if hit is None:
+                return {"RUNNING_MODAL"}
+            rid = int(hit)
+            if not np.any(self._live_ids == rid):
+                scene_props.remove_status = f"领域 {rid} 已不存在"
+                _tag_redraw(context)
+                return {"RUNNING_MODAL"}
+            try:
+                self._push_history()
+                self._live_ids, self._live_colors, self._live_count = (
+                    remove_region_ids(
+                        self._live_ids,
+                        self._live_colors,
+                        rid,
+                    )
+                )
+            except Exception as exc:
+                if self._history:
+                    previous = self._history.pop()
+                    self._live_ids = previous["ids"]
+                    self._live_colors = previous["colors"]
+                    self._live_count = int(previous["count"])
+                scene_props.remove_status = f"移除失败: {exc}"
+                _tag_redraw(context)
+                return {"RUNNING_MODAL"}
+            self._refresh_preview(context)
+            return {"RUNNING_MODAL"}
+
+        return {"PASS_THROUGH"}
 
 
 class ARE_OT_confirm_merge_regions(bpy.types.Operator):
@@ -1837,6 +2230,8 @@ __all__ = (
     "ARE_OT_clear_regions",
     "ARE_OT_merge_regions",
     "ARE_OT_confirm_merge_regions",
+    "ARE_OT_remove_regions",
+    "ARE_OT_confirm_remove_regions",
     "ARE_OT_split_regions",
     "ARE_OT_confirm_split_regions",
     "REGION_ID_ATTR",

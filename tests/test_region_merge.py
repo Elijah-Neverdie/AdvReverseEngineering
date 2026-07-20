@@ -13,6 +13,7 @@ from AdvReverseEngineering.algorithms.regions import (
     compute_region_label_anchors,
     merge_region_ids,
     remap_region_colors,
+    remove_region_ids,
 )
 
 
@@ -129,6 +130,22 @@ class RegionMergeTests(unittest.TestCase):
         remap = np.array([-1, 0, 1], dtype=np.int32)
         remapped = remap_region_colors(colors, remap, 2)
         self.assertEqual(remapped.shape, (2, 4))
+
+    def test_remove_region_ids_marks_ignored_and_compacts(self) -> None:
+        region_ids = np.array([0, 1, 1, 2], dtype=np.int32)
+        colors = np.eye(3, 4, dtype=np.float32)
+        colors[:, 3] = 0.5
+
+        new_ids, new_colors, count = remove_region_ids(region_ids, colors, 1)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(int(new_ids[1]), REGION_IGNORED_ID)
+        self.assertEqual(int(new_ids[2]), REGION_IGNORED_ID)
+        self.assertEqual(int(new_ids[0]), 0)
+        self.assertEqual(int(new_ids[3]), 1)
+        self.assertEqual(new_colors.shape[0], 2)
+        np.testing.assert_allclose(new_colors[0, :3], colors[0, :3])
+        np.testing.assert_allclose(new_colors[1, :3], colors[2, :3])
 
 
 if __name__ == "__main__":

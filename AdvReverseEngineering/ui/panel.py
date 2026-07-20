@@ -144,6 +144,7 @@ class ARE_PT_main(bpy.types.Panel):
             mesh_ready = obj is not None and obj.type == "MESH"
             modal_busy = bool(
                 scene_props.merge_mode_active
+                or getattr(scene_props, "remove_mode_active", False)
                 or scene_props.split_mode_active
                 or getattr(scene_props, "fit_mode_active", False)
             )
@@ -191,9 +192,10 @@ class ARE_PT_main(bpy.types.Panel):
             region_box = layout.box()
             mesh_ready = obj is not None and obj.type == "MESH"
             merging = bool(scene_props.merge_mode_active)
+            removing = bool(getattr(scene_props, "remove_mode_active", False))
             splitting = bool(scene_props.split_mode_active)
             fitting = bool(getattr(scene_props, "fit_mode_active", False))
-            modal_busy = merging or splitting or fitting
+            modal_busy = merging or removing or splitting or fitting
 
             region_box.prop(
                 scene_props,
@@ -251,6 +253,14 @@ class ARE_PT_main(bpy.types.Panel):
                 icon="MOD_BOOLEAN",
             )
 
+            remove_row = region_box.row(align=True)
+            remove_row.enabled = mesh_ready and not modal_busy
+            remove_row.operator(
+                "are.remove_regions",
+                text="移除领域",
+                icon="TRASH",
+            )
+
             fit_row = region_box.row(align=True)
             fit_row.enabled = mesh_ready and not modal_busy
             fit_row.operator(
@@ -288,6 +298,31 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box = tip.box()
                     help_box.label(text="首击设锚点，续击立即合并")
                     help_box.label(text="Ctrl+Z 撤销上次合并")
+                    help_box.label(text="点击确认或 Enter 写入并退出")
+                    help_box.label(text="Esc 取消")
+
+            if removing:
+                tip = region_box.box()
+                tip.label(text="移除模式", icon="INFO")
+                if scene_props.remove_status:
+                    tip.label(text=scene_props.remove_status)
+                confirm_row = tip.row()
+                confirm_row.scale_y = 1.2
+                confirm_row.operator(
+                    "are.confirm_remove_regions",
+                    text="确认",
+                    icon="CHECKMARK",
+                )
+                if _draw_foldout(
+                    tip,
+                    scene_props,
+                    "show_remove_help",
+                    "操作说明",
+                ):
+                    help_box = tip.box()
+                    help_box.label(text="点击编号移除该领域")
+                    help_box.label(text="被移除面变为未标记")
+                    help_box.label(text="Ctrl+Z 撤销上次移除")
                     help_box.label(text="点击确认或 Enter 写入并退出")
                     help_box.label(text="Esc 取消")
 

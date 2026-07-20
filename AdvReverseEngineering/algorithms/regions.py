@@ -875,3 +875,29 @@ def merge_region_ids(
     new_colors = remap_region_colors(palette, remap, count)
     new_anchor = int(remap[anchor_id]) if anchor_id < len(remap) else -1
     return compacted, new_colors, count, new_anchor
+
+
+def remove_region_ids(
+    region_ids: np.ndarray,
+    colors: np.ndarray,
+    region_id: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    移除指定领域：面标记为忽略并压缩其余编号。
+
+    返回 (新标签, 新颜色表, 新领域数)。
+    """
+    ids = np.asarray(region_ids, dtype=np.int32).copy()
+    palette = np.asarray(colors, dtype=np.float32)
+    rid = int(region_id)
+    if rid < 0:
+        raise ValueError("移除领域编号无效")
+    if not np.any(ids == rid):
+        compacted, remap, count = compact_region_ids(ids)
+        new_colors = remap_region_colors(palette, remap, count)
+        return compacted, new_colors, count
+
+    ids[ids == rid] = REGION_IGNORED_ID
+    compacted, remap, count = compact_region_ids(ids)
+    new_colors = remap_region_colors(palette, remap, count)
+    return compacted, new_colors, count

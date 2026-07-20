@@ -417,6 +417,36 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
 
     # ------------------------------------------------------------------
+    # 领域移除模态
+    # ------------------------------------------------------------------
+    remove_mode_active: BoolProperty(
+        name="移除模式",
+        description="是否正在进行领域移除",
+        default=False,
+    )
+    remove_confirm_requested: BoolProperty(
+        name="请求确认移除",
+        description="面板确认按钮通知模态算子提交",
+        default=False,
+    )
+    remove_hover_id: IntProperty(
+        name="移除悬停领域",
+        description="移除模式下鼠标悬停的领域编号",
+        default=-1,
+        min=-1,
+    )
+    remove_status: StringProperty(
+        name="移除状态",
+        description="移除模式提示文案",
+        default="",
+    )
+    show_remove_help: BoolProperty(
+        name="移除说明",
+        description="展开/收起移除模式操作说明",
+        default=False,
+    )
+
+    # ------------------------------------------------------------------
     # 领域拆分模态
     # ------------------------------------------------------------------
     split_mode_active: BoolProperty(
