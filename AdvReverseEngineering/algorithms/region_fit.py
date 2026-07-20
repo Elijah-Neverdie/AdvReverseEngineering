@@ -1289,11 +1289,76 @@ def _vertex_interior_angle_deg_2d(pts2: np.ndarray, index: int) -> float:
     return 180.0 + turn
 
 
+def _skip_collinear_neighbor_2d(
+    pts2: np.ndarray,
+    tip_index: int,
+    direction: int,
+    collinear_tol_deg: float = 8.0,
+) -> int:
+    """沿环跳过近共线茎点，取能代表尖刺走向的邻点。"""
+    count = len(pts2)
+    tip = pts2[int(tip_index) % count]
+    direction = 1 if direction >= 0 else -1
+    cursor = (int(tip_index) + direction) % count
+    max_steps = max(count // 3, 2)
+    for _ in range(max_steps):
+        nxt = (cursor + direction) % count
+        if nxt == int(tip_index) % count:
+            return cursor
+        vin = pts2[cursor] - tip
+        vout = pts2[nxt] - pts2[cursor]
+        in_len = float(np.linalg.norm(vin))
+        out_len = float(np.linalg.norm(vout))
+        if in_len < 1e-12:
+            cursor = nxt
+            continue
+        if out_len < 1e-12:
+            return cursor
+        cos_angle = float(
+            np.clip(vin.dot(vout) / (in_len * out_len), -1.0, 1.0)
+        )
+        turn = float(np.degrees(np.arccos(cos_angle)))
+        # 茎点近似直线前进；一旦明显转向则停在当前茎端
+        if turn > float(collinear_tol_deg):
+            return cursor
+        cursor = nxt
+    return cursor
+
+
+def _vertex_hairpin_interior_angle_deg_2d(pts2: np.ndarray, index: int) -> float:
+    """
+    尖刺几何内角：跳过两侧近共线茎点后再量角。
+
+    圆滑尖端的相邻折线角常只有 340°~354°，但跳过茎点后接近 360°。
+    """
+    count = len(pts2)
+    if count < 3:
+        return 180.0
+    index = int(index) % count
+    back = _skip_collinear_neighbor_2d(pts2, index, -1)
+    fwd = _skip_collinear_neighbor_2d(pts2, index, 1)
+    if back == index or fwd == index or back == fwd:
+        return _vertex_interior_angle_deg_2d(pts2, index)
+    tip = pts2[index]
+    vin = tip - pts2[back]
+    vout = pts2[fwd] - tip
+    in_len = float(np.linalg.norm(vin))
+    out_len = float(np.linalg.norm(vout))
+    if in_len < 1e-12 or out_len < 1e-12:
+        return _vertex_interior_angle_deg_2d(pts2, index)
+    cross = float(vin[0] * vout[1] - vin[1] * vout[0])
+    cos_angle = float(np.clip(vin.dot(vout) / (in_len * out_len), -1.0, 1.0))
+    turn = float(np.degrees(np.arccos(cos_angle)))
+    if cross >= 0.0:
+        return 180.0 - turn
+    return 180.0 + turn
+
+
 def _is_spike_stem_interior(interior_deg: float, interior_threshold_deg: float) -> bool:
     """尖刺链上的顶点：超锐内角或近乎直线（~180°）。"""
     if interior_deg > interior_threshold_deg:
         return True
-    return abs(interior_deg - 180.0) < 5.0
+    return abs(interior_deg - 180.0) < 8.0
 
 
 def _spike_junction_index_2d(
@@ -1310,8 +1375,12 @@ def _spike_junction_index_2d(
     for _step in range(max(count // 2, 2)):
         if cursor == tip_index:
             break
-        interior = _vertex_interior_angle_deg_2d(pts2, cursor)
-        if _is_spike_stem_interior(interior, interior_threshold_deg):
+        # 茎点用局部角；分岔用跳过共线后的几何角
+        local = _vertex_interior_angle_deg_2d(pts2, cursor)
+        hairpin = _vertex_hairpin_interior_angle_deg_2d(pts2, cursor)
+        if _is_spike_stem_interior(local, interior_threshold_deg) or (
+            hairpin > interior_threshold_deg
+        ):
             cursor = (cursor + direction) % count
             continue
         return cursor
@@ -1328,6 +1397,7 @@ def collapse_ultra_reflex_spike_vertices_closed_loop(
 
     适用于拟合边界上几乎 360° 的内角（细刺/毛刺），
     将尖点及其同侧细段收束到分岔处的交点。
+    圆滑尖端用「跳过共线茎点」后的几何内角判定，避免局部折线角略低于阈值而漏收。
     """
     pts = _as_float_array(points).copy()
     if len(pts) < 4:
@@ -1348,7 +1418,9 @@ def collapse_ultra_reflex_spike_vertices_closed_loop(
         tip_index = -1
         best_interior = threshold
         for index in range(count):
-            interior = _vertex_interior_angle_deg_2d(pts2, index)
+            local = _vertex_interior_angle_deg_2d(pts2, index)
+            hairpin = _vertex_hairpin_interior_angle_deg_2d(pts2, index)
+            interior = max(local, hairpin)
             if interior > best_interior:
                 best_interior = interior
                 tip_index = index
@@ -1378,6 +1450,11 @@ def collapse_ultra_reflex_spike_vertices_closed_loop(
         keep = [i for i in range(count) if i not in remove_set]
         if len(keep) < 3:
             break
+        if len(keep) == count:
+            # 未删点则强制去掉尖点，避免死循环
+            keep = [i for i in range(count) if i != tip_index]
+            if len(keep) < 3:
+                break
         pts = pts[np.asarray(keep, dtype=np.int32)].copy()
         pts2 = project_points_to_plane(pts, origin, axis_u, axis_v)
 
@@ -3826,6 +3903,11 @@ def extract_island_longest_sides(
             )
         )
         loop_rs = resample_closed_polyline(loop_pts, sample_count)
+        # 重采样后可能再次出现圆滑尖刺，再收束一次
+        loop_rs = collapse_ultra_reflex_spike_vertices_closed_loop(loop_rs)
+        if len(loop_rs) < 3:
+            continue
+        sample_count = len(loop_rs)
         pts_2d = project_points_to_plane(loop_rs, origin, axis_u, axis_v)
         corners = detect_corner_indices(
             pts_2d,

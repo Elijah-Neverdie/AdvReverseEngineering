@@ -1339,6 +1339,24 @@ class FitRegionSurfaceTests(unittest.TestCase):
         fork = cleaned[(np.abs(cleaned[:, 0] - 2.0) < 0.05) & (cleaned[:, 1] < 1.05)]
         self.assertGreaterEqual(len(fork), 1)
 
+    def test_collapse_soft_rounded_spike_below_local_355(self) -> None:
+        """局部折线角略低于355°的圆滑尖端，也应按几何发夹角收束。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            collapse_ultra_reflex_spike_vertices_closed_loop,
+        )
+
+        ys = [0.3, 0.8, 1.4, 1.9, 2.2, 2.35, 2.2, 1.9, 1.4, 0.8, 0.3]
+        xs = [1.92, 1.93, 1.95, 1.97, 1.99, 2.0, 2.01, 2.03, 2.05, 2.07, 2.08]
+        spiked = np.array(
+            [[0.0, 0.0, 0.0], [1.9, 0.0, 0.0]]
+            + [[xs[i], ys[i], 0.0] for i in range(len(xs))]
+            + [[2.1, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float64,
+        )
+        cleaned = collapse_ultra_reflex_spike_vertices_closed_loop(spiked)
+        self.assertLess(len(cleaned), len(spiked))
+        self.assertLess(float(cleaned[:, 1].max()), 1.05)
+
     def test_stitch_bridges_reentrant_notch_to_continuous_rim(self) -> None:
         """缝合后内阴角应被切除，外轮廓不再钻进 V 形凹口。"""
         from AdvReverseEngineering.algorithms.region_fit import (
