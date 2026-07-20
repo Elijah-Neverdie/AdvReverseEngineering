@@ -375,6 +375,52 @@ def _is_internal_region_edge(
     )
 
 
+def filter_internal_cut_edges(
+    cut_edges: np.ndarray,
+    topology: dict,
+    region_ids: np.ndarray,
+    target_rid: int,
+) -> np.ndarray:
+    """去掉跨领域边界边，只保留目标领域内部切边。"""
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    rid = np.asarray(region_ids, dtype=np.int32)
+    target = int(target_rid)
+    kept: list[int] = []
+    for edge_index in np.asarray(cut_edges, dtype=np.int32).tolist():
+        edge_index = int(edge_index)
+        if edge_index < 0 or edge_index >= len(face_a):
+            continue
+        if (
+            int(rid[int(face_a[edge_index])]) == target
+            and int(rid[int(face_b[edge_index])]) == target
+        ):
+            kept.append(edge_index)
+    if not kept:
+        return np.empty(0, dtype=np.int32)
+    return np.asarray(kept, dtype=np.int32)
+
+
+def _edge_touches_foreign_region(
+    edge_index: int,
+    face_a: np.ndarray,
+    face_b: np.ndarray,
+    offsets: np.ndarray,
+    adj: np.ndarray,
+    region_ids: np.ndarray,
+    target_rid: int,
+) -> bool:
+    """内部边是否贴着外领域（一侧面子有跨领域邻接）——周界贴边。"""
+    target = int(target_rid)
+    for face in (int(face_a[edge_index]), int(face_b[edge_index])):
+        begin = int(offsets[face])
+        end = int(offsets[face + 1])
+        for neighbor in adj[begin:end].tolist():
+            if int(region_ids[int(neighbor)]) != target:
+                return True
+    return False
+
+
 def grow_ridge_cut_to_boundary(
     seed_edge: int,
     topology: dict,
@@ -404,6 +450,16 @@ def grow_ridge_cut_to_boundary(
     edge_costs = np.asarray(edge_costs, dtype=np.float64)
     if seed < 0 or seed >= len(edge_vert_a):
         return np.empty(0, dtype=np.int32)
+
+    # 种子必须是目标领域内部边，不能是已有领域分界
+    if not _is_internal_region_edge(
+        seed, face_a, face_b, region_ids, target_rid
+    ):
+        return np.empty(0, dtype=np.int32)
+
+    offsets = np.asarray(topology["adjacency_offsets"], dtype=np.int32)
+    adj = np.asarray(topology["adjacency_indices"], dtype=np.int32)
+    rid = np.asarray(region_ids, dtype=np.int32)
 
     verts = (
         np.asarray(vertices, dtype=np.float64)
@@ -457,8 +513,13 @@ def grow_ridge_cut_to_boundary(
             return 2.0 + align
         if hard < min_hardness:
             return -1.0
-        # 方向权重大于绝对硬度，保证沿棱走而非横向抄近
-        return hard * (0.25 + 0.75 * align)
+        score = hard * (0.25 + 0.75 * align)
+        # 贴着已有领域分界的周界边大幅降权，避免沿着 39/9 这类边界长出「假切线」
+        if _edge_touches_foreign_region(
+            edge_index, face_a, face_b, offsets, adj, rid, target_rid
+        ):
+            score *= 0.12
+        return score
 
     def greedy_extend(start_vert: int, prev_vert: int) -> list[int]:
         path: list[int] = []
@@ -603,7 +664,12 @@ def grow_ridge_cut_to_boundary(
         completed.add(int(edge_index))
     for edge_index in greedy_extend(vb, va):
         completed.add(int(edge_index))
-    return np.asarray(sorted(completed), dtype=np.int32)
+    return filter_internal_cut_edges(
+        np.asarray(sorted(completed), dtype=np.int32),
+        topology,
+        region_ids,
+        target_rid,
+    )
 
 
 def complete_cut_edges_dijkstra(
@@ -1165,6 +1231,7 @@ __all__ = (
     "group_candidate_edge_chains",
     "chain_splits_region",
     "filter_bisecting_candidate_chains",
+    "filter_internal_cut_edges",
     "grow_ridge_cut_to_boundary",
     "stroke_hits_to_seed_edges",
     "complete_cut_edges_dijkstra",

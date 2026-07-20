@@ -16,6 +16,7 @@ from ..algorithms.regions import (
 from ..algorithms.region_split import (
     candidate_hard_edges,
     complete_cut_edges_dijkstra,
+    filter_internal_cut_edges,
     group_candidate_edge_chains,
     grow_ridge_cut_to_boundary,
     prepare_edge_costs,
@@ -1260,7 +1261,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             return
 
         target = int(scene_props.split_target_id)
-        # 从短边两端沿硬棱延伸到领域边界，得到完整分割线
+        # 从短边两端沿硬棱延伸；结果只保留目标领域内部边
         completed = grow_ridge_cut_to_boundary(
             edge_index,
             self._topology,
@@ -1292,8 +1293,34 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 self._edge_vert_b,
                 max_radius=self._max_radius,
             )
+        completed = filter_internal_cut_edges(
+            completed,
+            self._topology,
+            self._region_ids,
+            target,
+        )
         if len(completed) == 0:
-            completed = np.asarray([edge_index], dtype=np.int32)
+            completed = filter_internal_cut_edges(
+                np.asarray([edge_index], dtype=np.int32),
+                self._topology,
+                self._region_ids,
+                target,
+            )
+        if len(completed) == 0:
+            scene_props.split_status = (
+                "点到的是已有领域分界，不能用来拆分。"
+                "请点选当前领域内部的折棱（青绿候选）"
+            )
+            self.report({"WARNING"}, scene_props.split_status)
+            self._ridge_cut_edges = np.empty(0, dtype=np.int32)
+            self._selected_cut_edges.clear()
+            self._completed_edges = np.empty(0, dtype=np.int32)
+            self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
+            self._preview_ids = None
+            self._preview_colors = None
+            self._preview_serial += 1
+            self._refresh_session(context)
+            return
 
         self._ridge_cut_edges = np.asarray(completed, dtype=np.int32)
         self._selected_cut_edges = {int(e) for e in self._ridge_cut_edges.tolist()}
@@ -1347,10 +1374,17 @@ class ARE_OT_split_regions(bpy.types.Operator):
         else:
             scene_props.split_phase = "EDGE"
             scene_props.split_status = (
-                f"切线 {len(completed)} 段仍未切开领域，请换一条更靠近棱线中心的短边"
+                "切线贴着已有领域边界，无法把当前领域一分为二。"
+                "请点选领域内部的折棱（不要点两个领域之间的分界线）"
             )
             self._preview_ids = None
             self._preview_colors = None
+            # 去掉误导性红线，避免以为已经选好可确认
+            self._ridge_cut_edges = np.empty(0, dtype=np.int32)
+            self._selected_cut_edges.clear()
+            self._completed_edges = np.empty(0, dtype=np.int32)
+            self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
+            self.report({"WARNING"}, scene_props.split_status)
         self._refresh_session(context)
         if changed:
             self.report({"INFO"}, scene_props.split_status)
