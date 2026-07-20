@@ -467,11 +467,14 @@ def grow_ridge_cut_to_boundary(
         else None
     )
     seed_hardness = max(0.0, 1.0 - float(edge_costs[seed]))
-    # 续边硬度下限：允许比种子略软（缓棱中段），但不走明显平坦边
-    min_hardness = max(0.05, seed_hardness * 0.25)
-    # 相对种子主方向：约 <50° 才续；禁止拐到横边/周界
-    min_principal_align = 0.64
-    min_local_align = 0.45
+    # 续边硬度下限：允许比种子略软（缓棱中段）
+    min_hardness = max(0.04, seed_hardness * 0.22)
+    soft_hardness = max(0.02, seed_hardness * 0.12)
+    # 主方向约 <55° 可续；横拐（周界溢出）仍拒绝
+    min_principal_align = 0.55
+    min_local_align = 0.35
+    # 贴周界但朝主方向前进：允许；贴周界且偏横：拒绝
+    min_perimeter_forward_align = 0.75
     max_steps = 200000
 
     def other_vert(edge_index: int, from_vert: int) -> int:
@@ -496,8 +499,10 @@ def grow_ridge_cut_to_boundary(
 
     def greedy_extend(start_vert: int, prev_vert: int) -> list[int]:
         """
-        从 start 沿「种子主方向」延伸。
-        只走与主方向同向的内部边；贴周界的边一律不续，避免端点拐到横边上。
+        从 start 沿种子主方向延伸到领域边界。
+        - 与主方向同向的内部边可续（含接近边界的边）
+        - 贴周界且横拐的边拒绝（防端点溢出）
+        - 真领域边界边只作终止信号，不加入切线
         """
         path: list[int] = []
         current = int(start_vert)
@@ -526,7 +531,9 @@ def grow_ridge_cut_to_boundary(
             best_internal = None
             best_internal_score = -1.0
             best_internal_other = -1
-            hit_forward_boundary = False
+            best_soft = None
+            best_soft_score = -1.0
+            best_soft_other = -1
 
             for edge_index in vert_edge_indices[begin:end].tolist():
                 edge_index = int(edge_index)
@@ -544,12 +551,10 @@ def grow_ridge_cut_to_boundary(
                 if travel is not None and ed is not None:
                     align_t = float(np.dot(travel, ed))
 
-                # 真·领域边界：仅当大致朝主方向时结束延伸（不加入切线）
+                # 真·领域边界：朝向主方向则视为走到尽头（不加入切线）
                 if _is_region_boundary_edge(
                     edge_index, face_a, face_b, region_ids, target_rid
                 ):
-                    if align_p >= min_principal_align:
-                        hit_forward_boundary = True
                     continue
 
                 if not _is_internal_region_edge(
@@ -557,10 +562,11 @@ def grow_ridge_cut_to_boundary(
                 ):
                     continue
 
-                # 禁止贴着外领域周界续走（端点拐弯溢出的主因）
-                if _edge_touches_foreign_region(
+                on_perimeter = _edge_touches_foreign_region(
                     edge_index, face_a, face_b, offsets, adj, rid, target_rid
-                ):
+                )
+                # 周界横拐：拒绝；周界但朝主方向前进：允许（否则红线会中途断开）
+                if on_perimeter and align_p < min_perimeter_forward_align:
                     continue
 
                 if verts is not None:
@@ -570,17 +576,26 @@ def grow_ridge_cut_to_boundary(
                         continue
 
                 hard = hardness(edge_index)
-                if hard < min_hardness:
-                    continue
-
-                # 主方向对齐权重大，抑制逐渐漂向横边
                 score = hard * (0.15 + 0.55 * align_p + 0.30 * align_t)
-                if score > best_internal_score:
+                if on_perimeter:
+                    # 略降权，但仍可选，以便走到边界
+                    score *= 0.85
+
+                if hard >= min_hardness and score > best_internal_score:
                     best_internal_score = score
                     best_internal = edge_index
                     best_internal_other = v_other
+                elif (
+                    hard >= soft_hardness
+                    and align_p >= min_perimeter_forward_align
+                    and score > best_soft_score
+                ):
+                    # 缓棱中段：方向够正时允许更软的续边
+                    best_soft_score = score
+                    best_soft = edge_index
+                    best_soft_other = v_other
 
-            # 无坐标：仅按硬度，仍禁止周界贴边
+            # 无坐标：按硬度，周界横边无法判断时仍禁止「任意」周界
             if best_internal is None and verts is None:
                 for edge_index in vert_edge_indices[begin:end].tolist():
                     edge_index = int(edge_index)
@@ -592,14 +607,9 @@ def grow_ridge_cut_to_boundary(
                     if _is_region_boundary_edge(
                         edge_index, face_a, face_b, region_ids, target_rid
                     ):
-                        hit_forward_boundary = True
                         continue
                     if not _is_internal_region_edge(
                         edge_index, face_a, face_b, region_ids, target_rid
-                    ):
-                        continue
-                    if _edge_touches_foreign_region(
-                        edge_index, face_a, face_b, offsets, adj, rid, target_rid
                     ):
                         continue
                     hard = hardness(edge_index)
@@ -610,20 +620,24 @@ def grow_ridge_cut_to_boundary(
                         best_internal = edge_index
                         best_internal_other = v_other
 
-            if best_internal is not None:
-                path.append(int(best_internal))
-                used.add(int(best_internal))
+            chosen = best_internal
+            chosen_other = best_internal_other
+            if chosen is None and best_soft is not None:
+                chosen = best_soft
+                chosen_other = best_soft_other
+
+            if chosen is not None:
+                path.append(int(chosen))
+                used.add(int(chosen))
                 previous = current
-                current = int(best_internal_other)
-                # 主方向缓慢跟随，避免三角网锯齿被当成转向
+                current = int(chosen_other)
                 if travel is not None and principal is not None:
-                    blended = principal * 0.7 + travel * 0.3
+                    blended = principal * 0.75 + travel * 0.25
                     norm = float(np.linalg.norm(blended))
                     if norm > 1e-12:
                         principal = blended / norm
                 continue
 
-            # 无合格前进边：到边界或棱线尽头，停止（不拐弯）
             break
 
         return path
