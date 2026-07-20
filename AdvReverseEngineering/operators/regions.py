@@ -15,12 +15,12 @@ from ..algorithms.regions import (
 )
 from ..algorithms.region_split import (
     candidate_hard_edges,
-    complete_cut_edges_dijkstra,
     filter_internal_cut_edges,
     group_candidate_edge_chains,
     grow_ridge_cut_to_boundary,
     prepare_edge_costs,
     split_region_by_cut_edges,
+    unify_cut_edges_as_line,
 )
 from ..registration import SCENE_PROP_NAME
 from ..ui.overlay import (
@@ -915,13 +915,13 @@ class ARE_OT_confirm_split_regions(bpy.types.Operator):
 class ARE_OT_split_regions(bpy.types.Operator):
     """
     先选编号领域，再显示候选硬边粗线；
-    点选硬边（可多选），Ctrl+滚轮调阈值，自动补全并分色预览后确认写入。
+    可多次点选硬边，选中段合并为一条切线后再分色预览确认。
     """
 
     bl_idname = "are.split_regions"
     bl_label = "拆分领域"
     bl_description = (
-        "点击编号选择领域，Ctrl+滚轮调线框阈值，点选硬边拆分"
+        "点击编号选择领域，Ctrl+滚轮调线框阈值，多次点选硬边合并切线"
     )
     # 不用 UNDO：确认写入后若模态被 cancel，Blender 会回滚 Mesh 属性导致「拆了又没了」
     bl_options = {"REGISTER"}
@@ -1128,7 +1128,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             f"线框阈值 {self._hard_threshold:.2f} · "
             f"候选 {len(self._candidate_edges)} 条边 / "
             f"{len(self._candidate_chains)} 条棱线 · "
-            "点短边→自动延伸完整分割棱"
+            "可多次点选折棱，合并成一条切线后再预览"
         )
         self._refresh_session(context)
 
@@ -1239,30 +1239,108 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 chain_ids.add(chain_id)
         return len(chain_ids)
 
-    def _toggle_edge(self, context: bpy.types.Context, edge_index: int) -> None:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+    def _selected_component_edges(self, edge_index: int) -> set[int]:
+        """当前选中切边里，与给定边同连通分量的边集合。"""
         edge_index = int(edge_index)
-        # 再点已选完整棱 → 清除
-        if (
-            self._ridge_cut_edges is not None
-            and len(self._ridge_cut_edges)
-            and edge_index in self._selected_cut_edges
-        ):
-            self._selected_cut_edges.clear()
+        if edge_index not in self._selected_cut_edges:
+            return set()
+        vert_to_edges: dict[int, list[int]] = {}
+        for e in self._selected_cut_edges:
+            e = int(e)
+            for vert in (
+                int(self._edge_vert_a[e]),
+                int(self._edge_vert_b[e]),
+            ):
+                vert_to_edges.setdefault(vert, []).append(e)
+        visited: set[int] = set()
+        stack = [edge_index]
+        visited.add(edge_index)
+        while stack:
+            cur = stack.pop()
+            for vert in (
+                int(self._edge_vert_a[cur]),
+                int(self._edge_vert_b[cur]),
+            ):
+                for neighbor in vert_to_edges.get(vert, []):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+        return visited
+
+    def _apply_unified_cut(self, context: bpy.types.Context) -> None:
+        """把已点选边合并为一条切线并尝试软预览（失败不清空）。"""
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        target = int(scene_props.split_target_id)
+        if target < 0 or not self._selected_cut_edges:
             self._ridge_cut_edges = np.empty(0, dtype=np.int32)
-            self._clear_preview_keep_selection(context)
-            scene_props.split_status = (
-                f"已选领域 {scene_props.split_target_id} · "
-                f"线框阈值 {self._hard_threshold:.2f} · "
-                f"候选 {len(self._candidate_edges)} 条边 · 点选硬棱"
-            )
+            self._completed_edges = np.empty(0, dtype=np.int32)
+            self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
+            self._preview_ids = None
+            self._preview_colors = None
             self._preview_serial += 1
             self._refresh_session(context)
             return
 
+        seeds = np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
+        unified = unify_cut_edges_as_line(
+            seeds,
+            self._topology,
+            self._region_ids,
+            target,
+            self._edge_costs,
+            self._vert_edge_offsets,
+            self._vert_edge_indices,
+            self._edge_vert_a,
+            self._edge_vert_b,
+        )
+        if len(unified) == 0:
+            unified = filter_internal_cut_edges(
+                seeds,
+                self._topology,
+                self._region_ids,
+                target,
+            )
+        self._ridge_cut_edges = np.asarray(unified, dtype=np.int32)
+        self._selected_cut_edges = {int(e) for e in self._ridge_cut_edges.tolist()}
+        self._completed_edges = self._ridge_cut_edges.copy()
+        self._completed_edges_world = self._edges_to_world(self._completed_edges)
+        self._preview_serial += 1
+        n_sel = len(self._selected_cut_edges)
+        scene_props.split_status = (
+            f"已选切线 {n_sel} 段 · 线框阈值 {self._hard_threshold:.2f} · "
+            "可继续点选补全 · 正在尝试预览…"
+        )
+        self._schedule_preview(context)
+        self._refresh_session(context)
+
+    def _toggle_edge(self, context: bpy.types.Context, edge_index: int) -> None:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        edge_index = int(edge_index)
+
+        # 再点已选分量 → 仅去掉该段，保留其它点选
+        if edge_index in self._selected_cut_edges:
+            remove = self._selected_component_edges(edge_index)
+            self._selected_cut_edges -= remove
+            self._preview_ids = None
+            self._preview_colors = None
+            if not self._selected_cut_edges:
+                self._ridge_cut_edges = np.empty(0, dtype=np.int32)
+                self._clear_preview_keep_selection(context)
+                scene_props.split_phase = "EDGE"
+                scene_props.split_status = (
+                    f"已选领域 {scene_props.split_target_id} · "
+                    f"线框阈值 {self._hard_threshold:.2f} · "
+                    f"候选 {len(self._candidate_edges)} 条边 · 继续点选折棱"
+                )
+                self._preview_serial += 1
+                self._refresh_session(context)
+                return
+            self._apply_unified_cut(context)
+            return
+
         target = int(scene_props.split_target_id)
-        # 从短边两端沿硬棱主方向延伸（禁止拐到周界横边）
-        completed = grow_ridge_cut_to_boundary(
+        # 从短边延伸，并与已有点选合并为一条切线
+        grown = grow_ridge_cut_to_boundary(
             edge_index,
             self._topology,
             self._region_ids,
@@ -1275,46 +1353,30 @@ class ARE_OT_split_regions(bpy.types.Operator):
             self._edge_vert_b,
             vertices=self._mesh_data["vertices"],
         )
-        completed = filter_internal_cut_edges(
-            completed,
+        grown = filter_internal_cut_edges(
+            grown,
             self._topology,
             self._region_ids,
             target,
         )
-        if len(completed) == 0:
-            completed = filter_internal_cut_edges(
+        if len(grown) == 0:
+            grown = filter_internal_cut_edges(
                 np.asarray([edge_index], dtype=np.int32),
                 self._topology,
                 self._region_ids,
                 target,
             )
-        if len(completed) == 0:
+        if len(grown) == 0:
             scene_props.split_status = (
-                "点到的是已有领域分界，不能用来拆分。"
-                "请点选当前领域内部的折棱（青绿候选）"
+                "点到的是已有领域分界，不能加入切线。"
+                "请点选当前领域内部的折棱（青绿候选）；已保留现有选中"
             )
             self.report({"WARNING"}, scene_props.split_status)
-            self._ridge_cut_edges = np.empty(0, dtype=np.int32)
-            self._selected_cut_edges.clear()
-            self._completed_edges = np.empty(0, dtype=np.int32)
-            self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
-            self._preview_ids = None
-            self._preview_colors = None
-            self._preview_serial += 1
             self._refresh_session(context)
             return
 
-        self._ridge_cut_edges = np.asarray(completed, dtype=np.int32)
-        self._selected_cut_edges = {int(e) for e in self._ridge_cut_edges.tolist()}
-        self._completed_edges = self._ridge_cut_edges.copy()
-        self._completed_edges_world = self._edges_to_world(self._completed_edges)
-        self._preview_serial += 1
-        scene_props.split_status = (
-            f"已选完整棱线 {len(self._selected_cut_edges)} 段 · "
-            f"线框阈值 {self._hard_threshold:.2f} · 正在预览…"
-        )
-        self._schedule_preview(context)
-        self._refresh_session(context)
+        self._selected_cut_edges |= {int(e) for e in grown.tolist()}
+        self._apply_unified_cut(context)
 
     def _run_edge_preview(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
@@ -1328,7 +1390,7 @@ class ARE_OT_split_regions(bpy.types.Operator):
             ridge = np.asarray(sorted(self._selected_cut_edges), dtype=np.int32)
             self._ridge_cut_edges = ridge
 
-        # 预览必须用点选时延伸好的完整棱，禁止 Dijkstra 改短/改道
+        # 预览必须用点选合并后的完整切线，禁止 Dijkstra 改短/改道
         completed = np.asarray(ridge, dtype=np.int32)
         self._selected_cut_edges = {int(e) for e in completed.tolist()}
         new_ids, new_colors, new_count = split_region_by_cut_edges(
@@ -1353,23 +1415,17 @@ class ARE_OT_split_regions(bpy.types.Operator):
                 f"切线 {len(completed)} 段 · "
                 "确认拆分保存 · Ctrl+Z 清除选中 · Esc 取消"
             )
+            self.report({"INFO"}, scene_props.split_status)
         else:
+            # 不清空红线：允许继续点选补全后再判断
             scene_props.split_phase = "EDGE"
             scene_props.split_status = (
-                "切线贴着已有领域边界，无法把当前领域一分为二。"
-                "请点选领域内部的折棱（不要点两个领域之间的分界线）"
+                f"已选切线 {len(completed)} 段，尚无法一分为二。"
+                "请继续点选缺口处的折棱合并补全，出现分色预览后再确认"
             )
             self._preview_ids = None
             self._preview_colors = None
-            # 去掉误导性红线，避免以为已经选好可确认
-            self._ridge_cut_edges = np.empty(0, dtype=np.int32)
-            self._selected_cut_edges.clear()
-            self._completed_edges = np.empty(0, dtype=np.int32)
-            self._completed_edges_world = np.empty((0, 2, 3), dtype=np.float64)
-            self.report({"WARNING"}, scene_props.split_status)
         self._refresh_session(context)
-        if changed:
-            self.report({"INFO"}, scene_props.split_status)
 
     def _edges_to_world(self, edges: np.ndarray) -> np.ndarray:
         edge_arr = np.asarray(edges, dtype=np.int32)

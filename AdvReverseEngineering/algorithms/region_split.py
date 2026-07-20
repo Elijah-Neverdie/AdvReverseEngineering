@@ -657,6 +657,182 @@ def grow_ridge_cut_to_boundary(
     )
 
 
+def _cut_edge_components(
+    cut_edges: np.ndarray,
+    edge_vert_a: np.ndarray,
+    edge_vert_b: np.ndarray,
+) -> list[list[int]]:
+    """按共享顶点把切边分成连通分量。"""
+    edges = [int(e) for e in np.asarray(cut_edges, dtype=np.int32).tolist()]
+    if not edges:
+        return []
+    vert_to_edges: dict[int, list[int]] = {}
+    for edge_index in edges:
+        for vert in (
+            int(edge_vert_a[edge_index]),
+            int(edge_vert_b[edge_index]),
+        ):
+            vert_to_edges.setdefault(vert, []).append(edge_index)
+    visited: set[int] = set()
+    components: list[list[int]] = []
+    for start in edges:
+        if start in visited:
+            continue
+        stack = [start]
+        visited.add(start)
+        component: list[int] = []
+        while stack:
+            edge_index = stack.pop()
+            component.append(edge_index)
+            for vert in (
+                int(edge_vert_a[edge_index]),
+                int(edge_vert_b[edge_index]),
+            ):
+                for neighbor in vert_to_edges.get(vert, []):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+        components.append(component)
+    return components
+
+
+def unify_cut_edges_as_line(
+    cut_edges: np.ndarray,
+    topology: dict,
+    region_ids: np.ndarray,
+    target_rid: int,
+    edge_costs: np.ndarray,
+    vert_edge_offsets: np.ndarray,
+    vert_edge_indices: np.ndarray,
+    edge_vert_a: np.ndarray,
+    edge_vert_b: np.ndarray,
+    max_bridges: int = 8,
+) -> np.ndarray:
+    """
+    把多段点选切边合并成一条尽量连通的切线。
+
+    先去掉跨领域边界边，再在目标领域内部用硬边代价最短路桥接
+    各连通分量之间的缺口（多点选时常见）。
+    """
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    edge_vert_a = np.asarray(edge_vert_a, dtype=np.int32)
+    edge_vert_b = np.asarray(edge_vert_b, dtype=np.int32)
+    edge_costs = np.asarray(edge_costs, dtype=np.float64)
+    offsets = np.asarray(vert_edge_offsets, dtype=np.int32)
+    adj_edges = np.asarray(vert_edge_indices, dtype=np.int32)
+    target = int(target_rid)
+
+    completed = {
+        int(e)
+        for e in filter_internal_cut_edges(
+            cut_edges, topology, region_ids, target
+        ).tolist()
+    }
+    if not completed:
+        return np.empty(0, dtype=np.int32)
+
+    def endpoint_verts(edge_set: set[int]) -> set[int]:
+        degree: dict[int, int] = {}
+        for edge_index in edge_set:
+            for vert in (
+                int(edge_vert_a[edge_index]),
+                int(edge_vert_b[edge_index]),
+            ):
+                degree[vert] = degree.get(vert, 0) + 1
+        return {v for v, d in degree.items() if d == 1} or set(degree)
+
+    def shortest_bridge(
+        starts: set[int], goals: set[int]
+    ) -> list[int] | None:
+        if not starts or not goals:
+            return None
+        goal_set = set(goals)
+        dist: dict[int, float] = {v: 0.0 for v in starts}
+        prev_edge: dict[int, int | None] = {v: None for v in starts}
+        prev_vert: dict[int, int | None] = {v: None for v in starts}
+        heap: list[tuple[float, int]] = [(0.0, v) for v in starts]
+        heapq.heapify(heap)
+        reached: int | None = None
+        while heap:
+            cost_u, u = heapq.heappop(heap)
+            if cost_u > dist.get(u, float("inf")) + 1e-12:
+                continue
+            if u in goal_set and u not in starts:
+                reached = u
+                break
+            begin = int(offsets[u])
+            end = int(offsets[u + 1])
+            for edge_index in adj_edges[begin:end].tolist():
+                edge_index = int(edge_index)
+                if edge_index in completed:
+                    continue
+                if not _is_internal_region_edge(
+                    edge_index, face_a, face_b, region_ids, target
+                ):
+                    continue
+                va = int(edge_vert_a[edge_index])
+                vb = int(edge_vert_b[edge_index])
+                v_other = vb if va == u else va
+                step = float(edge_costs[edge_index])
+                if not np.isfinite(step) or step < 0.0:
+                    step = 1.0
+                new_cost = cost_u + step
+                if new_cost + 1e-12 >= dist.get(v_other, float("inf")):
+                    continue
+                dist[v_other] = new_cost
+                prev_edge[v_other] = edge_index
+                prev_vert[v_other] = u
+                heapq.heappush(heap, (new_cost, v_other))
+        if reached is None:
+            # 起点本身已在目标集合（分量已邻接）
+            for v in starts:
+                if v in goal_set:
+                    return []
+            return None
+        path: list[int] = []
+        cursor = reached
+        while cursor is not None and prev_edge.get(cursor) is not None:
+            edge_index = int(prev_edge[cursor])
+            path.append(edge_index)
+            cursor = prev_vert.get(cursor)
+        return path
+
+    for _ in range(int(max_bridges)):
+        components = _cut_edge_components(
+            np.asarray(sorted(completed), dtype=np.int32),
+            edge_vert_a,
+            edge_vert_b,
+        )
+        if len(components) <= 1:
+            break
+        # 桥接最近的一对分量端点
+        best_path: list[int] | None = None
+        best_cost = float("inf")
+        for i in range(len(components)):
+            set_i = set(components[i])
+            ends_i = endpoint_verts(set_i)
+            for j in range(i + 1, len(components)):
+                set_j = set(components[j])
+                ends_j = endpoint_verts(set_j)
+                path = shortest_bridge(ends_i, ends_j)
+                if path is None:
+                    continue
+                cost = 0.0
+                for edge_index in path:
+                    step = float(edge_costs[edge_index])
+                    cost += step if np.isfinite(step) and step >= 0.0 else 1.0
+                if cost < best_cost:
+                    best_cost = cost
+                    best_path = path
+        if best_path is None:
+            break
+        for edge_index in best_path:
+            completed.add(int(edge_index))
+
+    return np.asarray(sorted(completed), dtype=np.int32)
+
+
 def complete_cut_edges_dijkstra(
     topology: dict,
     normals: np.ndarray,
@@ -1218,6 +1394,7 @@ __all__ = (
     "filter_bisecting_candidate_chains",
     "filter_internal_cut_edges",
     "grow_ridge_cut_to_boundary",
+    "unify_cut_edges_as_line",
     "stroke_hits_to_seed_edges",
     "complete_cut_edges_dijkstra",
     "split_region_by_cut_edges",
