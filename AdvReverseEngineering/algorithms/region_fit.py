@@ -1275,10 +1275,11 @@ def collect_interior_angle_labels(
     normal: np.ndarray | None = None,
 ) -> list[dict]:
     """
-    为闭环折线各显著内角生成标注数据（对象局部坐标）。
+    为闭环折线各显著内角生成标注数据。
 
+    points 与返回的 world_co / face_center 使用同一坐标空间
+    （拟合流程里来自 extract_mesh_data，已是世界坐标）。
     返回元素含: text, angle_deg, hairpin_deg, world_co, face_center, normal。
-    world_co 为沿法线抬起的标签圆心；face_center 为顶点本身。
     """
     pts = _as_float_array(points)
     if len(pts) < 3:
@@ -1304,8 +1305,8 @@ def collect_interior_angle_labels(
             normal_vec = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
     extent = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
-    planar_lift = max(extent * 0.025, 1e-4)
-    lift_dist = float(max(lift, extent * 0.02, 1e-4))
+    # 仅沿法线略抬，避免平面偏移把标签甩出边界
+    lift_dist = float(max(lift, extent * 0.015, 1e-4))
     min_dev = float(max(min_deviation_deg, 0.0))
 
     labels: list[dict] = []
@@ -1317,28 +1318,8 @@ def collect_interior_angle_labels(
         if abs(angle - 180.0) < min_dev and abs(local - 180.0) < min_dev:
             continue
 
-        cur = pts[index]
-        prev_p = pts[(index - 1) % count]
-        next_p = pts[(index + 1) % count]
-        vin = cur - prev_p
-        vout = next_p - cur
-        in_len = float(np.linalg.norm(vin))
-        out_len = float(np.linalg.norm(vout))
-        if in_len > 1e-12 and out_len > 1e-12:
-            vin = vin / in_len
-            vout = vout / out_len
-            # 外侧偏移：背离两侧邻点弦的方向
-            bis = _normalize(-(vin) + (vout))  # noqa: 粗略外向
-            # 对凹尖端，用邻点平均的反方向更稳
-            away = _normalize(cur - 0.5 * (prev_p + next_p))
-            if float(np.linalg.norm(away)) > 1e-12:
-                bis = away
-            offset = bis * planar_lift
-        else:
-            offset = np.zeros(3, dtype=np.float64)
-
-        face_center = cur.copy()
-        world_co = face_center + offset + normal_vec * lift_dist
+        face_center = pts[index].copy()
+        world_co = face_center + normal_vec * lift_dist
         labels.append(
             {
                 "text": f"{int(round(angle))}",
@@ -3998,7 +3979,7 @@ def extract_island_longest_sides(
         normal_guess = _normalize(np.cross(axis_u, axis_v))
         angle_labels = collect_interior_angle_labels(
             loop_rs,
-            min_deviation_deg=4.0,
+            min_deviation_deg=12.0,
             normal=normal_guess,
         )
         corners = detect_corner_indices(

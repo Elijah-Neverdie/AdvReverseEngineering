@@ -850,50 +850,34 @@ class ARE_OT_fit_region(bpy.types.Operator):
         set_fit_angle_label_session(None)
 
     def _publish_angle_labels(self, debug: dict) -> None:
-        """把拟合边界内角标注推到视口覆盖层。"""
-        from mathutils import Vector
+        """把拟合边界内角标注推到视口覆盖层。
 
+        extract_mesh_data / 拟合边界点已是世界坐标，不可再乘 matrix_world。
+        """
         raw = debug.get("interior_angle_labels") or []
         if not raw:
             set_fit_angle_label_session(None)
             return
-        matrix = self._object.matrix_world
-        rot = matrix.to_3x3()
-
-        def _xf_point(point_local: np.ndarray) -> np.ndarray:
-            vec = matrix @ Vector(
-                (
-                    float(point_local[0]),
-                    float(point_local[1]),
-                    float(point_local[2]),
-                )
-            )
-            return np.array([vec.x, vec.y, vec.z], dtype=np.float64)
-
-        def _xf_dir(dir_local: np.ndarray) -> np.ndarray:
-            vec = rot @ Vector(
-                (float(dir_local[0]), float(dir_local[1]), float(dir_local[2]))
-            )
-            arr = np.array([vec.x, vec.y, vec.z], dtype=np.float64)
-            length = float(np.linalg.norm(arr))
-            if length > 1e-12:
-                return arr / length
-            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
         labels = []
         for item in raw:
-            face_local = np.asarray(item["face_center"], dtype=np.float64)
-            world_local = np.asarray(item["world_co"], dtype=np.float64)
-            normal_local = np.asarray(item["normal"], dtype=np.float64)
+            face = np.asarray(item["face_center"], dtype=np.float64).reshape(3)
+            anchor = np.asarray(item["world_co"], dtype=np.float64).reshape(3)
+            normal = np.asarray(item["normal"], dtype=np.float64).reshape(3)
+            nlen = float(np.linalg.norm(normal))
+            if nlen > 1e-12:
+                normal = normal / nlen
+            else:
+                normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
             labels.append(
                 {
                     "text": str(item.get("text") or ""),
                     "angle_deg": float(item.get("angle_deg", 0.0)),
                     "local_deg": float(item.get("local_deg", 0.0)),
                     "hairpin_deg": float(item.get("hairpin_deg", 0.0)),
-                    "world_co": _xf_point(world_local),
-                    "face_center": _xf_point(face_local),
-                    "normal": _xf_dir(normal_local),
+                    "world_co": anchor.copy(),
+                    "face_center": face.copy(),
+                    "normal": normal,
                     "screen_xy": None,
                     "face_screen_xy": None,
                     "visible": False,
