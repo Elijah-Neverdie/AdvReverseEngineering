@@ -1267,6 +1267,92 @@ def outer_contour_by_dissolving_facing_edges(
 _ULTRA_REFLEX_INTERIOR_DEG = 355.0
 
 
+def collect_interior_angle_labels(
+    points: np.ndarray,
+    *,
+    min_deviation_deg: float = 4.0,
+    lift: float = 0.0,
+    normal: np.ndarray | None = None,
+) -> list[dict]:
+    """
+    为闭环折线各显著内角生成标注数据（对象局部坐标）。
+
+    返回元素含: text, angle_deg, hairpin_deg, world_co, face_center, normal。
+    world_co 为沿法线抬起的标签圆心；face_center 为顶点本身。
+    """
+    pts = _as_float_array(points)
+    if len(pts) < 3:
+        return []
+    if float(np.linalg.norm(pts[0] - pts[-1])) < 1e-9:
+        pts = pts[:-1].copy()
+    if len(pts) < 3:
+        return []
+
+    origin, axis_u, axis_v = _loop_pca_basis(pts)
+    pts2 = project_points_to_plane(pts, origin, axis_u, axis_v)
+    if _signed_area_2d(pts2) < 0.0:
+        pts = pts[::-1].copy()
+        pts2 = pts2[::-1].copy()
+
+    if normal is None:
+        normal_vec = _normalize(np.cross(axis_u, axis_v))
+        if float(np.linalg.norm(normal_vec)) < 1e-12:
+            normal_vec = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        normal_vec = _normalize(_as_float_array(normal))
+        if float(np.linalg.norm(normal_vec)) < 1e-12:
+            normal_vec = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    extent = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+    planar_lift = max(extent * 0.025, 1e-4)
+    lift_dist = float(max(lift, extent * 0.02, 1e-4))
+    min_dev = float(max(min_deviation_deg, 0.0))
+
+    labels: list[dict] = []
+    count = len(pts)
+    for index in range(count):
+        local = _vertex_interior_angle_deg_2d(pts2, index)
+        hairpin = _vertex_hairpin_interior_angle_deg_2d(pts2, index)
+        angle = float(max(local, hairpin))
+        if abs(angle - 180.0) < min_dev and abs(local - 180.0) < min_dev:
+            continue
+
+        cur = pts[index]
+        prev_p = pts[(index - 1) % count]
+        next_p = pts[(index + 1) % count]
+        vin = cur - prev_p
+        vout = next_p - cur
+        in_len = float(np.linalg.norm(vin))
+        out_len = float(np.linalg.norm(vout))
+        if in_len > 1e-12 and out_len > 1e-12:
+            vin = vin / in_len
+            vout = vout / out_len
+            # 外侧偏移：背离两侧邻点弦的方向
+            bis = _normalize(-(vin) + (vout))  # noqa: 粗略外向
+            # 对凹尖端，用邻点平均的反方向更稳
+            away = _normalize(cur - 0.5 * (prev_p + next_p))
+            if float(np.linalg.norm(away)) > 1e-12:
+                bis = away
+            offset = bis * planar_lift
+        else:
+            offset = np.zeros(3, dtype=np.float64)
+
+        face_center = cur.copy()
+        world_co = face_center + offset + normal_vec * lift_dist
+        labels.append(
+            {
+                "text": f"{int(round(angle))}",
+                "angle_deg": angle,
+                "local_deg": float(local),
+                "hairpin_deg": float(hairpin),
+                "world_co": world_co,
+                "face_center": face_center,
+                "normal": normal_vec.copy(),
+            }
+        )
+    return labels
+
+
 def _vertex_interior_angle_deg_2d(pts2: np.ndarray, index: int) -> float:
     """逆时针闭环上顶点的内角（度）。"""
     count = len(pts2)
@@ -3909,6 +3995,12 @@ def extract_island_longest_sides(
             continue
         sample_count = len(loop_rs)
         pts_2d = project_points_to_plane(loop_rs, origin, axis_u, axis_v)
+        normal_guess = _normalize(np.cross(axis_u, axis_v))
+        angle_labels = collect_interior_angle_labels(
+            loop_rs,
+            min_deviation_deg=4.0,
+            normal=normal_guess,
+        )
         corners = detect_corner_indices(
             pts_2d,
             corner_angle_deg,
@@ -4016,6 +4108,7 @@ def extract_island_longest_sides(
                 "split_count": int(len(ordered_splits)),
                 "island_folds": island_folds,
                 "merged_from": int(item.get("merged_from", 1)),
+                "angle_labels": angle_labels,
             }
         )
 
@@ -4029,6 +4122,7 @@ def extract_island_longest_sides(
     control_points: list[np.ndarray] = []
     control_color_ids: list[int] = []
     concave_fold_points: list[np.ndarray] = []
+    interior_angle_labels: list[dict] = []
     segment_colors: list[tuple[float, float, float, float]] = []
     vertex_cursor = 0
     all_points: list[np.ndarray] = []
@@ -4041,6 +4135,7 @@ def extract_island_longest_sides(
         axis_v = draft["axis_v"]
         island_folds = draft["island_folds"]
         concave_fold_points.extend(island_folds)
+        interior_angle_labels.extend(draft.get("angle_labels") or [])
 
         beziers: list[dict] = []
         sides_sampled: list[np.ndarray] = []
@@ -4220,6 +4315,7 @@ def extract_island_longest_sides(
             if concave_fold_points
             else np.zeros((0, 3), dtype=np.float64)
         ),
+        "interior_angle_labels": interior_angle_labels,
         "bevel_depth": bevel_depth,
         "control_radius": control_radius,
         "fold_radius": fold_radius,
@@ -5323,6 +5419,7 @@ __all__ = (
     "build_triangular_patch",
     "classify_tri_or_quad",
     "collect_island_bridge_interiors",
+    "collect_interior_angle_labels",
     "combine_boundary_islands",
     "coons_patch",
     "detect_corner_indices",

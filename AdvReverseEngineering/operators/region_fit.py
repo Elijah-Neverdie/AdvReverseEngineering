@@ -24,6 +24,7 @@ from ..ui.overlay import (
     LABEL_RADIUS_PX,
     get_merge_label_session,
     register_label_draw_handler,
+    set_fit_angle_label_session,
     set_merge_label_session,
     unregister_label_draw_handler,
     update_merge_label_projections,
@@ -118,7 +119,9 @@ def _schedule_force_exit_check() -> None:
             scene_props.fit_phase = "IDLE"
             scene_props.fit_status = "拟合模态已失联，已强制退出"
             from .regions import _teardown_labels_then_sync
+            from ..ui.overlay import set_fit_angle_label_session
 
+            set_fit_angle_label_session(None)
             _teardown_labels_then_sync(bpy.context)
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
@@ -785,7 +788,9 @@ class ARE_OT_confirm_fit_region(bpy.types.Operator):
                 scene_props.fit_confirm_requested = False
                 scene_props.fit_phase = "IDLE"
                 from .regions import _teardown_labels_then_sync
+                from ..ui.overlay import set_fit_angle_label_session
 
+                set_fit_angle_label_session(None)
                 _teardown_labels_then_sync(context)
             return {"FINISHED"}
         scene_props.fit_confirm_requested = True
@@ -825,6 +830,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._fit_target_ids = []
         from .regions import _teardown_labels_then_sync
 
+        set_fit_angle_label_session(None)
         _teardown_labels_then_sync(context)
         _tag_redraw(context)
 
@@ -841,6 +847,66 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._debug_control_object = None
         self._debug_fold_object = None
         self._bridge_link_object = None
+        set_fit_angle_label_session(None)
+
+    def _publish_angle_labels(self, debug: dict) -> None:
+        """把拟合边界内角标注推到视口覆盖层。"""
+        from mathutils import Vector
+
+        raw = debug.get("interior_angle_labels") or []
+        if not raw:
+            set_fit_angle_label_session(None)
+            return
+        matrix = self._object.matrix_world
+        rot = matrix.to_3x3()
+
+        def _xf_point(point_local: np.ndarray) -> np.ndarray:
+            vec = matrix @ Vector(
+                (
+                    float(point_local[0]),
+                    float(point_local[1]),
+                    float(point_local[2]),
+                )
+            )
+            return np.array([vec.x, vec.y, vec.z], dtype=np.float64)
+
+        def _xf_dir(dir_local: np.ndarray) -> np.ndarray:
+            vec = rot @ Vector(
+                (float(dir_local[0]), float(dir_local[1]), float(dir_local[2]))
+            )
+            arr = np.array([vec.x, vec.y, vec.z], dtype=np.float64)
+            length = float(np.linalg.norm(arr))
+            if length > 1e-12:
+                return arr / length
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        labels = []
+        for item in raw:
+            face_local = np.asarray(item["face_center"], dtype=np.float64)
+            world_local = np.asarray(item["world_co"], dtype=np.float64)
+            normal_local = np.asarray(item["normal"], dtype=np.float64)
+            labels.append(
+                {
+                    "text": str(item.get("text") or ""),
+                    "angle_deg": float(item.get("angle_deg", 0.0)),
+                    "local_deg": float(item.get("local_deg", 0.0)),
+                    "hairpin_deg": float(item.get("hairpin_deg", 0.0)),
+                    "world_co": _xf_point(world_local),
+                    "face_center": _xf_point(face_local),
+                    "normal": _xf_dir(normal_local),
+                    "screen_xy": None,
+                    "face_screen_xy": None,
+                    "visible": False,
+                }
+            )
+        set_fit_angle_label_session(
+            {
+                "labels": labels,
+                "object_name": self._object.name,
+                "preview_version": int(getattr(self, "_preview_serial", 0)),
+            }
+        )
+        register_label_draw_handler()
 
     def confirm_from_panel(self, context: bpy.types.Context) -> None:
         if getattr(self, "_closed", False):
@@ -1024,6 +1090,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._debug_control_object = controls
         self._debug_fold_object = folds
         self._bridge_link_object = bridges
+        self._publish_angle_labels(debug)
         scene_props.fit_status = self._status_text(scene_props)
         scene_props.fit_status_detail = self._format_debug_detail(debug)
         _tag_redraw(context)

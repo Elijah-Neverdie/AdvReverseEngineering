@@ -30,6 +30,8 @@ _HIGHLIGHT_CACHE: dict = {}
 
 # 合并模式标签会话（由 merge operator 写入）
 _MERGE_LABEL_SESSION: dict | None = None
+# 拟合边界内角标注会话
+_FIT_ANGLE_LABEL_SESSION: dict | None = None
 # 拆分模式笔迹会话
 _SPLIT_STROKE_SESSION: dict | None = None
 
@@ -39,8 +41,10 @@ ANCHOR_HIGHLIGHT_COLOR = (1.0, 0.55, 0.12, 0.42)
 HOVER_HIGHLIGHT_COLOR = (0.35, 0.75, 1.0, 0.28)
 PAINT_FACE_COLOR = (1.0, 0.12, 0.08, 0.55)
 LABEL_RADIUS_PX = 16.0
+ANGLE_LABEL_RADIUS_PX = 18.0
 LABEL_OFFSET_Y = 28.0
 LEADER_ENDPOINT_RADIUS_PX = 3.5
+_ULTRA_REFLEX_DEG = 355.0
 # 覆盖层沿法线外移比例（相对包围盒对角线），消除共面 Z-fighting。
 OVERLAY_NORMAL_OFFSET_RATIO = 0.0015
 OVERLAY_NORMAL_OFFSET_MIN = 1e-4
@@ -131,6 +135,17 @@ def get_merge_label_session() -> dict | None:
     return _MERGE_LABEL_SESSION
 
 
+def set_fit_angle_label_session(session: dict | None) -> None:
+    """设置或清除拟合内角标注会话。"""
+    global _FIT_ANGLE_LABEL_SESSION
+    _FIT_ANGLE_LABEL_SESSION = session
+
+
+def get_fit_angle_label_session() -> dict | None:
+    """读取拟合内角标注会话。"""
+    return _FIT_ANGLE_LABEL_SESSION
+
+
 def active_label_hover_id(scene_props) -> int:
     """当前应高亮的悬停领域编号（模态优先，否则空闲标签悬停）。"""
     if scene_props is None:
@@ -148,6 +163,15 @@ def active_label_hover_id(scene_props) -> int:
 
 def update_merge_label_projections(context: bpy.types.Context) -> None:
     """根据当前视角刷新标签屏幕坐标，并过滤背面/遮挡编号。"""
+    _update_label_session_projections(context, _MERGE_LABEL_SESSION)
+    _update_label_session_projections(context, _FIT_ANGLE_LABEL_SESSION)
+
+
+def _update_label_session_projections(
+    context: bpy.types.Context,
+    session: dict | None,
+) -> None:
+    """刷新单个标签会话的屏幕投影。"""
     from mathutils import Vector
 
     from ..utils.viewport import (
@@ -157,7 +181,6 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
         view_direction_to_point,
     )
 
-    session = _MERGE_LABEL_SESSION
     if session is None:
         return
     region = context.region
@@ -167,7 +190,6 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
         if space is None or space.type != "VIEW_3D":
             return
         rv3d = space.region_3d
-        # draw handler 下尽量取当前 WINDOW region
         if region is None or region.type != "WINDOW":
             for area_region in getattr(space, "regions", []):
                 if area_region.type == "WINDOW":
@@ -176,7 +198,6 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
     if region is None or rv3d is None:
         return
 
-    # 视角与区域尺寸未变时跳过投影/遮挡计算（每标签一次射线，代价高）。
     view_signature = (
         tuple(round(v, 6) for row in rv3d.view_matrix for v in row),
         region.width,
@@ -191,7 +212,6 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
     if getattr(rv3d, "is_perspective", True):
         view_origin = rv3d.view_matrix.inverted().translation
     else:
-        # 正交：从标签沿视线反方向退一段作为射线起点。
         view_origin = None
 
     exclude_obj = None
@@ -217,7 +237,6 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
             continue
 
         if view_origin is None:
-            # 正交视图：从标签朝向相机方向退回一段距离。
             ray_origin = Vector(world) - view_dir * 1000.0
         else:
             ray_origin = view_origin
@@ -248,7 +267,9 @@ def update_merge_label_projections(context: bpy.types.Context) -> None:
             label["face_screen_xy"] = screen
         else:
             face_screen = project_world_to_region(region, rv3d, face_center)
-            label["face_screen_xy"] = face_screen if face_screen is not None else screen
+            label["face_screen_xy"] = (
+                face_screen if face_screen is not None else screen
+            )
 
 
 def _draw_circle_2d(center_x: float, center_y: float, radius: float, color) -> None:
@@ -389,6 +410,98 @@ def draw_region_merge_labels() -> None:
             blf.draw(font_id, text)
     finally:
         gpu.state.blend_set("NONE")
+
+
+def draw_fit_angle_labels() -> None:
+    """POST_PIXEL：拟合边界内角度数圆标（风格同领域编号）。"""
+    import blf
+
+    context = bpy.context
+    if context is None or context.scene is None:
+        return
+    scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+    if scene_props is None:
+        return
+    if not getattr(scene_props, "fit_mode_active", False):
+        return
+    session = _FIT_ANGLE_LABEL_SESSION
+    if session is None:
+        return
+
+    update_merge_label_projections(context)
+    gpu.state.blend_set("ALPHA")
+    try:
+        for label in session.get("labels", []):
+            if not label.get("visible", False):
+                continue
+            screen = label.get("screen_xy")
+            if screen is None:
+                continue
+            angle = float(label.get("angle_deg", 0.0))
+            if angle >= _ULTRA_REFLEX_DEG:
+                fill = (0.92, 0.22, 0.18, 0.94)
+                leader = (1.0, 0.45, 0.35, 0.95)
+            elif angle >= 300.0:
+                fill = (1.0, 0.55, 0.12, 0.92)
+                leader = (1.0, 0.65, 0.25, 0.95)
+            else:
+                fill = (0.12, 0.12, 0.14, 0.82)
+                leader = (0.85, 0.85, 0.88, 0.75)
+
+            face_screen = label.get("face_screen_xy")
+            if face_screen is None:
+                face_screen = screen
+            edge_x, edge_y = _leader_edge_point(
+                screen.x,
+                screen.y,
+                face_screen.x,
+                face_screen.y,
+                ANGLE_LABEL_RADIUS_PX,
+            )
+            _draw_polyline_2d(
+                [(edge_x, edge_y), (face_screen.x, face_screen.y)],
+                leader,
+                width=1.5,
+            )
+            _draw_circle_2d(
+                face_screen.x,
+                face_screen.y,
+                LEADER_ENDPOINT_RADIUS_PX,
+                leader,
+            )
+            _draw_circle_2d(
+                screen.x, screen.y, ANGLE_LABEL_RADIUS_PX, fill
+            )
+            _draw_circle_2d(
+                screen.x,
+                screen.y,
+                ANGLE_LABEL_RADIUS_PX + 2.0,
+                (1.0, 1.0, 1.0, 0.35),
+            )
+            _draw_circle_2d(
+                screen.x, screen.y, ANGLE_LABEL_RADIUS_PX, fill
+            )
+
+            text = str(label.get("text") or f"{int(round(angle))}")
+            font_id = 0
+            blf.size(font_id, 12)
+            width, height = blf.dimensions(font_id, text)
+            blf.position(
+                font_id,
+                screen.x - width * 0.5,
+                screen.y - height * 0.35,
+                0,
+            )
+            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+            blf.draw(font_id, text)
+    finally:
+        gpu.state.blend_set("NONE")
+
+
+def draw_all_region_labels() -> None:
+    """POST_PIXEL：领域编号 + 拟合内角标注。"""
+    draw_region_merge_labels()
+    draw_fit_angle_labels()
 
 
 def set_split_stroke_session(session: dict | None) -> None:
@@ -576,7 +689,7 @@ def register_label_draw_handler() -> None:
         except (ReferenceError, ValueError):
             pass
     _LABEL_DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
-        draw_region_merge_labels,
+        draw_all_region_labels,
         (),
         "WINDOW",
         "POST_PIXEL",
@@ -586,7 +699,7 @@ def register_label_draw_handler() -> None:
 
 def unregister_label_draw_handler() -> None:
     """注销领域编号绘制句柄。"""
-    global _LABEL_DRAW_HANDLE, _MERGE_LABEL_SESSION
+    global _LABEL_DRAW_HANDLE, _MERGE_LABEL_SESSION, _FIT_ANGLE_LABEL_SESSION
     namespace = bpy.app.driver_namespace
     handle = namespace.pop(LABEL_DRAW_HANDLE_KEY, None) or _LABEL_DRAW_HANDLE
     if handle is not None:
@@ -596,6 +709,7 @@ def unregister_label_draw_handler() -> None:
             pass
     _LABEL_DRAW_HANDLE = None
     _MERGE_LABEL_SESSION = None
+    _FIT_ANGLE_LABEL_SESSION = None
 
 
 def _tag_view3d_redraw(context: bpy.types.Context) -> None:

@@ -1357,6 +1357,31 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertLess(len(cleaned), len(spiked))
         self.assertLess(float(cleaned[:, 1].max()), 1.05)
 
+    def test_collect_interior_angle_labels_marks_spike_tip(self) -> None:
+        """尖刺尖端应出现接近 360° 的内角标注。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            collect_interior_angle_labels,
+        )
+
+        spiked = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [2.0, 1.0, 0.0],
+                [2.0, 2.0, 0.0],
+                [2.001, 2.8, 0.0],
+                [1.999, 1.001, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        labels = collect_interior_angle_labels(spiked, min_deviation_deg=4.0)
+        self.assertGreater(len(labels), 0)
+        tip = max(labels, key=lambda item: float(item["angle_deg"]))
+        self.assertGreaterEqual(float(tip["angle_deg"]), 350.0)
+        self.assertTrue(str(tip["text"]).isdigit())
+
     def test_stitch_bridges_reentrant_notch_to_continuous_rim(self) -> None:
         """缝合后内阴角应被切除，外轮廓不再钻进 V 形凹口。"""
         from AdvReverseEngineering.algorithms.region_fit import (
