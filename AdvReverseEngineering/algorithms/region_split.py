@@ -1327,11 +1327,13 @@ def smooth_region_boundaries(
     topology: dict,
     focus_ids: set[int] | None = None,
     iterations: int = 3,
+    aggressive: bool = False,
 ) -> np.ndarray:
     """
-    对领域边界做保守多数投票平滑，去掉单面锯齿/毛刺。
+    对领域边界做多数投票平滑。
 
-    仅翻转「自身邻接极少、对侧成多数」的毛刺面，避免吞掉整块新领域。
+    aggressive=False：只剔单面毛刺。
+    aggressive=True：对侧邻接严格更多即翻转，更能拉直锯齿分界。
     """
     ids = np.asarray(region_ids, dtype=np.int32).copy()
     offsets = np.asarray(topology["adjacency_offsets"], dtype=np.int32)
@@ -1340,14 +1342,21 @@ def smooth_region_boundaries(
     if face_count == 0 or iterations <= 0:
         return ids
 
+    # 先收集焦点面，避免每轮扫全网
+    if focus_ids is None:
+        candidates = list(range(face_count))
+    else:
+        candidates = np.flatnonzero(
+            np.isin(ids, np.asarray(sorted(focus_ids), dtype=np.int32))
+        ).tolist()
+
     for _ in range(int(iterations)):
         nxt = ids.copy()
         flipped = 0
-        for face in range(face_count):
+        for face in candidates:
+            face = int(face)
             rid = int(ids[face])
             if rid < 0:
-                continue
-            if focus_ids is not None and rid not in focus_ids:
                 continue
             begin = int(offsets[face])
             end = int(offsets[face + 1])
@@ -1366,13 +1375,161 @@ def smooth_region_boundaries(
                 votes.items(),
                 key=lambda item: (item[1], -item[0]),
             )
-            # 只剔「单面毛刺」：自己一侧 ≤1，对侧 ≥2 且严格更多
-            if best_rid != rid and own <= 1 and best_n >= 2 and best_n > own:
+            if best_rid == rid:
+                continue
+            if aggressive:
+                if best_n > own:
+                    nxt[face] = int(best_rid)
+                    flipped += 1
+            elif own <= 1 and best_n >= 2 and best_n > own:
                 nxt[face] = int(best_rid)
                 flipped += 1
         ids = nxt
         if flipped == 0:
             break
+    return ids
+
+
+def straighten_split_boundary(
+    region_ids: np.ndarray,
+    topology: dict,
+    face_centers: np.ndarray,
+    rid_a: int,
+    rid_b: int,
+    ring_expand: int = 2,
+    smooth_rounds: int = 6,
+) -> np.ndarray:
+    """
+    用交界点 PCA 拟合切割面，把近旁面按侧归属重贴，再做对侧多数平滑。
+
+    比「沿三角边切开」更接近识别领域那种整齐分界；只处理两块交界邻域，
+    复杂度 O(边界邻域)，不扫全网。
+    """
+    ids = np.asarray(region_ids, dtype=np.int32).copy()
+    centers = np.asarray(face_centers, dtype=np.float64)
+    face_a = np.asarray(topology["edge_face_a"], dtype=np.int32)
+    face_b = np.asarray(topology["edge_face_b"], dtype=np.int32)
+    offsets = np.asarray(topology["adjacency_offsets"], dtype=np.int32)
+    adj = np.asarray(topology["adjacency_indices"], dtype=np.int32)
+    ra = int(rid_a)
+    rb = int(rid_b)
+    if ra < 0 or rb < 0 or ra == rb or len(centers) != len(ids):
+        return ids
+
+    # 交界边中点
+    boundary_pts: list[np.ndarray] = []
+    boundary_faces: set[int] = set()
+    for edge_index in range(len(face_a)):
+        fa = int(face_a[edge_index])
+        fb = int(face_b[edge_index])
+        ia = int(ids[fa])
+        ib = int(ids[fb])
+        if {ia, ib} != {ra, rb}:
+            continue
+        boundary_pts.append(0.5 * (centers[fa] + centers[fb]))
+        boundary_faces.add(fa)
+        boundary_faces.add(fb)
+    if len(boundary_pts) < 3:
+        return ids
+
+    pts = np.asarray(boundary_pts, dtype=np.float64)
+    # 用两侧交界面中心差作为切割方向（共面扫描网格上比 PCA 最小轴更稳）
+    faces_a = [f for f in boundary_faces if int(ids[f]) == ra]
+    faces_b = [f for f in boundary_faces if int(ids[f]) == rb]
+    if len(faces_a) < 1 or len(faces_b) < 1:
+        return ids
+    mean_a = centers[np.asarray(faces_a, dtype=np.int32)].mean(axis=0)
+    mean_b = centers[np.asarray(faces_b, dtype=np.int32)].mean(axis=0)
+    normal = mean_a - mean_b
+    nlen = float(np.linalg.norm(normal))
+    if nlen < 1e-12:
+        # 回退 PCA
+        centroid = pts.mean(axis=0)
+        centered = pts - centroid
+        try:
+            _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
+            normal = vt[-1] if vt.shape[0] >= 1 else np.array([0.0, 1.0, 0.0])
+        except np.linalg.LinAlgError:
+            return ids
+        nlen = float(np.linalg.norm(normal))
+        if nlen < 1e-12:
+            return ids
+        normal = normal / nlen
+        # 仍用均值差判定正侧
+        mean_a = centers[np.asarray(faces_a, dtype=np.int32)].mean(axis=0)
+        mean_b = centers[np.asarray(faces_b, dtype=np.int32)].mean(axis=0)
+    else:
+        normal = normal / nlen
+        centroid = 0.5 * (mean_a + mean_b)
+
+    # 扩展交界邻域（对偶环）
+    band = set(boundary_faces)
+    frontier = set(boundary_faces)
+    for _ in range(max(0, int(ring_expand))):
+        nxt: set[int] = set()
+        for face in frontier:
+            begin = int(offsets[face])
+            end = int(offsets[face + 1])
+            for neighbor in adj[begin:end].tolist():
+                neighbor = int(neighbor)
+                if int(ids[neighbor]) not in (ra, rb):
+                    continue
+                if neighbor not in band:
+                    nxt.add(neighbor)
+        if not nxt:
+            break
+        band |= nxt
+        frontier = nxt
+
+    # 正侧：与 normal 同向（朝向 mean_a）
+    pos_rid, neg_rid = ra, rb
+    if float(np.dot(mean_a - centroid, normal)) < 0.0:
+        pos_rid, neg_rid = rb, ra
+
+    # 带宽：交界点到平面距离 + 邻域跨度
+    centered = pts - centroid
+    abs_dist = np.abs(np.dot(centered, normal))
+    band_width = float(np.percentile(abs_dist, 90)) if len(abs_dist) else 0.0
+    band_pts = centers[np.asarray(sorted(band), dtype=np.int32)]
+    band_span = float(
+        np.percentile(np.abs(np.dot(band_pts - centroid, normal)), 95)
+    )
+    # 至少覆盖半个「两侧中心距」
+    half_sep = 0.5 * float(np.linalg.norm(mean_a - mean_b))
+    band_width = max(band_width * 1.35, band_span * 0.55, half_sep * 0.85, 1e-6)
+
+    for face in band:
+        dist = float(np.dot(centers[face] - centroid, normal))
+        if abs(dist) > band_width * 1.35:
+            continue
+        ids[face] = pos_rid if dist >= 0.0 else neg_rid
+
+    # 对交界做同步多数平滑，拉直残留锯齿
+    focus = {ra, rb}
+    for _ in range(max(1, int(smooth_rounds))):
+        to_flip: list[tuple[int, int]] = []
+        for face in list(band):
+            rid = int(ids[face])
+            if rid not in focus:
+                continue
+            other = rb if rid == ra else ra
+            begin = int(offsets[face])
+            end = int(offsets[face + 1])
+            own_n = 0
+            other_n = 0
+            for neighbor in adj[begin:end].tolist():
+                nr = int(ids[int(neighbor)])
+                if nr == rid:
+                    own_n += 1
+                elif nr == other:
+                    other_n += 1
+            if other_n > own_n:
+                to_flip.append((face, other))
+        if not to_flip:
+            break
+        for face, new_rid in to_flip:
+            ids[face] = new_rid
+
     return ids
 
 
@@ -1451,12 +1608,13 @@ def split_region_by_cut_edges(
     min_component_faces: int | None = None,
     smooth_iterations: int = 3,
     edge_costs: np.ndarray | None = None,
+    face_centers: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """
     将补全边作为邻接屏障，在受影响领域内做连通分量拆分。
 
     最大分量保留原 ID/颜色；主要新块分配新 ID；锯齿碎块并入邻块，
-    再把交界吸附到硬棱并平滑，接近自动识别边界质感。
+    再 PCA 拉直交界并平滑，接近自动识别边界质感。
     """
     ids = np.asarray(region_ids, dtype=np.int32).copy()
     colors = np.asarray(colors, dtype=np.float32)
@@ -1626,7 +1784,19 @@ def split_region_by_cut_edges(
             colors = np.vstack((colors, extra)) if len(colors) else extra
         return ids, colors[:region_count].copy(), region_count
 
-    # 把交界挪到更硬的边上（对齐自动识别质感）；超大块跳过以免卡顿
+    # PCA 切割面拉直交界（优先），再硬边微调
+    if face_centers is not None and len(split_pairs):
+        for rid_a, rid_b in split_pairs:
+            ids = straighten_split_boundary(
+                ids,
+                topology,
+                face_centers,
+                rid_a,
+                rid_b,
+                ring_expand=2,
+                smooth_rounds=8,
+            )
+
     if edge_costs is not None and len(split_pairs):
         for rid_a, rid_b in split_pairs:
             n_ab = int(
@@ -1640,16 +1810,26 @@ def split_region_by_cut_edges(
                 edge_costs,
                 rid_a,
                 rid_b,
-                iterations=6,
+                iterations=5,
             )
 
-    # 边界平滑：去掉残留单面毛刺
+    # 边界平滑：两侧都够大时才用强模式，避免小测试网格被吞并
     if smooth_iterations > 0:
+        use_aggressive = False
+        if split_pairs:
+            use_aggressive = True
+            for rid_a, rid_b in split_pairs:
+                ca = int(np.count_nonzero(ids == rid_a))
+                cb = int(np.count_nonzero(ids == rid_b))
+                if min(ca, cb) < 20:
+                    use_aggressive = False
+                    break
         ids = smooth_region_boundaries(
             ids,
             topology,
             focus_ids=touched_ids,
-            iterations=int(smooth_iterations),
+            iterations=max(int(smooth_iterations), 4 if use_aggressive else 2),
+            aggressive=use_aggressive,
         )
 
     # 再吸收残留碎屑（平滑可能产生的小岛）；上限封顶，避免吞掉有效新块
@@ -2113,6 +2293,7 @@ __all__ = (
     "split_region_by_cut_edges",
     "refine_cut_to_hard_ridge",
     "optimize_split_boundary_to_hard_edges",
+    "straighten_split_boundary",
     "smooth_region_boundaries",
     "absorb_small_regions_by_face_count",
     "cut_edges_from_paint_corridor",

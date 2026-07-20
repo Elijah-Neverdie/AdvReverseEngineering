@@ -19,6 +19,7 @@ from AdvReverseEngineering.algorithms.region_split import (
     refine_cut_to_hard_ridge,
     seal_cut_to_region_boundary,
     split_region_by_cut_edges,
+    straighten_split_boundary,
     stroke_hits_to_seed_edges,
     unify_cut_edges_as_line,
 )
@@ -398,6 +399,28 @@ class RegionSplitTests(unittest.TestCase):
             topology["edge_vert_b"],
         )
         self.assertEqual(len(chains), 0)
+
+    def test_straighten_reduces_jagged_boundary(self) -> None:
+        """PCA 拉直后上下两排应各成一块。"""
+        topology, centers, normals = _quad_strip_topology()
+        del normals
+        region_ids = np.zeros(6, dtype=np.int32)
+        region_ids[[3, 4, 5]] = 1
+        region_ids[4] = 0  # 锯齿缺口
+        straightened = straighten_split_boundary(
+            region_ids,
+            topology,
+            centers,
+            0,
+            1,
+            ring_expand=1,
+            smooth_rounds=4,
+        )
+        bottom = set(straightened[[3, 4, 5]].tolist())
+        top = set(straightened[[0, 1, 2]].tolist())
+        self.assertEqual(len(top), 1)
+        self.assertEqual(len(bottom), 1)
+        self.assertNotEqual(next(iter(top)), next(iter(bottom)))
 
     def test_refine_cut_prefers_hard_vertical(self) -> None:
         """走廊内重寻应仍落在竖硬棱上并能切开。"""

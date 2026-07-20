@@ -1428,8 +1428,9 @@ class ARE_OT_split_regions(bpy.types.Operator):
             completed,
             self._colors,
             target_rid=target,
-            smooth_iterations=3,
+            smooth_iterations=5,
             edge_costs=self._edge_costs,
+            face_centers=self._mesh_data["face_centers"],
         )
         changed = bool(np.any(new_ids != self._region_ids))
 
