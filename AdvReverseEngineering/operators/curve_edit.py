@@ -21,8 +21,10 @@ from ..algorithms.curve_edit import (
 )
 from ..registration import SCENE_PROP_NAME
 from ..ui.overlay import (
+    clear_curve_split_preview,
     clear_curve_tool_hud,
     register_curve_tool_hud,
+    set_curve_split_preview,
     set_curve_tool_hud,
     unregister_curve_tool_hud,
 )
@@ -48,24 +50,15 @@ def _tag_redraw(context: bpy.types.Context) -> None:
 
 
 def _header(context: bpy.types.Context, text: str) -> None:
-    area = getattr(context, "area", None)
-    if area is not None:
-        try:
-            area.header_text_set(text)
-        except Exception:
-            pass
+    # 只用视口内 HUD（User Perspective 下方），不用 header_text_set
     set_curve_tool_hud(text)
     _tag_redraw(context)
 
 
 def _clear_header(context: bpy.types.Context) -> None:
-    area = getattr(context, "area", None)
-    if area is not None:
-        try:
-            area.header_text_set(None)
-        except Exception:
-            pass
     clear_curve_tool_hud()
+    clear_curve_split_preview()
+    _tag_redraw(context)
 
 
 def _selected_curve_objects(context: bpy.types.Context) -> list[bpy.types.Object]:
@@ -196,6 +189,9 @@ def _serialize_curve(obj: bpy.types.Object) -> dict:
         "bevel_resolution": int(curve.bevel_resolution),
         "splines": splines,
         "custom": custom,
+        "display_type": str(obj.display_type),
+        "show_in_front": bool(obj.show_in_front),
+        "color": tuple(float(v) for v in obj.color),
     }
 
 
@@ -239,6 +235,12 @@ def _restore_curve(obj: bpy.types.Object, backup: dict) -> None:
             obj[key] = value
         except Exception:
             pass
+    if "display_type" in backup:
+        obj.display_type = backup["display_type"]
+    if "show_in_front" in backup:
+        obj.show_in_front = bool(backup["show_in_front"])
+    if "color" in backup:
+        obj.color = backup["color"]
 
 
 def _write_poly_segments(
@@ -345,6 +347,7 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
     def _rebuild_preview(self, context: bpy.types.Context) -> bool:
         angle = float(getattr(self, "_angle", DEFAULT_SPLIT_ANGLE))
         all_segments: list[tuple[bpy.types.Object, list[np.ndarray]]] = []
+        overlay_segments: list[dict] = []
         total = 0
         for obj, sources in self._targets:
             segments: list[np.ndarray] = []
@@ -365,14 +368,39 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
             if not segments:
                 continue
             colors = segment_colors_for_count(len(segments))
+            # 几何仍写入物体（确认拆分用）；分色靠 GPU 叠加，避免选中橙色盖住材质
             _write_poly_segments(
                 obj,
                 segments,
                 colors,
                 cyclic_flags=[False] * len(segments),
             )
+            # 预览时弱化物体本身线框，突出分色叠加
+            obj.display_type = "WIRE"
+            obj.show_in_front = True
+            obj.color = (0.15, 0.15, 0.15, 0.15)
+            for index, part in enumerate(segments):
+                overlay_segments.append(
+                    {
+                        "points": np.asarray(part, dtype=np.float64).copy(),
+                        "color": colors[index % len(colors)],
+                    }
+                )
             all_segments.append((obj, segments))
             total += len(segments)
+
+        extent = 1.0
+        if overlay_segments:
+            stacked = np.vstack([item["points"] for item in overlay_segments])
+            extent = float(
+                np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0))
+            )
+        set_curve_split_preview(
+            {
+                "segments": overlay_segments,
+                "line_width": float(max(3.5, min(8.0, extent * 0.01))),
+            }
+        )
         self._preview_segments = all_segments
         self._segment_count = total
         self._update_status(context)
@@ -388,6 +416,8 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
                     obj, segments, colors, cyclic_flags=[False]
                 )
                 obj["are_fit_kind"] = "contour_split"
+                obj.display_type = "TEXTURED"
+                obj.color = (1.0, 1.0, 1.0, 1.0)
                 created += 1
                 continue
             base_name = obj.name
@@ -395,7 +425,7 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
                 k: obj[k] for k in obj.keys() if k != "_RNA_UI"
             }
             matrix = obj.matrix_world.copy()
-            bevel = float(obj.data.bevel_depth)
+            bevel = float(max(obj.data.bevel_depth, 0.0015))
             colors = segment_colors_for_count(len(segments))
             _write_poly_segments(
                 obj,
@@ -406,8 +436,12 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
             obj.name = f"{base_name}_S0"
             if obj.data is not None:
                 obj.data.name = obj.name
+                obj.data.bevel_depth = bevel
             obj["are_fit_kind"] = "contour_split"
             obj["are_fit_split_index"] = 0
+            obj.display_type = "TEXTURED"
+            obj.show_in_front = True
+            obj.color = (1.0, 1.0, 1.0, 1.0)
             created += 1
             for index, segment in enumerate(segments[1:], start=1):
                 curve = bpy.data.curves.new(
@@ -421,7 +455,8 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
                 curve.bevel_resolution = 2
                 new_obj.matrix_world = matrix
                 new_obj.show_in_front = True
-                new_obj.display_type = "WIRE"
+                new_obj.display_type = "TEXTURED"
+                new_obj.color = (1.0, 1.0, 1.0, 1.0)
                 if new_obj.name not in collection.objects:
                     collection.objects.link(new_obj)
                 for key, value in backups_attrs.items():

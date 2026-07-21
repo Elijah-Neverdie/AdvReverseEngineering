@@ -39,7 +39,12 @@ _SPLIT_STROKE_SESSION: dict | None = None
 # 曲线拆分/拟合工具左上角 HUD
 _CURVE_TOOL_HUD: str | None = None
 _CURVE_TOOL_HUD_HANDLE = None
+_CURVE_SPLIT_PREVIEW_HANDLE = None
+_CURVE_SPLIT_PREVIEW: dict | None = None
 CURVE_TOOL_HUD_KEY = "AdvReverseEngineering.curve_tool_hud_handle"
+CURVE_SPLIT_PREVIEW_KEY = "AdvReverseEngineering.curve_split_preview_handle"
+# 避开视口自带「User Perspective / 物体名」两行信息
+_CURVE_HUD_TOP_MARGIN_PX = 72.0
 
 # 紫色半透明 (R, G, B, A)
 HIGHLIGHT_COLOR = (0.78, 0.22, 1.0, 0.55)
@@ -703,8 +708,45 @@ def clear_curve_tool_hud() -> None:
     set_curve_tool_hud(None)
 
 
+def set_curve_split_preview(session: dict | None) -> None:
+    """
+    设置拆分曲线分色预览。
+
+    session = {
+      "segments": [{"points": (N,3) ndarray, "color": (r,g,b,a)}, ...],
+      "line_width": float,
+    }
+    """
+    global _CURVE_SPLIT_PREVIEW
+    _CURVE_SPLIT_PREVIEW = session
+
+
+def clear_curve_split_preview() -> None:
+    set_curve_split_preview(None)
+
+
+def draw_curve_split_preview() -> None:
+    """POST_VIEW：用加粗彩色折线画拆分段，不受物体选中橙色影响。"""
+    session = _CURVE_SPLIT_PREVIEW
+    if not session:
+        return
+    segments = session.get("segments") or []
+    if not segments:
+        return
+    width = float(session.get("line_width", 4.0))
+    for item in segments:
+        pts = np.asarray(item.get("points"), dtype=np.float64)
+        if len(pts) < 2:
+            continue
+        color = tuple(float(v) for v in (item.get("color") or (1, 0.2, 0.1, 1))[:4])
+        if len(color) < 4:
+            color = color + (1.0,) * (4 - len(color))
+        edges = np.stack((pts[:-1], pts[1:]), axis=1)
+        _draw_edge_lines_world(edges, color, width)
+
+
 def draw_curve_tool_hud() -> None:
-    """POST_PIXEL：视口左上角显示曲线拆分/拟合状态。"""
+    """POST_PIXEL：视口左上角（User Perspective 下方）显示状态。"""
     import blf
 
     text = _CURVE_TOOL_HUD
@@ -714,20 +756,23 @@ def draw_curve_tool_hud() -> None:
     if context is None or context.region is None:
         return
     font_id = 0
-    blf.size(font_id, 16)
+    blf.size(font_id, 15)
     width, height = blf.dimensions(font_id, text)
-    x = 18.0
-    y = float(context.region.height) - height - 18.0
+    x = 16.0
+    # 放在视口信息文字下方（用户框出的位置）
+    y = float(context.region.height) - _CURVE_HUD_TOP_MARGIN_PX - height
+    if y < 8.0:
+        y = 8.0
     gpu.state.blend_set("ALPHA")
     try:
-        # 半透明底条，保证白字可读
         shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-        pad = 8.0
+        pad_x = 10.0
+        pad_y = 6.0
         verts = (
-            (x - pad, y - pad),
-            (x + width + pad, y - pad),
-            (x + width + pad, y + height + pad),
-            (x - pad, y + height + pad),
+            (x - pad_x, y - pad_y),
+            (x + width + pad_x, y - pad_y),
+            (x + width + pad_x, y + height + pad_y),
+            (x - pad_x, y + height + pad_y),
         )
         batch = batch_for_shader(
             shader,
@@ -744,23 +789,24 @@ def draw_curve_tool_hud() -> None:
             },
         )
         shader.bind()
-        shader.uniform_float("color", (0.05, 0.05, 0.08, 0.55))
+        shader.uniform_float("color", (0.02, 0.02, 0.05, 0.62))
         batch.draw(shader)
         blf.position(font_id, x, y, 0)
-        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+        blf.color(font_id, 1.0, 0.95, 0.55, 1.0)
         blf.draw(font_id, text)
     finally:
         gpu.state.blend_set("NONE")
 
 
 def register_curve_tool_hud() -> None:
-    """注册曲线工具 HUD 绘制。"""
-    global _CURVE_TOOL_HUD_HANDLE
+    """注册曲线工具 HUD + 拆分预览绘制。"""
+    global _CURVE_TOOL_HUD_HANDLE, _CURVE_SPLIT_PREVIEW_HANDLE
     namespace = bpy.app.driver_namespace
-    old = namespace.get(CURVE_TOOL_HUD_KEY)
-    if old is not None:
+
+    old_hud = namespace.get(CURVE_TOOL_HUD_KEY)
+    if old_hud is not None:
         try:
-            bpy.types.SpaceView3D.draw_handler_remove(old, "WINDOW")
+            bpy.types.SpaceView3D.draw_handler_remove(old_hud, "WINDOW")
         except (ReferenceError, ValueError):
             pass
     _CURVE_TOOL_HUD_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
@@ -771,11 +817,27 @@ def register_curve_tool_hud() -> None:
     )
     namespace[CURVE_TOOL_HUD_KEY] = _CURVE_TOOL_HUD_HANDLE
 
+    old_prev = namespace.get(CURVE_SPLIT_PREVIEW_KEY)
+    if old_prev is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(old_prev, "WINDOW")
+        except (ReferenceError, ValueError):
+            pass
+    _CURVE_SPLIT_PREVIEW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+        draw_curve_split_preview,
+        (),
+        "WINDOW",
+        "POST_VIEW",
+    )
+    namespace[CURVE_SPLIT_PREVIEW_KEY] = _CURVE_SPLIT_PREVIEW_HANDLE
+
 
 def unregister_curve_tool_hud() -> None:
-    """注销曲线工具 HUD。"""
+    """注销曲线工具 HUD 与拆分预览。"""
     global _CURVE_TOOL_HUD_HANDLE, _CURVE_TOOL_HUD
+    global _CURVE_SPLIT_PREVIEW_HANDLE, _CURVE_SPLIT_PREVIEW
     namespace = bpy.app.driver_namespace
+
     handle = namespace.pop(CURVE_TOOL_HUD_KEY, None) or _CURVE_TOOL_HUD_HANDLE
     if handle is not None:
         try:
@@ -784,6 +846,15 @@ def unregister_curve_tool_hud() -> None:
             pass
     _CURVE_TOOL_HUD_HANDLE = None
     _CURVE_TOOL_HUD = None
+
+    prev = namespace.pop(CURVE_SPLIT_PREVIEW_KEY, None) or _CURVE_SPLIT_PREVIEW_HANDLE
+    if prev is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(prev, "WINDOW")
+        except (ReferenceError, ValueError):
+            pass
+    _CURVE_SPLIT_PREVIEW_HANDLE = None
+    _CURVE_SPLIT_PREVIEW = None
 
 
 def register_label_draw_handler() -> None:
