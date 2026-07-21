@@ -1476,6 +1476,129 @@ def weld_close_points_closed_loop(
     return pts
 
 
+def weld_close_corner_clusters_closed_loop(
+    points: np.ndarray,
+    corner_indices: Sequence[int],
+    min_distance: float,
+    *,
+    max_index_span: int = 32,
+) -> np.ndarray:
+    """
+    只焊接相互接近的已检测折点簇，普通边界采样点保持不变。
+
+    两个折点除空间距离小于阈值外，其间较短闭环弧也必须局部且短，
+    防止跨越细长区域误焊不相邻的拓扑位置。
+    """
+    pts = _as_float_array(points).copy()
+    count = len(pts)
+    if count < 4:
+        return pts
+    threshold = float(max(min_distance, 0.0))
+    if threshold <= 0.0:
+        return pts
+
+    candidates = sorted(
+        {int(index) % count for index in corner_indices}
+    )
+    if len(candidates) < 2:
+        return pts
+
+    parent = list(range(len(candidates)))
+
+    def _root(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def _union(a: int, b: int) -> None:
+        ra = _root(a)
+        rb = _root(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    span_limit = int(max(max_index_span, 2))
+    for ai, a in enumerate(candidates):
+        for bi in range(ai + 1, len(candidates)):
+            b = candidates[bi]
+            forward_steps = (b - a) % count
+            backward_steps = (a - b) % count
+            short_steps = min(forward_steps, backward_steps)
+            if short_steps > span_limit:
+                continue
+            if float(np.linalg.norm(pts[a] - pts[b])) >= threshold:
+                continue
+            if forward_steps <= backward_steps:
+                arc_indices = [
+                    (a + step) % count
+                    for step in range(forward_steps + 1)
+                ]
+            else:
+                arc_indices = [
+                    (b + step) % count
+                    for step in range(backward_steps + 1)
+                ]
+            arc = pts[np.asarray(arc_indices, dtype=np.int32)]
+            arc_length = polyline_length(arc)
+            if arc_length <= threshold * 2.0:
+                _union(ai, bi)
+
+    groups: dict[int, list[int]] = defaultdict(list)
+    for position, candidate in enumerate(candidates):
+        groups[_root(position)].append(candidate)
+
+    arcs: list[tuple[set[int], np.ndarray, int]] = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        ordered = sorted(group)
+        gaps = [
+            ((ordered[(i + 1) % len(ordered)] - ordered[i]) % count, i)
+            for i in range(len(ordered))
+        ]
+        _largest_gap, gap_index = max(gaps)
+        start = ordered[(gap_index + 1) % len(ordered)]
+        end = ordered[gap_index]
+        arc_indices = [start]
+        cursor = start
+        while cursor != end and len(arc_indices) <= count:
+            cursor = (cursor + 1) % count
+            arc_indices.append(cursor)
+        if len(arc_indices) < 2 or len(arc_indices) >= count - 2:
+            continue
+        arc = pts[np.asarray(arc_indices, dtype=np.int32)]
+        if polyline_length(arc) > threshold * 2.0:
+            continue
+        arcs.append(
+            (
+                set(arc_indices),
+                np.mean(pts[np.asarray(group, dtype=np.int32)], axis=0),
+                start,
+            )
+        )
+
+    if not arcs:
+        return pts
+
+    remove: set[int] = set()
+    replacement: dict[int, np.ndarray] = {}
+    for arc_indices, centroid, start in arcs:
+        if remove.intersection(arc_indices):
+            continue
+        remove.update(arc_indices)
+        replacement[start] = centroid
+
+    result: list[np.ndarray] = []
+    for index in range(count):
+        if index in replacement:
+            result.append(replacement[index].copy())
+        elif index not in remove:
+            result.append(pts[index].copy())
+    if len(result) < 3:
+        return pts
+    return np.asarray(result, dtype=np.float64)
+
+
 def weld_then_collapse_fit_loop(
     points: np.ndarray,
     *,
@@ -1486,8 +1609,8 @@ def weld_then_collapse_fit_loop(
     """
     准备用于内角计算的拟合闭环：收束尖刺 → 焊接过近点 → 再收束。
 
-    焊接阈值 = min(最长边×weld_frac, 中位邻边×0.4)，
-    只合并异常过近的拐角簇，不把整条边抽成折线。
+    先检测折角/凹折，只在这些候选点之间应用「最长边×weld_frac」。
+    普通光滑边采样点完全不参与焊接，因此不会把整条边抽成折线。
     """
     from ..utils.debug import are_debug
     import time as _time
@@ -1504,15 +1627,45 @@ def weld_then_collapse_fit_loop(
         if longest_side_length is not None and float(longest_side_length) > 0.0
         else estimate_longest_fit_side_length(pts, corner_angle_deg)
     )
-    min_dist = resolve_weld_min_distance(pts, longest, weld_frac=weld_frac)
+    min_dist = max(
+        float(longest) * float(max(weld_frac, 0.0)),
+        0.0,
+    )
     n1 = len(pts)
+    candidate_count = 0
     if min_dist > 0.0:
-        pts = weld_close_points_closed_loop(pts, min_dist)
+        # 一次焊接后相邻残点可能才显露为折点；有限迭代重检，直到不再删点。
+        for _ in range(8):
+            origin, axis_u, axis_v = _loop_pca_basis(pts)
+            pts2 = project_points_to_plane(pts, origin, axis_u, axis_v)
+            corners = detect_corner_indices(
+                pts2,
+                corner_angle_deg,
+                max_corners=_MAX_SPLIT_CORNERS,
+                convex_only=False,
+                include_strong_concave=True,
+            )
+            folds = detect_concave_fold_indices(
+                pts2,
+                fold_angle_deg=corner_angle_deg,
+                max_folds=_MAX_CONCAVE_FOLDS,
+            )
+            candidates = sorted(set(corners) | set(folds))
+            candidate_count = max(candidate_count, len(candidates))
+            welded = weld_close_corner_clusters_closed_loop(
+                pts,
+                candidates,
+                min_dist,
+            )
+            if len(welded) >= len(pts):
+                break
+            pts = welded
     t2 = _time.perf_counter()
     pts = collapse_ultra_reflex_spike_vertices_closed_loop(pts)
     are_debug(
         f"weld_then_collapse n={n0}->{n1}->{len(pts)} "
         f"longest={longest:.4g} min_d={min_dist:.4g} "
+        f"corner_candidates={candidate_count} "
         f"collapse1_ms={(t1 - t0) * 1000.0:.1f} "
         f"weld_ms={(t2 - t1) * 1000.0:.1f} "
         f"collapse2_ms={(_time.perf_counter() - t2) * 1000.0:.1f}"
@@ -5786,6 +5939,7 @@ __all__ = (
     "side_interior_max_turn_deg",
     "soft_snap_quad_grid_to_points",
     "weld_close_points_closed_loop",
+    "weld_close_corner_clusters_closed_loop",
     "weld_then_collapse_fit_loop",
     "resolve_weld_min_distance",
 )
