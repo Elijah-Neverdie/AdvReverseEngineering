@@ -364,92 +364,16 @@ class ARE_PT_main(bpy.types.Panel):
 
             if fitting:
                 tip = region_box.box()
-                tip.label(text="拟合模式（分步）", icon="INFO")
+                tip.label(text="拟合模式（外轮廓曲线）", icon="INFO")
                 if scene_props.fit_status:
                     tip.label(text=scene_props.fit_status)
                 if scene_props.fit_status_detail:
                     tip.label(text=scene_props.fit_status_detail)
-
-                phase = scene_props.fit_phase
-                if phase == "ISLANDS":
-                    tip.label(text="① 各孤岛封闭外围曲线")
-                    tip.prop(
-                        scene_props,
-                        "fit_island_min_perimeter",
-                        text="碎岛周长阈值 (%)",
-                    )
-                elif phase == "STITCH":
-                    tip.label(text="② 缝合邻近孤岛（折角配对）")
-                    tip.prop(
-                        scene_props,
-                        "fit_stitch_gap",
-                        text="缝合间隙阈值 (%)",
-                    )
-                elif phase == "BRIDGE":
-                    tip.label(text="③ 桥接远距离孤岛")
-                    tip.prop(
-                        scene_props,
-                        "fit_bridge_enabled",
-                        text="启用远岛桥接",
-                    )
-                    tip.prop(
-                        scene_props,
-                        "fit_bridge_gap",
-                        text="桥接间隙 (%)",
-                    )
-
-                if phase in {"ISLANDS", "STITCH", "BRIDGE"}:
-                    nav = tip.row(align=True)
-                    nav.operator("are.fit_step_back", text="上一步", icon="BACK")
-                    nav.operator("are.fit_step_next", text="下一步", icon="FORWARD")
-                    if phase == "BRIDGE":
-                        build_row = tip.row()
-                        build_row.scale_y = 1.2
-                        build_row.operator(
-                            "are.build_fit_surface",
-                            text="拟合成面",
-                            icon="MESH_GRID",
-                        )
-
-                if phase == "PREVIEW":
-                    tip.label(
-                        text=(
-                            "三边曲面"
-                            if scene_props.fit_topology == "TRI"
-                            else "四边曲面"
-                        )
-                    )
-                    tip.prop(
-                        scene_props,
-                        "fit_segments_u",
-                        text=(
-                            "底边段数"
-                            if scene_props.fit_topology == "TRI"
-                            else "U 向段数"
-                        ),
-                    )
-                    tip.prop(
-                        scene_props,
-                        "fit_segments_v",
-                        text=(
-                            "长边段数"
-                            if scene_props.fit_topology == "TRI"
-                            else "V 向段数"
-                        ),
-                    )
-                    back_row = tip.row(align=True)
-                    back_row.operator(
-                        "are.fit_step_back",
-                        text="返回桥接",
-                        icon="BACK",
-                    )
-                    confirm_row = tip.row()
-                    confirm_row.scale_y = 1.2
-                    confirm_row.operator(
-                        "are.confirm_fit_region",
-                        text="确认",
-                        icon="CHECKMARK",
-                    )
+                tip.prop(
+                    scene_props,
+                    "fit_island_min_perimeter",
+                    text="碎岛周长阈值 (%)",
+                )
                 if _draw_foldout(
                     tip,
                     scene_props,
@@ -457,12 +381,11 @@ class ARE_PT_main(bpy.types.Panel):
                     "操作说明",
                 ):
                     help_box = tip.box()
-                    help_box.label(text="1. 点击编号 → ① 各孤岛外围曲线")
-                    help_box.label(text="2. Enter/下一步 → ② 缝合邻近")
-                    help_box.label(text="3. Enter/下一步 → ③ 桥接远岛")
-                    help_box.label(text="4. 拟合成面后滚轮/Page 调段数")
-                    help_box.label(text="Backspace 返回上一步 · Esc 取消")
-                    help_box.label(text="Shift+点击多选领域并集")
+                    help_box.label(text="1. 点击领域编号 → 生成可编辑外轮廓曲线")
+                    help_box.label(text="2. 曲线写入「拟合面」集合，可直接编辑")
+                    help_box.label(text="3. 物体属性 are_fit_region_id 标记领域")
+                    help_box.label(text="Shift+点击多选后按 Enter 确认")
+                    help_box.label(text="Esc 取消 · 不再焊接/内角/成面")
 
             if scene_props.region_status:
                 region_box.label(

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 AdvReverseEngineering Contributors
 
-"""领域三边/四边曲面拟合操作符。"""
+"""领域外轮廓拟合操作符：生成可编辑曲线。"""
 
 from __future__ import annotations
 
@@ -11,12 +11,8 @@ import numpy as np
 from ..algorithms.region_fit import (
     DEFAULT_SEG_U,
     DEFAULT_SEG_V,
-    MAX_SEGMENTS,
-    MIN_SEGMENTS,
     RegionFitError,
-    collect_island_bridge_interiors,
     extract_island_longest_sides,
-    fit_region_surface,
 )
 from ..algorithms.regions import compute_region_label_anchors
 from ..registration import SCENE_PROP_NAME
@@ -26,7 +22,6 @@ from ..ui.overlay import (
     register_label_draw_handler,
     set_fit_angle_label_session,
     set_merge_label_session,
-    unregister_label_draw_handler,
     update_merge_label_projections,
 )
 from ..utils.mesh import extract_face_topology, extract_mesh_data
@@ -54,6 +49,7 @@ FIT_FOLD_COLOR = (0.15, 0.85, 1.0, 1.0)
 FIT_BRIDGE_COLOR = (0.55, 0.55, 0.55, 1.0)
 FIT_CURVE_STAGES = ("ISLANDS", "STITCH", "BRIDGE")
 FIT_STAGE_ORDER = ("ISLANDS", "STITCH", "BRIDGE", "PREVIEW")
+FIT_CONTOUR_KIND = "contour"
 MODAL_TIMER_STEP = 0.1
 _FIT_OP_KEY = "are_active_fit_op"
 
@@ -382,6 +378,71 @@ def _octahedron_mesh(
     return np.asarray(verts, dtype=np.float64), faces, face_colors
 
 
+def _join_island_closed_loop(island: dict) -> np.ndarray | None:
+    """把岛上各拟合边拼成闭合折线（去掉相邻边重复端点）。"""
+    parts: list[np.ndarray] = []
+    for side in island.get("sides") or []:
+        arr = np.asarray(side, dtype=np.float64)
+        if len(arr) >= 2:
+            parts.append(arr[:-1])
+    if not parts:
+        for bezier in island.get("beziers") or []:
+            poly = bezier.get("polyline")
+            if poly is None:
+                continue
+            arr = np.asarray(poly, dtype=np.float64)
+            if len(arr) >= 2:
+                parts.append(arr[:-1])
+    if not parts:
+        return None
+    return np.vstack(parts)
+
+
+def _create_editable_contour_curve(
+    name: str,
+    debug: dict,
+    matrix_world,
+    collection: bpy.types.Collection | None,
+) -> bpy.types.Object:
+    """以外轮廓闭合折线创建可编辑曲线（每岛一条 cyclic POLY）。"""
+    matrix = np.asarray(matrix_world, dtype=np.float64)
+    curve = bpy.data.curves.new(name, type="CURVE")
+    obj = bpy.data.objects.new(name, curve)
+    _link_object_to_scene(obj, collection)
+
+    curve.dimensions = "3D"
+    curve.bevel_depth = float(max(float(debug.get("bevel_depth", 0.002)) * 0.5, 1e-4))
+    curve.bevel_resolution = 2
+    curve.use_fill_caps = True
+
+    for island in debug.get("islands", []):
+        loop = _join_island_closed_loop(island)
+        if loop is None or len(loop) < 3:
+            continue
+        local_pts = _world_to_object_local(matrix, loop)
+        spline = curve.splines.new("POLY")
+        spline.points.add(len(local_pts) - 1)
+        for index, point in enumerate(local_pts):
+            spline.points[index].co = (
+                float(point[0]),
+                float(point[1]),
+                float(point[2]),
+                1.0,
+            )
+        spline.use_cyclic_u = True
+        spline.use_smooth = False
+
+    if not curve.splines:
+        _delete_object(obj)
+        raise RegionFitError("外轮廓拟合结果为空，无法创建曲线")
+
+    obj.matrix_world = matrix_world.copy()
+    obj.hide_select = False
+    obj.display_type = "WIRE"
+    obj.show_in_front = True
+    return obj
+
+
 def _create_or_update_debug_curve_object(
     name: str,
     debug: dict,
@@ -656,161 +717,85 @@ def _create_or_update_bridge_link_object(
 
 
 class ARE_OT_fit_step_next(bpy.types.Operator):
-    """拟合向导：进入下一步。"""
+    """已取消：拟合仅生成外轮廓曲线。"""
 
     bl_idname = "are.fit_step_next"
     bl_label = "下一步"
-    bl_description = "进入拟合流程的下一步（孤岛→缝合→桥接→成面）"
+    bl_description = "已取消后续拟合步骤；请点击领域编号生成外轮廓曲线"
     bl_options = {"INTERNAL"}
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
-        return (
-            scene_props is not None
-            and scene_props.fit_mode_active
-            and scene_props.fit_phase in FIT_CURVE_STAGES
-        )
+        return False
 
     def execute(self, context: bpy.types.Context):
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        op = _get_active_fit_op()
-        if op is not None:
-            try:
-                if op.advance_stage(context):
-                    self.report({"INFO"}, scene_props.fit_status or "已进入下一步")
-                    return {"FINISHED"}
-                self.report({"ERROR"}, "无法进入下一步")
-                return {"CANCELLED"}
-            except Exception as exc:
-                self.report({"ERROR"}, f"下一步失败: {exc}")
-        # 后备：置位由模态 TIMER 消费（避免侧栏点击被模态吞掉后无响应）
-        scene_props.fit_advance_requested = True
-        return {"FINISHED"}
+        self.report({"WARNING"}, "后续拟合步骤已取消，请点击领域编号生成外轮廓")
+        return {"CANCELLED"}
 
 
 class ARE_OT_fit_step_back(bpy.types.Operator):
-    """拟合向导：返回上一步。"""
+    """已取消：拟合仅生成外轮廓曲线。"""
 
     bl_idname = "are.fit_step_back"
     bl_label = "上一步"
-    bl_description = "返回拟合流程的上一步"
+    bl_description = "已取消后续拟合步骤"
     bl_options = {"INTERNAL"}
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
-        return (
-            scene_props is not None
-            and scene_props.fit_mode_active
-            and scene_props.fit_phase in {"STITCH", "BRIDGE", "PREVIEW"}
-        )
+        return False
 
     def execute(self, context: bpy.types.Context):
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        op = _get_active_fit_op()
-        if op is not None:
-            try:
-                if op.retreat_stage(context):
-                    self.report({"INFO"}, scene_props.fit_status or "已返回上一步")
-                    return {"FINISHED"}
-                self.report({"ERROR"}, "无法返回上一步")
-                return {"CANCELLED"}
-            except Exception as exc:
-                self.report({"ERROR"}, f"上一步失败: {exc}")
-        scene_props.fit_retreat_requested = True
-        return {"FINISHED"}
+        self.report({"WARNING"}, "后续拟合步骤已取消")
+        return {"CANCELLED"}
 
 
 class ARE_OT_build_fit_surface(bpy.types.Operator):
-    """面板按钮：从桥接预览进入曲面拟合（兼容旧入口）。"""
+    """已取消：不再拟合成面。"""
 
     bl_idname = "are.build_fit_surface"
     bl_label = "拟合成面"
-    bl_description = "根据当前分步结果生成三边/四边拟合曲面预览"
+    bl_description = "已取消成面步骤；拟合仅输出可编辑外轮廓曲线"
     bl_options = {"INTERNAL"}
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
-        return (
-            scene_props is not None
-            and scene_props.fit_mode_active
-            and scene_props.fit_phase in FIT_CURVE_STAGES
-        )
+        return False
 
     def execute(self, context: bpy.types.Context):
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        op = _get_active_fit_op()
-        if op is not None:
-            try:
-                if op.advance_to_preview(context):
-                    self.report({"INFO"}, "已生成拟合曲面预览")
-                    return {"FINISHED"}
-                self.report({"ERROR"}, "拟合成面失败")
-                return {"CANCELLED"}
-            except Exception as exc:
-                self.report({"ERROR"}, f"拟合成面失败: {exc}")
-        scene_props.fit_preview_requested = True
-        return {"FINISHED"}
+        self.report({"WARNING"}, "成面步骤已取消，拟合仅输出外轮廓曲线")
+        return {"CANCELLED"}
 
 
 class ARE_OT_confirm_fit_region(bpy.types.Operator):
-    """面板确认按钮：通知拟合模态提交。"""
+    """已取消：点击领域后自动写入外轮廓曲线。"""
 
     bl_idname = "are.confirm_fit_region"
-    bl_label = "确认"
-    bl_description = "确认当前拟合面并退出拟合模式"
+    bl_label = "确认拟合"
+    bl_description = "已取消；点击领域编号即可生成外轮廓曲线"
     bl_options = {"INTERNAL"}
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
-        return (
-            scene_props is not None
-            and scene_props.fit_mode_active
-            and scene_props.fit_phase == "PREVIEW"
-        )
+        return False
 
     def execute(self, context: bpy.types.Context):
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        op = _get_active_fit_op()
-        if op is not None:
-            try:
-                op.confirm_from_panel(context)
-            except Exception as exc:
-                self.report({"ERROR"}, f"确认拟合失败: {exc}")
-                scene_props.fit_confirm_requested = True
-                _schedule_force_exit_check()
-                return {"FINISHED"}
-            if scene_props.fit_mode_active:
-                scene_props.fit_mode_active = False
-                scene_props.fit_confirm_requested = False
-                scene_props.fit_phase = "IDLE"
-                from .regions import _teardown_labels_then_sync
-                from ..ui.overlay import set_fit_angle_label_session
-
-                set_fit_angle_label_session(None)
-                _teardown_labels_then_sync(context)
-            return {"FINISHED"}
-        scene_props.fit_confirm_requested = True
-        _schedule_force_exit_check()
-        return {"FINISHED"}
+        self.report({"WARNING"}, "无需确认：点击领域编号即生成外轮廓曲线")
+        return {"CANCELLED"}
 
 
 class ARE_OT_fit_region(bpy.types.Operator):
     """
-    模态拟合领域（分步向导）。
+    模态拟合领域：点选编号后生成可编辑外轮廓曲线。
 
-    点击编号 → ①孤岛外围曲线 → ②缝合邻近 → ③桥接远岛 → 成面确认。
-    每步可调参数并实时预览。
+    不再自动焊接、不再显示内角，也不再进入缝合/桥接/成面。
     """
 
     bl_idname = "are.fit_region"
     bl_label = "拟合领域"
     bl_description = (
-        "分步拟合：各孤岛外围曲线 → 缝合邻近孤岛 → 桥接远岛 → 成面；"
-        "Shift+点击多选并集；每步参数可实时调节预览"
+        "点击领域编号，生成可编辑外轮廓曲线到「拟合面」集合；"
+        "Shift+多选后按 Enter 确认；曲线带 are_fit_region_id 属性"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -849,66 +834,20 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._bridge_link_object = None
         set_fit_angle_label_session(None)
 
-    def _publish_angle_labels(self, debug: dict) -> None:
-        """把拟合边界内角标注推到视口覆盖层。
-
-        extract_mesh_data / 拟合边界点已是世界坐标，不可再乘 matrix_world。
-        """
-        raw = debug.get("interior_angle_labels") or []
-        if not raw:
-            set_fit_angle_label_session(None)
-            return
-
-        labels = []
-        for item in raw:
-            face = np.asarray(item["face_center"], dtype=np.float64).reshape(3)
-            anchor = np.asarray(item["world_co"], dtype=np.float64).reshape(3)
-            normal = np.asarray(item["normal"], dtype=np.float64).reshape(3)
-            nlen = float(np.linalg.norm(normal))
-            if nlen > 1e-12:
-                normal = normal / nlen
-            else:
-                normal = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            labels.append(
-                {
-                    "text": str(item.get("text") or ""),
-                    "angle_deg": float(item.get("angle_deg", 0.0)),
-                    "local_deg": float(item.get("local_deg", 0.0)),
-                    "hairpin_deg": float(item.get("hairpin_deg", 0.0)),
-                    "world_co": anchor.copy(),
-                    "face_center": face.copy(),
-                    "normal": normal,
-                    "screen_xy": None,
-                    "face_screen_xy": None,
-                    "visible": False,
-                }
-            )
-        set_fit_angle_label_session(
-            {
-                "labels": labels,
-                "object_name": self._object.name,
-                "preview_version": int(getattr(self, "_preview_serial", 0)) + 1,
-                # 调试标注：不做朝向/遮挡剔除，否则边界点几乎全被滤掉
-                "skip_facing": True,
-                "skip_occlusion": True,
-            }
-        )
-        self._preview_serial = int(getattr(self, "_preview_serial", 0)) + 1
-        register_label_draw_handler()
-
     def confirm_from_panel(self, context: bpy.types.Context) -> None:
         if getattr(self, "_closed", False):
             return
         try:
             if not self._committed:
-                self._commit_fit(context)
+                self._fit_and_commit_contour(context)
         finally:
-            self._finish_mode(context, cancelled=False)
+            if not getattr(self, "_closed", False):
+                self._finish_mode(context, cancelled=not self._committed)
             self._closed = True
 
     def build_surface_from_panel(self, context: bpy.types.Context) -> bool:
-        """兼容旧面板入口：直接跳到曲面预览。"""
-        return self.advance_to_preview(context)
+        """兼容旧面板：改为直接生成外轮廓曲线。"""
+        return self._fit_and_commit_contour(context)
 
     def _stage_kwargs(self, scene_props) -> dict:
         return {
@@ -920,63 +859,14 @@ class ARE_OT_fit_region(bpy.types.Operator):
         }
 
     def _status_text(self, scene_props) -> str:
-        phase = scene_props.fit_phase
         targets = self._resolve_fit_targets(scene_props)
-        label = "+".join(str(value) for value in targets) if targets else "?"
-        island_n = int(getattr(self, "_debug_island_count", 0))
-        if phase == "ISLANDS":
+        if not targets:
             return (
-                f"① 孤岛外围 · 领域 {label} · {island_n} 环 · "
-                f"调碎岛阈值后点「下一步」或 Enter"
+                "点击领域编号生成可编辑外轮廓曲线；"
+                "Shift+点击多选后按 Enter 确认"
             )
-        if phase == "STITCH":
-            return (
-                f"② 缝合邻近 · 领域 {label} · {island_n} 轮廓 · "
-                f"调缝合间隙后点「下一步」或 Enter"
-            )
-        if phase == "BRIDGE":
-            return (
-                f"③ 桥接远岛 · 领域 {label} · {island_n} 轮廓 · "
-                f"调桥接间隙后点「拟合成面」或 Enter"
-            )
-        if phase != "PREVIEW":
-            return (
-                "点击领域编号开始分步拟合；"
-                "Shift+点击多选并集（消去公共内边）"
-            )
-        topo = "三边" if self._topology == "TRI" else "四边"
-        if self._topology == "TRI":
-            return (
-                f"领域 {label} · {topo} · "
-                f"长边段数 {scene_props.fit_segments_v} · "
-                f"底边段数 {scene_props.fit_segments_u} · "
-                f"滚轮调长边 / Page 调底边"
-            )
-        return (
-            f"领域 {label} · {topo} · "
-            f"U={scene_props.fit_segments_u} V={scene_props.fit_segments_v} · "
-            f"滚轮调 U / Page 调 V"
-        )
-
-    @staticmethod
-    def _format_debug_detail(debug: dict) -> str:
-        stage = str(debug.get("stage", ""))
-        parts: list[str] = [f"阶段 {stage}"] if stage else []
-        for island in debug.get("islands", []):
-            lengths = island.get("lengths", [])
-            length_txt = " / ".join(f"{length:.3f}" for length in lengths)
-            fold_n = int(island.get("concave_fold_count", 0))
-            fold_txt = f"，凹折{fold_n}" if fold_n else ""
-            merged = int(island.get("merged_from", 1))
-            merge_txt = f"←{merged}岛" if merged > 1 else ""
-            parts.append(
-                f"岛{island.get('island_index', '?')}{merge_txt}: "
-                f"{len(lengths)}边 [{length_txt}]{fold_txt}"
-            )
-        links = debug.get("bridge_links") or []
-        if links:
-            parts.append(f"桥接示意 {len(links)} 段")
-        return "；".join(parts)
+        label = "+".join(str(value) for value in targets)
+        return f"已选领域 {label} · Enter 生成外轮廓曲线 · Esc 取消"
 
     def _resolve_fit_targets(self, scene_props) -> list[int]:
         """当前拟合目标：支持 Shift 多选并集。"""
@@ -990,29 +880,14 @@ class ARE_OT_fit_region(bpy.types.Operator):
         target = int(scene_props.fit_target_id)
         return [target] if target >= 0 else []
 
-    def _rebuild_stage_preview(
-        self,
-        context: bpy.types.Context,
-        stage: str | None = None,
-    ) -> bool:
-        """按阶段重建外围/缝合/桥接曲线预览。"""
+    def _fit_and_commit_contour(self, context: bpy.types.Context) -> bool:
+        """提取外轮廓（不焊接、不内角），写入可编辑曲线并结束模态。"""
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         targets = self._resolve_fit_targets(scene_props)
         if not targets:
+            self.report({"WARNING"}, "请先点击领域编号")
             return False
-        stage_key = str(stage or scene_props.fit_phase).upper()
-        if stage_key not in FIT_CURVE_STAGES:
-            stage_key = "ISLANDS"
         kwargs = self._stage_kwargs(scene_props)
-        interior = None
-        if stage_key == "BRIDGE":
-            interior = collect_island_bridge_interiors(
-                self._region_ids,
-                targets if len(targets) > 1 else targets[0],
-                self._mesh_data["face_centers"],
-                adjacency_offsets=self._topology_data["adjacency_offsets"],
-                adjacency_indices=self._topology_data["adjacency_indices"],
-            )
         try:
             debug = extract_island_longest_sides(
                 region_ids=self._region_ids,
@@ -1021,12 +896,13 @@ class ARE_OT_fit_region(bpy.types.Operator):
                 loop_start=self._topology_data["loop_start"],
                 loop_total=self._topology_data["loop_total"],
                 loop_vertex_indices=self._topology_data["loop_vertex_indices"],
-                stage=stage_key,
-                interior_points=interior,
+                stage="ISLANDS",
+                skip_weld=True,
+                emit_angle_labels=False,
                 **kwargs,
             )
         except RegionFitError as exc:
-            self._discard_preview()
+            set_fit_angle_label_session(None)
             scene_props.fit_phase = "SELECT"
             scene_props.fit_topology = ""
             scene_props.fit_status = str(exc)
@@ -1035,200 +911,62 @@ class ARE_OT_fit_region(bpy.types.Operator):
             _tag_redraw(context)
             return False
 
-        self._debug_result = debug
-        self._debug_island_count = int(debug["island_count"])
-        self._last_result = None
-        self._topology = "QUAD"
-        scene_props.fit_topology = ""
-        scene_props.fit_phase = stage_key
-        # 曲线阶段：先清掉曲面预览对象，再画线
-        if getattr(self, "_preview_object", None) is not None:
-            # 若上一阶段是 mesh，删掉后重建曲线
-            if getattr(self._preview_object, "type", "") == "MESH":
-                _delete_object(self._preview_object)
-                self._preview_object = None
-        preview = _create_or_update_debug_curve_object(
-            FIT_PREVIEW_NAME,
-            debug,
-            self._object.matrix_world,
-            collection=None,
-            existing=self._preview_object,
-        )
-        controls = _create_or_update_control_point_object(
-            FIT_DEBUG_CTRL_NAME,
-            debug,
-            self._object.matrix_world,
-            collection=None,
-            existing=getattr(self, "_debug_control_object", None),
-        )
-        folds = _create_or_update_concave_fold_object(
-            FIT_DEBUG_FOLD_NAME,
-            debug,
-            self._object.matrix_world,
-            collection=None,
-            existing=getattr(self, "_debug_fold_object", None),
-        )
-        bridges = _create_or_update_bridge_link_object(
-            FIT_BRIDGE_LINK_NAME,
-            debug,
-            self._object.matrix_world,
-            existing=getattr(self, "_bridge_link_object", None),
-        )
-        self._preview_object = preview
-        self._debug_control_object = controls
-        self._debug_fold_object = folds
-        self._bridge_link_object = bridges
-        self._publish_angle_labels(debug)
-        scene_props.fit_status = self._status_text(scene_props)
-        scene_props.fit_status_detail = self._format_debug_detail(debug)
-        _tag_redraw(context)
-        return True
-
-    def _rebuild_debug_edges(self, context: bpy.types.Context) -> bool:
-        """兼容旧名：从选领域进入第 1 步。"""
-        return self._rebuild_stage_preview(context, stage="ISLANDS")
-
-    def advance_stage(self, context: bpy.types.Context) -> bool:
-        """曲线阶段前进；到 BRIDGE 后再进则成面。"""
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        phase = str(scene_props.fit_phase)
-        if phase == "ISLANDS":
-            return self._rebuild_stage_preview(context, stage="STITCH")
-        if phase == "STITCH":
-            return self._rebuild_stage_preview(context, stage="BRIDGE")
-        if phase == "BRIDGE":
-            return self._rebuild_preview(context)
-        return False
-
-    def retreat_stage(self, context: bpy.types.Context) -> bool:
-        """回退一步。"""
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        phase = str(scene_props.fit_phase)
-        if phase == "PREVIEW":
-            self._discard_preview()
-            return self._rebuild_stage_preview(context, stage="BRIDGE")
-        if phase == "BRIDGE":
-            return self._rebuild_stage_preview(context, stage="STITCH")
-        if phase == "STITCH":
-            return self._rebuild_stage_preview(context, stage="ISLANDS")
-        return False
-
-    def advance_to_preview(self, context: bpy.types.Context) -> bool:
-        """任意曲线阶段直接成面。"""
-        return self._rebuild_preview(context)
-
-    def _rebuild_preview(self, context: bpy.types.Context) -> bool:
-        import time as _time
-
-        from ..utils.debug import are_debug, are_debug_clear, debug_log_path
-
-        are_debug_clear()
-        are_debug(f"fit._rebuild_preview begin log={debug_log_path()}")
-        t0 = _time.perf_counter()
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        targets = self._resolve_fit_targets(scene_props)
-        if not targets:
-            return False
-        kwargs = self._stage_kwargs(scene_props)
-        are_debug(
-            f"fit targets={targets} stage={kwargs.get('stage')} "
-            f"faces={len(self._region_ids)}"
-        )
-        try:
-            result = fit_region_surface(
-                region_ids=self._region_ids,
-                target_id=targets if len(targets) > 1 else targets[0],
-                vertices=self._mesh_data["vertices"],
-                loop_start=self._topology_data["loop_start"],
-                loop_total=self._topology_data["loop_total"],
-                loop_vertex_indices=self._topology_data["loop_vertex_indices"],
-                face_normals=self._mesh_data["normals"],
-                face_areas=self._mesh_data["areas"],
-                face_centers=self._mesh_data["face_centers"],
-                segments_u=int(scene_props.fit_segments_u),
-                segments_v=int(scene_props.fit_segments_v),
-                triangle_ratio=float(scene_props.region_fit_triangle_ratio)
-                / 100.0,
-                adjacency_offsets=self._topology_data["adjacency_offsets"],
-                adjacency_indices=self._topology_data["adjacency_indices"],
-                **kwargs,
-            )
-        except RegionFitError as exc:
-            are_debug(f"fit RegionFitError: {exc}", exc=exc)
-            # 拟合失败：撤下旧预览，回到编号选择阶段
-            self._discard_preview()
-            scene_props.fit_phase = "SELECT"
-            scene_props.fit_topology = ""
-            scene_props.fit_status = str(exc)
-            self.report({"ERROR"}, str(exc))
-            _tag_redraw(context)
-            return False
-
-        are_debug(
-            f"fit_region_surface done topo={result.topology} "
-            f"ms={(_time.perf_counter() - t0) * 1000.0:.1f}"
-        )
-        # 曲面预览前清掉 debug 曲线/控制点，避免类型混用
         self._discard_preview()
-        self._topology = result.topology
-        self._last_result = result
-        scene_props.fit_topology = result.topology
-        scene_props.fit_phase = "PREVIEW"
-        preview = _create_or_update_mesh_object(
-            FIT_PREVIEW_NAME,
-            result.vertices,
-            result.faces,
-            self._object.matrix_world,
-            collection=None,
-            existing=None,
-        )
-        preview.hide_select = True
-        preview.display_type = "WIRE"
-        # 预览网格始终显示在扫描面之前，避免被遮挡
-        preview.show_in_front = True
-        self._preview_object = preview
-        scene_props.fit_status = self._status_text(scene_props)
-        if result.warnings:
-            scene_props.fit_status_detail = "；".join(result.warnings)
-        else:
-            scene_props.fit_status_detail = ""
-        _tag_redraw(context)
-        return True
-
-    def _commit_fit(self, context: bpy.types.Context) -> bool:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        if self._preview_object is None or self._last_result is None:
-            self.report({"WARNING"}, "还没有可确认的拟合预览")
-            return False
+        set_fit_angle_label_session(None)
 
         collection = _ensure_fit_collection(context.scene)
-        target = int(scene_props.fit_target_id)
-        final_name = f"Fit_R{target}_{self._topology}"
-        # 断开预览与场景根，改链到拟合面集合
-        preview = self._preview_object
-        for col in list(preview.users_collection):
-            col.objects.unlink(preview)
-        if preview.name not in collection.objects:
-            collection.objects.link(preview)
-        preview.name = final_name
-        if preview.data is not None:
-            preview.data.name = final_name
-        preview.hide_select = False
-        preview.display_type = "TEXTURED"
-        # 拟合面与扫描面重合，保持前置显示避免被埋没
-        preview.show_in_front = True
-        preview["are_fit_source"] = self._object.name
-        preview["are_fit_region_id"] = target
-        preview["are_fit_topology"] = self._topology
+        label = "+".join(str(value) for value in targets)
+        safe_label = label.replace("+", "_")
+        final_name = f"FitContour_R{safe_label}"
+        try:
+            curve_obj = _create_editable_contour_curve(
+                final_name,
+                debug,
+                self._object.matrix_world,
+                collection,
+            )
+        except RegionFitError as exc:
+            scene_props.fit_status = str(exc)
+            self.report({"ERROR"}, str(exc))
+            _tag_redraw(context)
+            return False
+
+        if curve_obj.name != final_name:
+            curve_obj.name = final_name
+        if curve_obj.data is not None and curve_obj.data.name != final_name:
+            curve_obj.data.name = final_name
+
+        curve_obj["are_fit_source"] = self._object.name
+        curve_obj["are_fit_region_id"] = int(targets[0])
+        curve_obj["are_fit_kind"] = FIT_CONTOUR_KIND
+        if len(targets) > 1:
+            curve_obj["are_fit_region_ids"] = ",".join(
+                str(value) for value in targets
+            )
 
         self._preview_object = None
         self._committed = True
+        self._debug_result = debug
+        self._debug_island_count = int(debug.get("island_count", 0))
         scene_props.fit_status = (
-            f"已拟合领域 {target}（{('三边' if self._topology == 'TRI' else '四边')}）"
-            f" → {final_name}"
+            f"已生成领域 {label} 外轮廓曲线 → {curve_obj.name}"
         )
-        scene_props.fit_status_detail = ""
+        scene_props.fit_status_detail = (
+            f"{self._debug_island_count} 条闭合轮廓 · 可直接编辑曲线"
+        )
+        self.report({"INFO"}, scene_props.fit_status)
+        self._finish_mode(context, cancelled=False)
+        self._closed = True
         return True
+
+    def advance_stage(self, context: bpy.types.Context) -> bool:
+        return self._fit_and_commit_contour(context)
+
+    def retreat_stage(self, context: bpy.types.Context) -> bool:
+        return False
+
+    def advance_to_preview(self, context: bpy.types.Context) -> bool:
+        return self._fit_and_commit_contour(context)
 
     def _finish_mode(self, context: bpy.types.Context, cancelled: bool) -> set:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
@@ -1237,35 +975,6 @@ class ARE_OT_fit_region(bpy.types.Operator):
             scene_props.fit_status = "已取消拟合"
         self._cleanup_ui(context)
         return {"CANCELLED"} if cancelled and not self._committed else {"FINISHED"}
-
-    def _adjust_segments(
-        self,
-        context: bpy.types.Context,
-        delta_u: int = 0,
-        delta_v: int = 0,
-    ) -> None:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        if scene_props.fit_phase != "PREVIEW":
-            return
-        self._updating_segments = True
-        try:
-            scene_props.fit_segments_u = int(
-                np.clip(
-                    int(scene_props.fit_segments_u) + delta_u,
-                    MIN_SEGMENTS,
-                    MAX_SEGMENTS,
-                )
-            )
-            scene_props.fit_segments_v = int(
-                np.clip(
-                    int(scene_props.fit_segments_v) + delta_v,
-                    MIN_SEGMENTS,
-                    MAX_SEGMENTS,
-                )
-            )
-        finally:
-            self._updating_segments = False
-        self._rebuild_preview(context)
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -1302,6 +1011,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
         self._preview_object = None
         self._debug_control_object = None
         self._debug_fold_object = None
+        self._bridge_link_object = None
         self._last_result = None
         self._debug_result = None
         self._debug_island_count = 0
@@ -1316,6 +1026,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
         session["preview_version"] = 0
         set_merge_label_session(session)
         register_label_draw_handler()
+        set_fit_angle_label_session(None)
         _set_active_fit_op(self)
 
         scene_props.fit_mode_active = True
@@ -1364,34 +1075,25 @@ class ARE_OT_fit_region(bpy.types.Operator):
 
         if scene_props.fit_confirm_requested and not self._committed:
             scene_props.fit_confirm_requested = False
-            if self._commit_fit(context):
-                self.report({"INFO"}, scene_props.fit_status)
-                return self._finish_mode(context, cancelled=False)
+            if self._fit_and_commit_contour(context):
+                return {"FINISHED"}
             return {"RUNNING_MODAL"}
 
-        # 面板按钮 / 参数滑块通过标志与模态通信（避免侧栏点击被吞）
         if scene_props.fit_advance_requested:
             scene_props.fit_advance_requested = False
-            if self.advance_stage(context):
-                self.report({"INFO"}, scene_props.fit_status)
+            if self._fit_and_commit_contour(context):
+                return {"FINISHED"}
             return {"RUNNING_MODAL"}
         if scene_props.fit_retreat_requested:
             scene_props.fit_retreat_requested = False
-            if self.retreat_stage(context):
-                self.report({"INFO"}, scene_props.fit_status)
             return {"RUNNING_MODAL"}
         if scene_props.fit_preview_requested:
             scene_props.fit_preview_requested = False
-            if self.advance_to_preview(context):
-                self.report({"INFO"}, "已生成拟合曲面预览")
+            if self._fit_and_commit_contour(context):
+                return {"FINISHED"}
             return {"RUNNING_MODAL"}
         if scene_props.fit_stage_rebuild_requested:
             scene_props.fit_stage_rebuild_requested = False
-            phase = str(scene_props.fit_phase)
-            if phase in FIT_CURVE_STAGES:
-                self._rebuild_stage_preview(context, stage=phase)
-            elif phase == "PREVIEW":
-                self._rebuild_preview(context)
             return {"RUNNING_MODAL"}
 
         if event.type == "TIMER":
@@ -1404,42 +1106,12 @@ class ARE_OT_fit_region(bpy.types.Operator):
             return self._finish_mode(context, cancelled=True)
 
         if event.type in {"RET", "NUMPAD_ENTER"} and event.value == "PRESS":
-            if scene_props.fit_phase in FIT_CURVE_STAGES:
-                if self.advance_stage(context):
-                    self.report({"INFO"}, scene_props.fit_status)
-                return {"RUNNING_MODAL"}
-            if scene_props.fit_phase == "PREVIEW":
-                if self._commit_fit(context):
-                    self.report({"INFO"}, scene_props.fit_status)
-                    return self._finish_mode(context, cancelled=False)
+            if self._resolve_fit_targets(scene_props):
+                if self._fit_and_commit_contour(context):
+                    return {"FINISHED"}
+            else:
+                self.report({"INFO"}, "请先点击领域编号")
             return {"RUNNING_MODAL"}
-
-        if event.type == "BACK_SPACE" and event.value == "PRESS":
-            if scene_props.fit_phase in {"STITCH", "BRIDGE", "PREVIEW"}:
-                if self.retreat_stage(context):
-                    self.report({"INFO"}, scene_props.fit_status)
-                return {"RUNNING_MODAL"}
-            return {"RUNNING_MODAL"}
-
-        # 滚轮：第一组（四边 U / 三边长边→存于 V）
-        if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event.value == "PRESS":
-            if scene_props.fit_phase == "PREVIEW":
-                delta = 1 if event.type == "WHEELUPMOUSE" else -1
-                if self._topology == "TRI":
-                    self._adjust_segments(context, delta_v=delta)
-                else:
-                    self._adjust_segments(context, delta_u=delta)
-                return {"RUNNING_MODAL"}
-
-        # PageUp/PageDown：第二组（四边 V / 三边底边→存于 U）
-        if event.type in {"PAGE_UP", "PAGE_DOWN"} and event.value == "PRESS":
-            if scene_props.fit_phase == "PREVIEW":
-                delta = 1 if event.type == "PAGE_UP" else -1
-                if self._topology == "TRI":
-                    self._adjust_segments(context, delta_u=delta)
-                else:
-                    self._adjust_segments(context, delta_v=delta)
-                return {"RUNNING_MODAL"}
 
         if context.space_data is None or context.space_data.type != "VIEW_3D":
             return {"PASS_THROUGH"}
@@ -1471,7 +1143,6 @@ class ARE_OT_fit_region(bpy.types.Operator):
                 LABEL_RADIUS_PX,
             )
             if hit is None:
-                # 未点中编号：放行，让侧栏按钮/滑块能收到点击
                 return {"PASS_THROUGH"}
 
             rid = int(hit)
@@ -1487,19 +1158,19 @@ class ARE_OT_fit_region(bpy.types.Operator):
                         current = [rid]
                 else:
                     current.append(rid)
-            else:
-                current = [rid]
-            self._fit_target_ids = sorted(set(int(value) for value in current))
-            scene_props.fit_target_id = int(rid)
-            scene_props.fit_segments_u = DEFAULT_SEG_U
-            scene_props.fit_segments_v = DEFAULT_SEG_V
-            if self._rebuild_debug_edges(context):
-                label = "+".join(str(value) for value in self._fit_target_ids)
-                self.report(
-                    {"INFO"},
-                    f"已选择领域 {label}：① 各孤岛外围曲线；"
-                    "调参数后 Enter 下一步，Backspace 上一步",
+                self._fit_target_ids = sorted(
+                    set(int(value) for value in current)
                 )
+                scene_props.fit_target_id = int(rid)
+                scene_props.fit_status = self._status_text(scene_props)
+                scene_props.fit_status_detail = ""
+                _tag_redraw(context)
+                return {"RUNNING_MODAL"}
+
+            self._fit_target_ids = [rid]
+            scene_props.fit_target_id = int(rid)
+            if self._fit_and_commit_contour(context):
+                return {"FINISHED"}
             return {"RUNNING_MODAL"}
 
         return {"PASS_THROUGH"}
@@ -1512,4 +1183,5 @@ __all__ = (
     "ARE_OT_build_fit_surface",
     "ARE_OT_confirm_fit_region",
     "FIT_COLLECTION_NAME",
+    "FIT_CONTOUR_KIND",
 )

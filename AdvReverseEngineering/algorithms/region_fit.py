@@ -4139,6 +4139,7 @@ def build_fit_work_items(
     bridge_gap_frac: float = 0.25,
     bridge_enabled: bool = True,
     interior_points: np.ndarray | None = None,
+    skip_weld: bool = False,
 ) -> tuple[list[dict], dict]:
     """
     按拟合阶段生成工作项（points / loop_ids / merged_from）。
@@ -4147,6 +4148,8 @@ def build_fit_work_items(
       ISLANDS — 每岛独立外围闭环
       STITCH  — 仅缝合邻近孤岛
       BRIDGE  — 在缝合基础上桥接更远的孤岛（条带外包络）
+
+    skip_weld: ISLANDS 阶段跳过焊接/收束，保留原始边界点列。
     """
     verts = _as_float_array(vertices)
     valid = [list(int(v) for v in loop) for loop in loops if len(loop) >= 3]
@@ -4175,6 +4178,16 @@ def build_fit_work_items(
 
     stage_key = str(stage).upper()
     if stage_key == "ISLANDS":
+        if skip_weld:
+            items = [
+                {
+                    "points": verts[np.asarray(loop, dtype=np.int32)].copy(),
+                    "loop_ids": loop,
+                    "merged_from": 1,
+                }
+                for loop in valid
+            ]
+            return items, meta
         items = [
             {
                 "points": weld_then_collapse_fit_loop(
@@ -4298,6 +4311,8 @@ def extract_island_longest_sides(
     bridge_enabled: bool = True,
     min_perimeter_frac: float = _MIN_ISLAND_PERIMETER_FRAC,
     interior_points: np.ndarray | None = None,
+    skip_weld: bool = False,
+    emit_angle_labels: bool = True,
 ) -> dict:
     """
     对领域内每个 island 边界环按折角拆成段并拟合。
@@ -4305,6 +4320,8 @@ def extract_island_longest_sides(
     stage 控制多岛策略：ISLANDS / STITCH / BRIDGE。
     每条平滑折线段或曲线段分配独立随机颜色（segment_colors）。
     max_sides 保留兼容，调试拆分不再使用它压边数。
+    skip_weld: 跳过焊接/尖刺收束。
+    emit_angle_labels: 是否收集内角标注。
     """
     _ = max_sides  # 兼容旧调用签名；按折角拆分不压边数
     verts = _as_float_array(vertices)
@@ -4336,6 +4353,7 @@ def extract_island_longest_sides(
         bridge_gap_frac=bridge_gap_frac,
         bridge_enabled=bridge_enabled,
         interior_points=interior_points,
+        skip_weld=skip_weld,
     )
     if not work_items:
         raise RegionFitError("过滤极小碎环后无可用边界")
@@ -4355,16 +4373,17 @@ def extract_island_longest_sides(
             if loop_ids is not None:
                 loop_ids = list(reversed(loop_ids))
 
-        # 焊接过近点并收束超大内角尖刺（所有拟合阶段）
-        collapsed = weld_then_collapse_fit_loop(
-            loop_pts,
-            corner_angle_deg=corner_angle_deg,
-        )
-        if len(collapsed) != len(loop_pts) or not np.allclose(
-            collapsed, loop_pts, atol=1e-9
-        ):
-            loop_pts = collapsed
-            loop_ids = None
+        # 焊接过近点并收束超大内角尖刺（可跳过）
+        if not skip_weld:
+            collapsed = weld_then_collapse_fit_loop(
+                loop_pts,
+                corner_angle_deg=corner_angle_deg,
+            )
+            if len(collapsed) != len(loop_pts) or not np.allclose(
+                collapsed, loop_pts, atol=1e-9
+            ):
+                loop_pts = collapsed
+                loop_ids = None
 
         # 仅原始网格环可做邻域 T 接缝切点；融并外轮廓只靠几何折角
         if loop_ids is not None:
@@ -4387,10 +4406,11 @@ def extract_island_longest_sides(
         )
         loop_rs = resample_closed_polyline(loop_pts, sample_count)
         # 重采样后再焊：阈值受中位邻边限制，不会把整条边抽成折线
-        loop_rs = weld_then_collapse_fit_loop(
-            loop_rs,
-            corner_angle_deg=corner_angle_deg,
-        )
+        if not skip_weld:
+            loop_rs = weld_then_collapse_fit_loop(
+                loop_rs,
+                corner_angle_deg=corner_angle_deg,
+            )
         if len(loop_rs) < 3:
             continue
         sample_count = len(loop_rs)
@@ -4425,12 +4445,15 @@ def extract_island_longest_sides(
             split_indices = [0, half]
 
         # 折角/凹折点强制出度数标注（焊接后的环，不受平直过滤）
-        angle_labels = collect_interior_angle_labels(
-            loop_rs,
-            min_deviation_deg=15.0,
-            normal=normal_guess,
-            force_indices=split_indices,
-        )
+        if emit_angle_labels:
+            angle_labels = collect_interior_angle_labels(
+                loop_rs,
+                min_deviation_deg=15.0,
+                normal=normal_guess,
+                force_indices=split_indices,
+            )
+        else:
+            angle_labels = []
 
         island_folds = [loop_rs[index].copy() for index in fold_indices]
         ordered_splits = sorted(
@@ -4485,7 +4508,11 @@ def extract_island_longest_sides(
             if len(side) >= 2
         ]
         true_longest = float(max(side_lens)) if side_lens else 0.0
-        if true_longest > 0.0 and len(sides_3d) >= 2:
+        if (
+            not skip_weld
+            and true_longest > 0.0
+            and len(sides_3d) >= 2
+        ):
             joined_parts = [
                 _as_float_array(side)[:-1]
                 for side in sides_3d
@@ -4533,12 +4560,15 @@ def extract_island_longest_sides(
                     if len(split_indices) < 2:
                         half = max(sample_count // 2, 1)
                         split_indices = [0, half]
-                    angle_labels = collect_interior_angle_labels(
-                        loop_rs,
-                        min_deviation_deg=15.0,
-                        normal=normal_guess,
-                        force_indices=split_indices,
-                    )
+                    if emit_angle_labels:
+                        angle_labels = collect_interior_angle_labels(
+                            loop_rs,
+                            min_deviation_deg=15.0,
+                            normal=normal_guess,
+                            force_indices=split_indices,
+                        )
+                    else:
+                        angle_labels = []
                     island_folds = [
                         loop_rs[index].copy() for index in fold_indices
                     ]
@@ -4800,7 +4830,9 @@ def extract_island_longest_sides(
             if concave_fold_points
             else np.zeros((0, 3), dtype=np.float64)
         ),
-        "interior_angle_labels": interior_angle_labels,
+        "interior_angle_labels": (
+            [] if not emit_angle_labels else interior_angle_labels
+        ),
         "bevel_depth": bevel_depth,
         "control_radius": control_radius,
         "fold_radius": fold_radius,
