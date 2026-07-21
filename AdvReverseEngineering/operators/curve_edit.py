@@ -25,6 +25,7 @@ from ..algorithms.curve_edit import (
     segment_colors_for_count,
     snap_bezier_endpoints,
     split_polyline_at_breaks,
+    stitch_oriented_loop_polylines,
     transform_bezier_points,
     weld_bezier_loop_endpoints,
 )
@@ -845,7 +846,8 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
     bl_label = "拟合曲线"
     bl_description = (
         "将选中曲线转为贝塞尔；四条闭合对边时：Ctrl/Shift 滚轮分别调两组控制点数，"
-        "相似模式对边两两相似（保持环向首尾），对边同色预览"
+        "相似模式对边两两相似（保持环向首尾），对边同色预览；"
+        "缝合开口(V)沿切向延伸端点至交点封闭缺口"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -859,13 +861,17 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         na = int(getattr(self, "_controls_a", DEFAULT_BEZIER_CONTROLS))
         nb = int(getattr(self, "_controls_b", DEFAULT_BEZIER_CONTROLS))
         similar = bool(getattr(self, "_similar", False))
+        stitch = bool(getattr(self, "_stitch_open", False))
         mode = "开" if similar else "关"
+        stitch_s = "开" if stitch else "关"
         quad = bool(getattr(self, "_quad_loop_active", False))
         if quad:
             extra = " · 对边两两相似·封闭" if similar else " · 四边形对边封闭"
+            if stitch:
+                extra += " · 已缝合开口"
             text = (
-                f"拟合曲线：组A {na} · 组B {nb} · 相似 {mode}{extra} · "
-                "Ctrl滚轮调A · Shift滚轮调B · S 切换相似 · Enter 确认 · Esc 取消"
+                f"拟合曲线：组A {na} · 组B {nb} · 相似 {mode} · 缝合 {stitch_s}"
+                f"{extra} · Ctrl滚轮A · Shift滚轮B · S相似 · V缝合 · Enter确认"
             )
         else:
             text = (
@@ -927,9 +933,14 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         四条开环端点近乎闭合时：识别对边；相似则对边两两相似；焊接端点。
 
         相似变换严格保持环向首尾对应（禁止反向对齐），避免对边扭曲。
+        缝合开口：沿切向延伸缺口两端至交点后再拟合。
         """
         polylines = [source["points"] for _obj, source in edges]
-        ordered = order_open_curves_as_closed_loop(polylines)
+        stitch = bool(getattr(self, "_stitch_open", False))
+        ordered = order_open_curves_as_closed_loop(
+            polylines,
+            allow_large_gaps=stitch,
+        )
         if ordered is None:
             return False
         order, flipped, _gap = ordered
@@ -940,6 +951,18 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             if reverse:
                 pts = pts[::-1].copy()
             loop_items.append((obj, pts))
+
+        if stitch:
+            stitched_pts, stitch_count = stitch_oriented_loop_polylines(
+                [pts for _obj, pts in loop_items]
+            )
+            self._stitch_count = int(stitch_count)
+            loop_items = [
+                (loop_items[i][0], stitched_pts[i])
+                for i in range(len(loop_items))
+            ]
+        else:
+            self._stitch_count = 0
 
         counts = [
             self._clamp_controls(self._controls_a),
@@ -996,6 +1019,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             obj["are_fit_quad_loop"] = True
             obj["are_fit_opposite_pair"] = int(pair_id)
             obj["are_fit_similar"] = bool(similar)
+            obj["are_fit_stitch_open"] = bool(stitch)
             if similar:
                 obj["are_fit_similar_group"] = group_id
             self._preview_payload.append((obj, fitted, False, pair_id))
@@ -1126,6 +1150,8 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 similar = "对边两两相似·封闭"
             else:
                 similar = "四边形封闭"
+            if self._stitch_open:
+                similar += f"·缝合{int(getattr(self, '_stitch_count', 0))}处"
             scene_props.curve_fit_status = (
                 f"已拟合为贝塞尔（组A={na} 组B={nb}，{similar}）"
             )
@@ -1205,6 +1231,10 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         )
         self._controls = self._controls_a
         self._similar = bool(getattr(scene_props, "curve_fit_similar", False))
+        self._stitch_open = bool(
+            getattr(scene_props, "curve_fit_stitch_open", False)
+        )
+        self._stitch_count = 0
         self._committed = False
         self._preview_payload = []
         self._quad_loop_active = False
@@ -1213,6 +1243,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         scene_props.curve_fit_controls = self._controls_a
         scene_props.curve_fit_controls_b = self._controls_b
         scene_props.curve_fit_similar = self._similar
+        scene_props.curve_fit_stitch_open = self._stitch_open
         clear_curve_split_preview()
         register_curve_tool_hud()
         try:
@@ -1266,6 +1297,15 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 self.report({"ERROR"}, str(exc))
             return {"RUNNING_MODAL"}
 
+        if event.type == "V" and event.value == "PRESS" and not event.ctrl:
+            self._stitch_open = not self._stitch_open
+            scene_props.curve_fit_stitch_open = self._stitch_open
+            try:
+                self._rebuild_preview(context)
+            except RegionFitError as exc:
+                self.report({"ERROR"}, str(exc))
+            return {"RUNNING_MODAL"}
+
         if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
             delta = 1 if event.type == "WHEELUPMOUSE" else -1
             # Shift（无 Ctrl）：调组 B；Ctrl：调组 A（非四边形时即统一点数）
@@ -1294,15 +1334,20 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             getattr(scene_props, "curve_fit_controls_b", self._controls_b)
         )
         panel_sim = bool(getattr(scene_props, "curve_fit_similar", self._similar))
+        panel_stitch = bool(
+            getattr(scene_props, "curve_fit_stitch_open", self._stitch_open)
+        )
         if (
             panel_a != self._controls_a
             or panel_b != self._controls_b
             or panel_sim != self._similar
+            or panel_stitch != self._stitch_open
         ):
             self._controls_a = panel_a
             self._controls_b = panel_b
             self._controls = self._controls_a
             self._similar = panel_sim
+            self._stitch_open = panel_stitch
             try:
                 self._rebuild_preview(context)
             except RegionFitError as exc:

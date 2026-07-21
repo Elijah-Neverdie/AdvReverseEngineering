@@ -474,10 +474,16 @@ class ARE_PT_main(bpy.types.Panel):
                     "curve_fit_controls_b",
                     text="控制点数B",
                 )
-                tip.prop(
+                mode_row = tip.row(align=True)
+                mode_row.prop(
                     scene_props,
                     "curve_fit_similar",
                     text="相似模式",
+                )
+                mode_row.prop(
+                    scene_props,
+                    "curve_fit_stitch_open",
+                    text="缝合开口",
                 )
                 if scene_props.curve_fit_status:
                     tip.label(text=scene_props.curve_fit_status)
@@ -497,8 +503,9 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box = tip.box()
                     help_box.label(text="1. 选中曲线后点「拟合曲线」")
                     help_box.label(text="2. Ctrl+滚轮调组A点数；Shift+滚轮调组B")
-                    help_box.label(text="3. 按 S 切换相似模式（多选时）")
+                    help_box.label(text="3. 按 S 切换相似；按 V 切换缝合开口")
                     help_box.label(text="四条端点近闭合：对边同色，相似=对边两两")
+                    help_box.label(text="缝合开口：切向延伸缺口两端至交点封闭")
                     help_box.label(text="相似变换保持环向首尾，避免对边扭曲")
                     help_box.label(text="曲线写入「拟合曲线」集合")
                     help_box.label(text="选 3/4 条后点「合成区面」→「拟合曲面」")

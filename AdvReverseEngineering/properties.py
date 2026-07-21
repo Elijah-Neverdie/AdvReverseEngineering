@@ -740,6 +740,14 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         description="多条曲线视为相似形状；四边形时对边两两相似（保持环向首尾）",
         default=False,
     )
+    curve_fit_stitch_open: BoolProperty(
+        name="缝合开口",
+        description=(
+            "四条曲线有缺口时，沿两端贝塞尔/折线切向延伸至交点封闭；"
+            "拟合中按 V 切换"
+        ),
+        default=False,
+    )
     curve_fit_status: StringProperty(
         name="拟合曲线状态",
         default="",

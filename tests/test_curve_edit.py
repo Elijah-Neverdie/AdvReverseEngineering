@@ -20,6 +20,7 @@ from AdvReverseEngineering.algorithms.curve_edit import (
     sample_polyline_uniform,
     snap_bezier_endpoints,
     split_polyline_at_breaks,
+    stitch_oriented_loop_polylines,
     transform_bezier_points,
     turn_angles_deg,
     weld_bezier_loop_endpoints,
@@ -192,6 +193,39 @@ class CurveEditTests(unittest.TestCase):
         self.assertEqual(kind, "TRI")
         self.assertGreater(len(verts), 0)
         self.assertGreater(len(faces), 0)
+
+    def test_stitch_open_corner_gap(self) -> None:
+        """一角有缺口时，切向延伸应汇合到近似直角交点。"""
+        bottom = np.linspace([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 10)
+        right = np.linspace([1.0, 0.0, 0.0], [1.0, 1.0, 0.0], 10)
+        top = np.linspace([1.0, 1.0, 0.0], [0.0, 1.0, 0.0], 10)
+        # 左边不到底：止于 (0, 0.15)，与 bottom 起点形成开口
+        left = np.linspace([0.0, 1.0, 0.0], [0.0, 0.15, 0.0], 10)
+        # 同时 bottom 起点改到 (0.12, 0)，两游离端点不相邻
+        bottom = np.linspace([0.12, 0.0, 0.0], [1.0, 0.0, 0.0], 10)
+        loop = [bottom, right, top, left]
+        # 无缝合时最大间隙应明显
+        gap0 = float(np.linalg.norm(loop[3][-1] - loop[0][0]))
+        self.assertGreater(gap0, 0.1)
+        stitched, count = stitch_oriented_loop_polylines(loop)
+        self.assertGreaterEqual(count, 1)
+        gap1 = float(np.linalg.norm(stitched[3][-1] - stitched[0][0]))
+        self.assertLess(gap1, 1e-6)
+        # 交点应接近原点
+        hit = stitched[0][0]
+        self.assertLess(float(np.linalg.norm(hit - np.array([0.0, 0.0, 0.0]))), 0.05)
+
+    def test_order_allows_large_gaps_when_requested(self) -> None:
+        bottom = np.linspace([0.3, 0.0, 0.0], [1.0, 0.0, 0.0], 8)
+        right = np.linspace([1.0, 0.0, 0.0], [1.0, 1.0, 0.0], 8)
+        top = np.linspace([1.0, 1.0, 0.0], [0.0, 1.0, 0.0], 8)
+        left = np.linspace([0.0, 1.0, 0.0], [0.0, 0.3, 0.0], 8)
+        self.assertIsNone(order_open_curves_as_closed_loop([bottom, right, top, left]))
+        ordered = order_open_curves_as_closed_loop(
+            [bottom, right, top, left],
+            allow_large_gaps=True,
+        )
+        self.assertIsNotNone(ordered)
 
 
 if __name__ == "__main__":

@@ -282,12 +282,15 @@ def best_open_alignment(
 def order_open_curves_as_closed_loop(
     polylines: Sequence[np.ndarray],
     max_gap_frac: float = 0.08,
+    *,
+    allow_large_gaps: bool = False,
 ) -> tuple[list[int], list[bool], float] | None:
     """
     将开环折线排成闭合环（端点近乎相接）。
 
     返回 (顺序下标, 是否反向, 最大接缝距离)；无法成环则 None。
     支持 3 或 4 条（三边/四边合成区面）。
+    allow_large_gaps=True 时忽略间隙上限（供「缝合开口」先成环再延伸）。
     """
     curves = [_as_float_array(p) for p in polylines]
     count = len(curves)
@@ -299,6 +302,8 @@ def order_open_curves_as_closed_loop(
     lengths = [float(polyline_length(p)) for p in curves]
     ref_len = float(max(sum(lengths) / len(lengths), 1e-6))
     max_gap = ref_len * float(max(max_gap_frac, 1e-4))
+    if allow_large_gaps:
+        max_gap = float("inf")
 
     ends = [(p[0].copy(), p[-1].copy()) for p in curves]
     used = [False] * count
@@ -349,6 +354,109 @@ def opposite_edge_pairs(count: int = 4) -> list[tuple[int, int]]:
     if int(count) != 4:
         return []
     return [(0, 2), (1, 3)]
+
+
+def closest_points_on_rays(
+    origin_a: np.ndarray,
+    dir_a: np.ndarray,
+    origin_b: np.ndarray,
+    dir_b: np.ndarray,
+) -> tuple[np.ndarray, float, float] | None:
+    """
+    两条射线（半直线）的最近点对中点。
+
+    要求参数 ta>=0、tb>=0（向外延伸）。返回 (交点近似, ta, tb)；失败 None。
+    """
+    p1 = _as_float_array(origin_a).reshape(3)
+    p2 = _as_float_array(origin_b).reshape(3)
+    d1 = _as_float_array(dir_a).reshape(3)
+    d2 = _as_float_array(dir_b).reshape(3)
+    n1 = float(np.linalg.norm(d1))
+    n2 = float(np.linalg.norm(d2))
+    if n1 < 1e-12 or n2 < 1e-12:
+        return None
+    d1 = d1 / n1
+    d2 = d2 / n2
+    r = p1 - p2
+    a = float(np.dot(d1, d1))
+    b = float(np.dot(d1, d2))
+    c = float(np.dot(d2, d2))
+    d = float(np.dot(d1, r))
+    e = float(np.dot(d2, r))
+    denom = a * c - b * b
+    if abs(denom) < 1e-14:
+        # 近似平行：取中点投影
+        ta = 0.0
+        tb = float(np.dot(p1 - p2, d2))
+        if tb < 0.0:
+            return None
+        qa = p1
+        qb = p2 + tb * d2
+        return 0.5 * (qa + qb), ta, tb
+    ta = (b * e - c * d) / denom
+    tb = (a * e - b * d) / denom
+    if ta < -1e-6 or tb < -1e-6:
+        return None
+    ta = max(ta, 0.0)
+    tb = max(tb, 0.0)
+    qa = p1 + ta * d1
+    qb = p2 + tb * d2
+    return 0.5 * (qa + qb), ta, tb
+
+
+def stitch_oriented_loop_polylines(
+    loop_sides: Sequence[np.ndarray],
+    *,
+    gap_frac: float = 0.015,
+    max_extend_frac: float = 3.0,
+) -> tuple[list[np.ndarray], int]:
+    """
+    环向折线缝合开口：对间隙过大的接缝，沿两端切向延伸至交点。
+
+    返回 (新折线列表, 缝合接缝数)。
+    """
+    sides = [_as_float_array(s).copy() for s in loop_sides]
+    n = len(sides)
+    if n < 2:
+        return sides, 0
+    lengths = [float(max(polyline_length(s), 1e-6)) for s in sides]
+    mean_len = float(sum(lengths) / n)
+    gap_tol = mean_len * float(max(gap_frac, 1e-5))
+    max_extend = mean_len * float(max(max_extend_frac, 0.1))
+    stitched = 0
+
+    for index in range(n):
+        a = sides[index]
+        b = sides[(index + 1) % n]
+        if len(a) < 2 or len(b) < 2:
+            continue
+        end_a = a[-1]
+        start_b = b[0]
+        gap = float(np.linalg.norm(end_a - start_b))
+        if gap <= gap_tol:
+            continue
+        dir_a = end_a - a[-2]
+        dir_b = start_b - b[1]  # 向环外延伸（与 b 行进反向）
+        hit = closest_points_on_rays(end_a, dir_a, start_b, dir_b)
+        if hit is None:
+            continue
+        point, ta, tb = hit
+        if ta > max_extend or tb > max_extend:
+            continue
+        # 延伸：在端点外侧追加交点（已在端点则仅钉齐）
+        if ta > 1e-8:
+            sides[index] = np.vstack((a, point.reshape(1, 3)))
+        else:
+            sides[index] = a.copy()
+            sides[index][-1] = point
+        if tb > 1e-8:
+            sides[(index + 1) % n] = np.vstack((point.reshape(1, 3), b))
+        else:
+            sides[(index + 1) % n] = b.copy()
+            sides[(index + 1) % n][0] = point
+        stitched += 1
+
+    return sides, stitched
 
 
 def sample_bezier_anchor_chain(
@@ -655,6 +763,7 @@ __all__ = (
     "apply_similarity",
     "best_closed_alignment",
     "best_open_alignment",
+    "closest_points_on_rays",
     "compose_patch_from_boundary_polylines",
     "estimate_open_directed_similarity",
     "estimate_similarity_transform",
@@ -672,6 +781,7 @@ __all__ = (
     "segment_colors_for_count",
     "snap_bezier_endpoints",
     "split_polyline_at_breaks",
+    "stitch_oriented_loop_polylines",
     "transform_bezier_points",
     "turn_angles_deg",
     "weld_bezier_loop_endpoints",
