@@ -1321,45 +1321,20 @@ def estimate_longest_fit_side_length(
     )
 
 
-def _closed_arc_length(
-    points: np.ndarray,
-    start: int,
-    end: int,
-    *,
-    forward: bool,
-) -> float:
-    """闭环上从 start 走到 end 的弧长（forward 沿下标增大方向）。"""
-    pts = _as_float_array(points)
-    count = len(pts)
-    if count < 2:
-        return 0.0
-    total = 0.0
-    cursor = int(start) % count
-    target = int(end) % count
-    step = 1 if forward else -1
-    for _ in range(count):
-        if cursor == target and total > 0.0:
-            break
-        nxt = (cursor + step) % count
-        total += float(np.linalg.norm(pts[nxt] - pts[cursor]))
-        cursor = nxt
-        if cursor == target:
-            break
-    return total
-
-
 def weld_close_points_closed_loop(
     points: np.ndarray,
     min_distance: float,
     *,
     min_points: int = 3,
+    max_index_span: int = 16,
+    max_spatial_passes: int = 24,
 ) -> np.ndarray:
     """
     将闭环上过近的点焊接为一点。
 
     1) 相邻点距 < 阈值：焊成中点（消除密采样拐角簇）
-    2) 非相邻但欧氏距离 < 阈值、且较短弧弧长也 < 2×阈值：
-       收掉短弧（发夹两侧贴得很近时也能焊上）
+    2) 下标跨度 ≤ max_index_span 的近点：收掉短弧（发夹肩）
+       ——只用局部窗口，避免全对扫描 O(n²)~O(n⁴) 卡死大环。
     """
     pts = _as_float_array(points).copy()
     if len(pts) < int(min_points):
@@ -1374,6 +1349,8 @@ def weld_close_points_closed_loop(
         return pts
 
     floor = int(max(min_points, 3))
+    span_limit = int(max(max_index_span, 2))
+    pass_limit = int(max(max_spatial_passes, 1))
 
     def _consecutive_weld(values: np.ndarray) -> np.ndarray:
         work = values
@@ -1406,65 +1383,57 @@ def weld_close_points_closed_loop(
 
     pts = _consecutive_weld(pts)
 
-    # 空间短弧焊接：仅当弦长与较短弧都足够短，避免把细长走廊整段吸扁
+    # 局部短弧焊接：只扫 i..i+span，复杂度 O(n·span·passes)
     max_arc = min_d * 2.0
-    for _ in range(len(pts) + 2):
+    for _ in range(pass_limit):
         count = len(pts)
         if count <= floor:
             break
-        best: tuple[float, int, int, bool] | None = None
+        best: tuple[float, int, int] | None = None
+        span = min(span_limit, count - 2)
+        if span < 2:
+            break
         for i in range(count):
-            for j in range(i + 1, count):
+            for step in range(2, span + 1):
+                j = (i + step) % count
                 chord = float(np.linalg.norm(pts[i] - pts[j]))
                 if chord >= min_d or chord < 1e-15:
                     continue
-                forward_steps = j - i
-                backward_steps = count - forward_steps
-                if forward_steps <= 1 and backward_steps <= 1:
-                    continue
-                use_forward = forward_steps <= backward_steps
-                if use_forward and forward_steps <= 1:
-                    use_forward = False
-                if (not use_forward) and backward_steps <= 1:
-                    use_forward = True
-                arc_len = _closed_arc_length(
-                    pts, i, j, forward=use_forward
-                )
+                # 短弧即下标前进 step 步
+                arc_len = 0.0
+                cursor = i
+                for _s in range(step):
+                    nxt = (cursor + 1) % count
+                    arc_len += float(np.linalg.norm(pts[nxt] - pts[cursor]))
+                    cursor = nxt
+                    if arc_len > max_arc:
+                        break
                 if arc_len > max_arc or arc_len < 1e-15:
                     continue
                 score = chord + arc_len * 0.01
                 if best is None or score < best[0]:
-                    best = (score, i, j, use_forward)
+                    best = (score, i, j)
         if best is None:
             break
-        _score, i, j, use_forward = best
-        if use_forward:
-            start, end = i, j
+        _score, i, j = best
+        if j < i:
+            # 环绕：从 i 前进到 j
+            arc_indices = list(range(i, count)) + list(range(0, j + 1))
         else:
-            start, end = j, i
-        # 收集短弧下标（含两端），焊成质心
-        arc_indices: list[int] = [start]
-        cursor = start
-        while cursor != end:
-            cursor = (cursor + 1) % count
-            arc_indices.append(cursor)
-            if len(arc_indices) > count:
-                break
+            arc_indices = list(range(i, j + 1))
         if len(arc_indices) < 2:
             break
         centroid = np.mean(pts[np.asarray(arc_indices, dtype=np.int32)], axis=0)
         remove = set(arc_indices)
         keep_pts: list[np.ndarray] = []
-        inserted = False
         for index in range(count):
-            if index == start:
+            if index == i:
                 keep_pts.append(centroid.copy())
-                inserted = True
                 continue
             if index in remove:
                 continue
             keep_pts.append(pts[index].copy())
-        if not inserted or len(keep_pts) < floor:
+        if len(keep_pts) < floor:
             break
         pts = np.asarray(keep_pts, dtype=np.float64)
         pts = _consecutive_weld(pts)
@@ -1485,19 +1454,35 @@ def weld_then_collapse_fit_loop(
     焊接阈值 = 最长拟合边弧长 × weld_frac（默认 5%）。
     先收束可避免焊接抹平圆滑尖端后漏检；焊后再收束处理焊接形成的新尖刺。
     """
+    from ..utils.debug import are_debug
+    import time as _time
+
     pts = _as_float_array(points)
     if len(pts) < 3:
         return pts.copy()
+    t0 = _time.perf_counter()
+    n0 = len(pts)
     pts = collapse_ultra_reflex_spike_vertices_closed_loop(pts)
+    t1 = _time.perf_counter()
     longest = (
         float(longest_side_length)
         if longest_side_length is not None and float(longest_side_length) > 0.0
         else estimate_longest_fit_side_length(pts, corner_angle_deg)
     )
     min_dist = max(float(longest) * float(max(weld_frac, 0.0)), 0.0)
+    n1 = len(pts)
     if min_dist > 0.0:
         pts = weld_close_points_closed_loop(pts, min_dist)
-    return collapse_ultra_reflex_spike_vertices_closed_loop(pts)
+    t2 = _time.perf_counter()
+    pts = collapse_ultra_reflex_spike_vertices_closed_loop(pts)
+    are_debug(
+        f"weld_then_collapse n={n0}->{n1}->{len(pts)} "
+        f"longest={longest:.4g} min_d={min_dist:.4g} "
+        f"collapse1_ms={(t1 - t0) * 1000.0:.1f} "
+        f"weld_ms={(t2 - t1) * 1000.0:.1f} "
+        f"collapse2_ms={(_time.perf_counter() - t2) * 1000.0:.1f}"
+    )
+    return pts
 
 
 def collect_interior_angle_labels(

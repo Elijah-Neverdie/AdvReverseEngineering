@@ -1118,11 +1118,22 @@ class ARE_OT_fit_region(bpy.types.Operator):
         return self._rebuild_preview(context)
 
     def _rebuild_preview(self, context: bpy.types.Context) -> bool:
+        import time as _time
+
+        from ..utils.debug import are_debug, are_debug_clear, debug_log_path
+
+        are_debug_clear()
+        are_debug(f"fit._rebuild_preview begin log={debug_log_path()}")
+        t0 = _time.perf_counter()
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         targets = self._resolve_fit_targets(scene_props)
         if not targets:
             return False
         kwargs = self._stage_kwargs(scene_props)
+        are_debug(
+            f"fit targets={targets} stage={kwargs.get('stage')} "
+            f"faces={len(self._region_ids)}"
+        )
         try:
             result = fit_region_surface(
                 region_ids=self._region_ids,
@@ -1143,6 +1154,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
                 **kwargs,
             )
         except RegionFitError as exc:
+            are_debug(f"fit RegionFitError: {exc}", exc=exc)
             # 拟合失败：撤下旧预览，回到编号选择阶段
             self._discard_preview()
             scene_props.fit_phase = "SELECT"
@@ -1152,6 +1164,10 @@ class ARE_OT_fit_region(bpy.types.Operator):
             _tag_redraw(context)
             return False
 
+        are_debug(
+            f"fit_region_surface done topo={result.topology} "
+            f"ms={(_time.perf_counter() - t0) * 1000.0:.1f}"
+        )
         # 曲面预览前清掉 debug 曲线/控制点，避免类型混用
         self._discard_preview()
         self._topology = result.topology
