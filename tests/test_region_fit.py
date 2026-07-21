@@ -1451,6 +1451,38 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertLess(len(cleaned), len(spiked))
         self.assertLess(float(cleaned[:, 1].max()), 1.05)
 
+    def test_weld_spatial_close_hairpin_shoulders(self) -> None:
+        """发夹两侧肩点空间很近但非相邻，也应按最长边 5% 焊掉短弧。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            estimate_longest_fit_side_length,
+            weld_close_points_closed_loop,
+        )
+
+        # 4×2 矩形，底边中部极矮发夹；两肩间距 0.04，尖端高 0.08
+        loop = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.98, 0.0, 0.0],
+                [1.99, 0.08, 0.0],
+                [2.02, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 2.0, 0.0],
+                [0.0, 2.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        longest = estimate_longest_fit_side_length(loop, corner_angle_deg=35.0)
+        min_dist = longest * 0.05
+        self.assertGreater(min_dist, 0.04)
+        welded = weld_close_points_closed_loop(loop, min_dist)
+        self.assertLess(len(welded), len(loop))
+        # 发夹尖端应被焊掉；矩形顶边 y=2 仍保留
+        tip_left = welded[
+            (welded[:, 1] > 0.03) & (welded[:, 1] < 0.5)
+        ]
+        self.assertEqual(len(tip_left), 0)
+        self.assertGreater(float(welded[:, 1].max()), 1.5)
+
     def test_stitch_bridges_reentrant_notch_to_continuous_rim(self) -> None:
         """缝合后内阴角应被切除，外轮廓不再钻进 V 形凹口。"""
         from AdvReverseEngineering.algorithms.region_fit import (

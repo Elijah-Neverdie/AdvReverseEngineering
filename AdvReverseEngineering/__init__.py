@@ -20,7 +20,7 @@ from __future__ import annotations
 bl_info = {
     "name": "AdvReverseEngineering",
     "author": "AdvReverseEngineering Team",
-    "version": (0, 6, 78),
+    "version": (0, 6, 79),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > 逆向工具",
     "description": (

@@ -1274,9 +1274,10 @@ def estimate_longest_fit_side_length(
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE_DEG,
 ) -> float:
     """
-    估计当前拟合曲线最长边弧长（折角拆段后各边的最大长度）。
+    估计当前拟合曲线最长边弧长，作为焊接阈值参考。
 
-    折角不足时退回周长四分之一与包围盒对角线的较大值。
+    用较粗的折角拆段（避免密锯齿把长边切碎），并与包围盒对角线/
+    周长比例取最大，使阈值贴近用户看到的「领域最长边」。
     """
     pts = _as_float_array(points)
     if len(pts) < 3:
@@ -1293,25 +1294,58 @@ def estimate_longest_fit_side_length(
         work = pts[::-1].copy()
         pts2 = pts2[::-1].copy()
 
-    corners = detect_corner_indices(
-        pts2,
-        corner_angle_deg,
-        max_corners=_MAX_SPLIT_CORNERS,
-        convex_only=False,
-        include_strong_concave=True,
-    )
-    if len(corners) >= 2:
-        sides = split_loop_into_sides(work, corners)
-        lengths = [polyline_length(side) for side in sides]
-        if lengths:
-            return float(max(lengths))
-
     edge_lengths = np.linalg.norm(
         np.roll(work, -1, axis=0) - work, axis=1
     )
     perimeter = float(np.sum(edge_lengths))
     extent = float(np.linalg.norm(work.max(axis=0) - work.min(axis=0)))
-    return float(max(perimeter * 0.25, extent, 1e-6))
+
+    # 粗折角：少切段，最长边才接近视口里那条长边界
+    coarse_angle = float(max(corner_angle_deg, 50.0))
+    corners = detect_corner_indices(
+        pts2,
+        coarse_angle,
+        max_corners=12,
+        convex_only=False,
+        include_strong_concave=True,
+    )
+    longest = 0.0
+    if len(corners) >= 2:
+        sides = split_loop_into_sides(work, corners)
+        lengths = [polyline_length(side) for side in sides]
+        if lengths:
+            longest = float(max(lengths))
+
+    return float(
+        max(longest, extent * 0.5, perimeter * 0.15, 1e-6)
+    )
+
+
+def _closed_arc_length(
+    points: np.ndarray,
+    start: int,
+    end: int,
+    *,
+    forward: bool,
+) -> float:
+    """闭环上从 start 走到 end 的弧长（forward 沿下标增大方向）。"""
+    pts = _as_float_array(points)
+    count = len(pts)
+    if count < 2:
+        return 0.0
+    total = 0.0
+    cursor = int(start) % count
+    target = int(end) % count
+    step = 1 if forward else -1
+    for _ in range(count):
+        if cursor == target and total > 0.0:
+            break
+        nxt = (cursor + step) % count
+        total += float(np.linalg.norm(pts[nxt] - pts[cursor]))
+        cursor = nxt
+        if cursor == target:
+            break
+    return total
 
 
 def weld_close_points_closed_loop(
@@ -1321,9 +1355,11 @@ def weld_close_points_closed_loop(
     min_points: int = 3,
 ) -> np.ndarray:
     """
-    将闭环折线上间距小于阈值的相邻点焊接为一点（取中点）。
+    将闭环上过近的点焊接为一点。
 
-    用于消除密采样在同一拐角簇出的多重折点，再算内角/收束。
+    1) 相邻点距 < 阈值：焊成中点（消除密采样拐角簇）
+    2) 非相邻但欧氏距离 < 阈值、且较短弧弧长也 < 2×阈值：
+       收掉短弧（发夹两侧贴得很近时也能焊上）
     """
     pts = _as_float_array(points).copy()
     if len(pts) < int(min_points):
@@ -1338,31 +1374,101 @@ def weld_close_points_closed_loop(
         return pts
 
     floor = int(max(min_points, 3))
+
+    def _consecutive_weld(values: np.ndarray) -> np.ndarray:
+        work = values
+        for _ in range(len(work) + 2):
+            count = len(work)
+            if count <= floor:
+                break
+            keep: list[np.ndarray] = [work[0].copy()]
+            merged = False
+            for index in range(1, count):
+                cur = work[index]
+                if float(np.linalg.norm(cur - keep[-1])) >= min_d:
+                    keep.append(cur.copy())
+                else:
+                    keep[-1] = 0.5 * (keep[-1] + cur)
+                    merged = True
+            if (
+                len(keep) > floor
+                and float(np.linalg.norm(keep[0] - keep[-1])) < min_d
+            ):
+                keep[0] = 0.5 * (keep[0] + keep[-1])
+                keep.pop()
+                merged = True
+            if len(keep) < floor:
+                break
+            work = np.asarray(keep, dtype=np.float64)
+            if not merged:
+                break
+        return work
+
+    pts = _consecutive_weld(pts)
+
+    # 空间短弧焊接：仅当弦长与较短弧都足够短，避免把细长走廊整段吸扁
+    max_arc = min_d * 2.0
     for _ in range(len(pts) + 2):
         count = len(pts)
         if count <= floor:
             break
-        keep: list[np.ndarray] = [pts[0].copy()]
-        merged = False
-        for index in range(1, count):
-            cur = pts[index]
-            if float(np.linalg.norm(cur - keep[-1])) >= min_d:
-                keep.append(cur.copy())
-            else:
-                keep[-1] = 0.5 * (keep[-1] + cur)
-                merged = True
-        if (
-            len(keep) > floor
-            and float(np.linalg.norm(keep[0] - keep[-1])) < min_d
-        ):
-            keep[0] = 0.5 * (keep[0] + keep[-1])
-            keep.pop()
-            merged = True
-        if len(keep) < floor:
+        best: tuple[float, int, int, bool] | None = None
+        for i in range(count):
+            for j in range(i + 1, count):
+                chord = float(np.linalg.norm(pts[i] - pts[j]))
+                if chord >= min_d or chord < 1e-15:
+                    continue
+                forward_steps = j - i
+                backward_steps = count - forward_steps
+                if forward_steps <= 1 and backward_steps <= 1:
+                    continue
+                use_forward = forward_steps <= backward_steps
+                if use_forward and forward_steps <= 1:
+                    use_forward = False
+                if (not use_forward) and backward_steps <= 1:
+                    use_forward = True
+                arc_len = _closed_arc_length(
+                    pts, i, j, forward=use_forward
+                )
+                if arc_len > max_arc or arc_len < 1e-15:
+                    continue
+                score = chord + arc_len * 0.01
+                if best is None or score < best[0]:
+                    best = (score, i, j, use_forward)
+        if best is None:
             break
-        pts = np.asarray(keep, dtype=np.float64)
-        if not merged:
+        _score, i, j, use_forward = best
+        if use_forward:
+            start, end = i, j
+        else:
+            start, end = j, i
+        # 收集短弧下标（含两端），焊成质心
+        arc_indices: list[int] = [start]
+        cursor = start
+        while cursor != end:
+            cursor = (cursor + 1) % count
+            arc_indices.append(cursor)
+            if len(arc_indices) > count:
+                break
+        if len(arc_indices) < 2:
             break
+        centroid = np.mean(pts[np.asarray(arc_indices, dtype=np.int32)], axis=0)
+        remove = set(arc_indices)
+        keep_pts: list[np.ndarray] = []
+        inserted = False
+        for index in range(count):
+            if index == start:
+                keep_pts.append(centroid.copy())
+                inserted = True
+                continue
+            if index in remove:
+                continue
+            keep_pts.append(pts[index].copy())
+        if not inserted or len(keep_pts) < floor:
+            break
+        pts = np.asarray(keep_pts, dtype=np.float64)
+        pts = _consecutive_weld(pts)
+
     return pts
 
 
@@ -4198,6 +4304,88 @@ def extract_island_longest_sides(
                 max_dist=max(loop_len * 0.01, 1e-4),
             )
             sides_3d = share_closed_side_endpoints(sides_3d)
+
+        # 用拆段后的真实最长边再焊一次，避免估计偏小导致框内近点漏焊
+        side_lens = [
+            polyline_length(side)
+            for side in sides_3d
+            if len(side) >= 2
+        ]
+        true_longest = float(max(side_lens)) if side_lens else 0.0
+        if true_longest > 0.0 and len(sides_3d) >= 2:
+            joined_parts = [
+                _as_float_array(side)[:-1]
+                for side in sides_3d
+                if len(side) >= 2
+            ]
+            if joined_parts:
+                joined = np.vstack(joined_parts)
+                loop_welded = weld_then_collapse_fit_loop(
+                    joined,
+                    corner_angle_deg=corner_angle_deg,
+                    longest_side_length=true_longest,
+                )
+                if len(loop_welded) >= 3 and len(loop_welded) < len(loop_rs):
+                    loop_rs = loop_welded
+                    sample_count = len(loop_rs)
+                    pts_2d = project_points_to_plane(
+                        loop_rs, origin, axis_u, axis_v
+                    )
+                    corners = detect_corner_indices(
+                        pts_2d,
+                        corner_angle_deg,
+                        max_corners=_MAX_SPLIT_CORNERS,
+                        convex_only=False,
+                        include_strong_concave=True,
+                    )
+                    fold_indices = detect_concave_fold_indices(
+                        pts_2d,
+                        fold_angle_deg=corner_angle_deg,
+                        max_folds=_MAX_CONCAVE_FOLDS,
+                    )
+                    neighbor_splits = (
+                        map_loop_indices_to_resampled(
+                            loop_pts,
+                            neighbor_vertices,
+                            sample_count,
+                        )
+                        if neighbor_vertices
+                        else []
+                    )
+                    split_indices = sorted(
+                        set(corners)
+                        | set(fold_indices)
+                        | set(neighbor_splits)
+                    )
+                    if len(split_indices) < 2:
+                        half = max(sample_count // 2, 1)
+                        split_indices = [0, half]
+                    angle_labels = collect_interior_angle_labels(
+                        loop_rs,
+                        min_deviation_deg=15.0,
+                        normal=normal_guess,
+                        force_indices=split_indices,
+                    )
+                    island_folds = [
+                        loop_rs[index].copy() for index in fold_indices
+                    ]
+                    ordered_splits = sorted(
+                        {int(i) % sample_count for i in split_indices}
+                    )
+                    sides_3d = split_loop_into_sides(
+                        loop_rs, ordered_splits
+                    )
+                    sides_3d = merge_collinear_adjacent_sides(
+                        sides_3d,
+                        max_turn_deg=corner_angle_deg,
+                        min_sides=2,
+                    )
+                    sides_3d = share_closed_side_endpoints(sides_3d)
+                    loop_len = float(
+                        polyline_length(
+                            np.vstack((loop_rs, loop_rs[:1]))
+                        )
+                    )
 
         for side in sides_3d:
             if len(side) < 5:
