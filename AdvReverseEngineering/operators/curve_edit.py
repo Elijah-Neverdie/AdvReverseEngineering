@@ -52,6 +52,51 @@ def _tag_redraw(context: bpy.types.Context) -> None:
                 area.tag_redraw()
 
 
+def _is_object_alive(obj) -> bool:
+    """判断 Blender Object 指针是否仍有效（删除/撤销后会失效）。"""
+    if obj is None:
+        return False
+    try:
+        name = obj.name
+    except ReferenceError:
+        return False
+    try:
+        return name in bpy.data.objects and bpy.data.objects.get(name) is obj
+    except ReferenceError:
+        return False
+
+
+def _restore_curve_backups(backups) -> None:
+    """安全还原备份；物体已被删除/撤销时跳过。"""
+    for entry in backups or []:
+        obj = None
+        backup = None
+        name = None
+        if isinstance(entry, dict):
+            obj = entry.get("obj")
+            backup = entry.get("data")
+            name = entry.get("name")
+        elif isinstance(entry, (tuple, list)) and len(entry) >= 2:
+            obj, backup = entry[0], entry[1]
+            if len(entry) >= 3:
+                name = entry[2]
+        if backup is None:
+            continue
+        target = None
+        if _is_object_alive(obj):
+            target = obj
+        elif name and name in bpy.data.objects:
+            target = bpy.data.objects[name]
+        if target is None:
+            continue
+        try:
+            _restore_curve(target, backup)
+        except ReferenceError:
+            continue
+        except Exception:
+            continue
+
+
 def _header(context: bpy.types.Context, text: str) -> None:
     # 只用视口内 HUD（User Perspective 下方），不用 header_text_set
     set_curve_tool_hud(text)
@@ -570,23 +615,25 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
         return created > 0
 
     def _cleanup(self, context: bpy.types.Context, restore: bool) -> None:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        if restore:
-            for obj, backup in getattr(self, "_backups", []) or []:
-                if obj is not None and obj.name in bpy.data.objects:
-                    _restore_curve(obj, backup)
-        scene_props.curve_split_mode_active = False
-        scene_props.curve_split_confirm_requested = False
-        _clear_header(context)
-        unregister_curve_tool_hud()
-        timer = getattr(self, "_timer", None)
-        if timer is not None:
-            try:
-                context.window_manager.event_timer_remove(timer)
-            except Exception:
-                pass
-            self._timer = None
-        _tag_redraw(context)
+        # 无论还原是否成功，都必须清掉 GPU 预览，避免残影
+        try:
+            if restore:
+                _restore_curve_backups(getattr(self, "_backups", None))
+        finally:
+            scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+            if scene_props is not None:
+                scene_props.curve_split_mode_active = False
+                scene_props.curve_split_confirm_requested = False
+            _clear_header(context)
+            unregister_curve_tool_hud()
+            timer = getattr(self, "_timer", None)
+            if timer is not None:
+                try:
+                    context.window_manager.event_timer_remove(timer)
+                except Exception:
+                    pass
+                self._timer = None
+            _tag_redraw(context)
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -609,7 +656,13 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
             sources = _extract_spline_polylines(obj)
             if not sources:
                 continue
-            self._backups.append((obj, _serialize_curve(obj)))
+            self._backups.append(
+                {
+                    "name": obj.name,
+                    "obj": obj,
+                    "data": _serialize_curve(obj),
+                }
+            )
             self._targets.append((obj, sources))
         if not self._targets:
             self.report({"ERROR"}, "选中曲线没有可用样条")
@@ -635,6 +688,14 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
 
     def modal(self, context: bpy.types.Context, event):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        # 目标曲线被删除/撤销后立刻退出，并清预览
+        if not all(
+            _is_object_alive(obj) for obj, _sources in getattr(self, "_targets", [])
+        ):
+            self.report({"WARNING"}, "目标曲线已丢失，已退出拆分")
+            self._cleanup(context, restore=False)
+            return {"CANCELLED"}
+
         if scene_props.curve_split_confirm_requested:
             scene_props.curve_split_confirm_requested = False
             if self._commit(context):
@@ -866,23 +927,26 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         return True
 
     def _cleanup(self, context: bpy.types.Context, restore: bool) -> None:
-        scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        if restore:
-            for obj, backup in getattr(self, "_backups", []) or []:
-                if obj is not None and obj.name in bpy.data.objects:
-                    _restore_curve(obj, backup)
-        scene_props.curve_fit_mode_active = False
-        scene_props.curve_fit_confirm_requested = False
-        _clear_header(context)
-        unregister_curve_tool_hud()
-        timer = getattr(self, "_timer", None)
-        if timer is not None:
-            try:
-                context.window_manager.event_timer_remove(timer)
-            except Exception:
-                pass
-            self._timer = None
-        _tag_redraw(context)
+        # 无论还原是否成功，都必须清掉 GPU 预览，避免残影
+        try:
+            if restore:
+                _restore_curve_backups(getattr(self, "_backups", None))
+        finally:
+            scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+            if scene_props is not None:
+                scene_props.curve_fit_mode_active = False
+                scene_props.curve_fit_confirm_requested = False
+            _clear_header(context)
+            unregister_curve_tool_hud()
+            timer = getattr(self, "_timer", None)
+            if timer is not None:
+                try:
+                    context.window_manager.event_timer_remove(timer)
+                except Exception:
+                    pass
+                self._timer = None
+            self._preview_payload = []
+            _tag_redraw(context)
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -905,7 +969,13 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             sources = _extract_spline_polylines(obj)
             if not sources:
                 continue
-            self._backups.append((obj, _serialize_curve(obj)))
+            self._backups.append(
+                {
+                    "name": obj.name,
+                    "obj": obj,
+                    "data": _serialize_curve(obj),
+                }
+            )
             self._targets.append((obj, sources))
         if not self._targets:
             self.report({"ERROR"}, "选中曲线没有可用样条")
@@ -940,6 +1010,14 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
 
     def modal(self, context: bpy.types.Context, event):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        # 目标曲线被删除/撤销后立刻退出，并清预览
+        if not all(
+            _is_object_alive(obj) for obj, _sources in getattr(self, "_targets", [])
+        ):
+            self.report({"WARNING"}, "目标曲线已丢失，已退出拟合")
+            self._cleanup(context, restore=False)
+            return {"CANCELLED"}
+
         if scene_props.curve_fit_confirm_requested:
             scene_props.curve_fit_confirm_requested = False
             if self._commit(context):

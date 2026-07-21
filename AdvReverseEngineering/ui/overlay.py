@@ -892,6 +892,9 @@ def draw_curve_tool_hud() -> None:
 def register_curve_tool_hud() -> None:
     """注册曲线工具 HUD + 拆分/贝塞尔预览绘制。"""
     global _CURVE_TOOL_HUD_HANDLE, _CURVE_SPLIT_PREVIEW_HANDLE
+    # 重新进入工具时先清掉可能残留的旧预览
+    clear_curve_split_preview()
+    clear_curve_bezier_preview()
     namespace = bpy.app.driver_namespace
 
     old_hud = namespace.get(CURVE_TOOL_HUD_KEY)
