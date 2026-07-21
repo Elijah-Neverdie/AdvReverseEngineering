@@ -350,8 +350,20 @@ def draw_region_merge_labels() -> None:
     scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
     if scene_props is None or not scene_props.show_region_highlight:
         return
+    # 空闲不显示编号：仅合并/拆分/移除/拟合
+    if not _region_label_modes_active(scene_props):
+        return
     session = _MERGE_LABEL_SESSION
     if session is None:
+        return
+
+    region_obj = None
+    obj_name = session.get("object_name")
+    if obj_name:
+        region_obj = bpy.data.objects.get(obj_name)
+    if region_obj is None:
+        region_obj = getattr(scene_props, "region_object", None)
+    if not _is_region_mesh_overlay_visible(context, region_obj):
         return
 
     update_merge_label_projections(context)
@@ -447,6 +459,12 @@ def draw_fit_angle_labels() -> None:
         return
     session = _FIT_ANGLE_LABEL_SESSION
     if session is None:
+        return
+    region_obj = getattr(scene_props, "region_object", None)
+    obj_name = session.get("object_name")
+    if obj_name:
+        region_obj = bpy.data.objects.get(obj_name) or region_obj
+    if not _is_region_mesh_overlay_visible(context, region_obj):
         return
 
     update_fit_angle_label_projections(context)
@@ -1000,6 +1018,55 @@ def _is_object_selected(context: bpy.types.Context, obj: bpy.types.Object) -> bo
         return bool(obj.select_get())
     except ReferenceError:
         return False
+
+
+def _is_region_mesh_overlay_visible(
+    context: bpy.types.Context,
+    obj: bpy.types.Object | None,
+) -> bool:
+    """
+    领域分色/编号是否应绘制：对象须在当前视图层（及视口）可见。
+
+    使用 visible_get，从而与 Collection / LayerCollection 隐藏、
+    Local Collections、视图层排除保持一致；仅 hide_get 不够。
+    """
+    if obj is None:
+        return False
+    try:
+        if obj.type != "MESH":
+            return False
+        if obj.mode == "EDIT":
+            return False
+        if obj.hide_viewport:
+            return False
+        view_layer = getattr(context, "view_layer", None)
+        if view_layer is None:
+            return not bool(obj.hide_get())
+        space = getattr(context, "space_data", None)
+        if space is not None and getattr(space, "type", "") == "VIEW_3D":
+            return bool(obj.visible_get(view_layer=view_layer, viewport=space))
+        return bool(obj.visible_get(view_layer=view_layer))
+    except ReferenceError:
+        return False
+    except TypeError:
+        # 旧版 Blender 可能不支持 viewport= 参数
+        try:
+            view_layer = getattr(context, "view_layer", None)
+            if view_layer is None:
+                return not bool(obj.hide_get())
+            return bool(obj.visible_get(view_layer=view_layer))
+        except Exception:
+            return False
+
+
+def _region_label_modes_active(scene_props) -> bool:
+    """编号标签仅在合并/拆分/移除/拟合模态中显示。"""
+    return bool(
+        getattr(scene_props, "merge_mode_active", False)
+        or getattr(scene_props, "remove_mode_active", False)
+        or getattr(scene_props, "split_mode_active", False)
+        or getattr(scene_props, "fit_mode_active", False)
+    )
 
 
 def _matrix_signature(obj: bpy.types.Object) -> tuple:
@@ -1561,9 +1628,7 @@ def draw_overlays() -> None:
         region_obj is not None
         and region_obj.type == "MESH"
         and _is_object_selected(context, region_obj)
-        and not region_obj.hide_get()
-        and not region_obj.hide_viewport
-        and region_obj.mode != "EDIT"
+        and _is_region_mesh_overlay_visible(context, region_obj)
         and (
             use_merge_preview
             or use_split_preview
@@ -1751,9 +1816,7 @@ def draw_overlays() -> None:
         obj is not None
         and obj.type == "MESH"
         and _is_object_selected(context, obj)
-        and not obj.hide_get()
-        and not obj.hide_viewport
-        and obj.mode != "EDIT"
+        and _is_region_mesh_overlay_visible(context, obj)
         and BOTTOM_FACES_ATTR in obj
     ):
         face_indices = list(obj[BOTTOM_FACES_ATTR])

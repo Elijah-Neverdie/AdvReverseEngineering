@@ -280,13 +280,16 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
     show_region_highlight: BoolProperty(
         name="显示领域",
-        description="在 3D 视口中显示自动识别的领域颜色，以及作为前置固定领域的紫色底面",
+        description=(
+            "在 3D 视口显示领域分色与紫色底面（仅当网格在当前集合/视图层可见时）；"
+            "编号标签仅在合并/拆分/移除/拟合时显示"
+        ),
         default=True,
         update=_on_show_region_highlight_update,
     )
     label_hover_id: IntProperty(
         name="标签悬停领域",
-        description="空闲状态下鼠标悬停的领域编号",
+        description="合并/拆分/移除/拟合时鼠标悬停的领域编号",
         default=-1,
         min=-1,
     )

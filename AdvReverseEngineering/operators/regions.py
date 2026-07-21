@@ -335,10 +335,10 @@ def _resolve_region_object(context: bpy.types.Context, scene_props):
 
 def sync_region_label_overlay(context: bpy.types.Context | None = None) -> None:
     """
-    空闲状态下同步编号标签覆盖层。
+    同步编号标签覆盖层。
 
-    有领域且开启「显示领域」时常驻显示编号；否则拆除。
-    模态进行中不改写会话（由模态算子接管）。
+    编号仅在合并/拆分/移除/拟合模态中由对应算子建立会话；
+    空闲状态一律拆除，避免常驻显示。
     """
     context = context or bpy.context
     if context is None or context.scene is None:
@@ -348,38 +348,17 @@ def sync_region_label_overlay(context: bpy.types.Context | None = None) -> None:
         return
     if hasattr(scene_props, "label_hover_id"):
         scene_props.label_hover_id = -1
+    # 模态进行中：会话由模态算子接管，此处不改写
     if _modal_busy(scene_props):
         return
-    if not scene_props.show_region_highlight:
-        unregister_label_draw_handler()
-        set_merge_label_session(None)
-        return
-    obj = _resolve_region_object(context, scene_props)
-    if obj is None:
-        unregister_label_draw_handler()
-        set_merge_label_session(None)
-        return
-    region_ids = read_region_ids(obj.data)
-    if region_ids is None or not np.any(region_ids >= 0):
-        unregister_label_draw_handler()
-        set_merge_label_session(None)
-        return
-    valid = region_ids[region_ids >= 0]
-    region_count = max(int(valid.max()) + 1, int(scene_props.region_count))
-    colors = _read_region_colors(obj, region_count)
-    mesh_data = extract_mesh_data(obj)
-    session = _build_label_session(region_ids, mesh_data, colors)
-    session["object_name"] = obj.name
-    session["idle"] = True
-    session["preview_version"] = int(scene_props.region_version)
-    set_merge_label_session(session)
-    register_label_draw_handler()
-    scene_props.region_object = obj
+    # 空闲：强制拆除编号（分色仍由 show_region_highlight + 可见性控制）
+    unregister_label_draw_handler()
+    set_merge_label_session(None)
     _tag_redraw(context)
 
 
 def _teardown_labels_then_sync(context: bpy.types.Context) -> None:
-    """拆除当前标签会话后按空闲状态重建。"""
+    """拆除当前标签会话（退出模态后不重建空闲编号）。"""
     unregister_label_draw_handler()
     set_merge_label_session(None)
     sync_region_label_overlay(context)
@@ -596,7 +575,7 @@ class ARE_OT_clear_regions(bpy.types.Operator):
 
 
 class ARE_OT_update_label_hover(bpy.types.Operator):
-    """空闲状态下根据鼠标位置更新编号悬停高亮。"""
+    """模态中根据鼠标位置更新编号悬停高亮（空闲不启用）。"""
 
     bl_idname = "are.update_label_hover"
     bl_label = "更新领域标签悬停"
@@ -607,11 +586,10 @@ class ARE_OT_update_label_hover(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
         if scene_props is None or not scene_props.show_region_highlight:
             return False
-        if _modal_busy(scene_props):
+        # 仅合并/拆分/移除/拟合时需要悬停；空闲无编号
+        if not _modal_busy(scene_props):
             return False
-        return get_merge_label_session() is not None or (
-            _resolve_region_object(context, scene_props) is not None
-        )
+        return get_merge_label_session() is not None
 
     def invoke(self, context: bpy.types.Context, event):
         scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
@@ -622,8 +600,6 @@ class ARE_OT_update_label_hover(bpy.types.Operator):
         if context.region is None or context.region.type != "WINDOW":
             return {"PASS_THROUGH"}
 
-        if get_merge_label_session() is None:
-            sync_region_label_overlay(context)
         session = get_merge_label_session()
         if session is None:
             if int(getattr(scene_props, "label_hover_id", -1)) != -1:
