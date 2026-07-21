@@ -41,10 +41,12 @@ _CURVE_TOOL_HUD: str | None = None
 _CURVE_TOOL_HUD_HANDLE = None
 _CURVE_SPLIT_PREVIEW_HANDLE = None
 _CURVE_SPLIT_PREVIEW: dict | None = None
+_CURVE_BEZIER_PREVIEW: dict | None = None
 CURVE_TOOL_HUD_KEY = "AdvReverseEngineering.curve_tool_hud_handle"
 CURVE_SPLIT_PREVIEW_KEY = "AdvReverseEngineering.curve_split_preview_handle"
-# 避开视口自带「User Perspective / 物体名」两行信息
-_CURVE_HUD_TOP_MARGIN_PX = 72.0
+# 视口左下角，避开顶部 User Perspective / 物体名
+_CURVE_HUD_BOTTOM_MARGIN_PX = 18.0
+_CURVE_HUD_LEFT_MARGIN_PX = 16.0
 
 # 紫色半透明 (R, G, B, A)
 HIGHLIGHT_COLOR = (0.78, 0.22, 1.0, 0.55)
@@ -698,7 +700,7 @@ def unregister_split_draw_handler() -> None:
 
 
 def set_curve_tool_hud(text: str | None) -> None:
-    """设置曲线工具左上角提示文案。"""
+    """设置曲线工具提示文案（视口左下角）。"""
     global _CURVE_TOOL_HUD
     _CURVE_TOOL_HUD = None if text is None else str(text)
 
@@ -725,28 +727,120 @@ def clear_curve_split_preview() -> None:
     set_curve_split_preview(None)
 
 
+def set_curve_bezier_preview(session: dict | None) -> None:
+    """
+    设置贝塞尔拟合预览（曲线采样 + 锚点 + 手柄）。
+
+    session = {
+      "curves": [{"points": (N,3), "color": rgba}, ...],
+      "anchors": (M,3),
+      "handles": (K,3),
+      "handle_edges": (H,2,3),
+      "line_width": float,
+      "anchor_size": float,
+      "handle_size": float,
+    }
+    """
+    global _CURVE_BEZIER_PREVIEW
+    _CURVE_BEZIER_PREVIEW = session
+
+
+def clear_curve_bezier_preview() -> None:
+    set_curve_bezier_preview(None)
+
+
+def _draw_points_world(points, color, size: float) -> None:
+    """世界空间点（关闭深度测试，始终可见）。"""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) == 0:
+        return
+    coords = [tuple(map(float, p)) for p in pts]
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "POINTS", {"pos": coords})
+    gpu.state.blend_set("ALPHA")
+    gpu.state.depth_test_set("NONE")
+    gpu.state.depth_mask_set(False)
+    try:
+        gpu.state.point_size_set(float(size))
+    except Exception:
+        pass
+    try:
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+    finally:
+        try:
+            gpu.state.point_size_set(1.0)
+        except Exception:
+            pass
+        gpu.state.depth_mask_set(True)
+        gpu.state.depth_test_set("NONE")
+        gpu.state.blend_set("NONE")
+
+
 def draw_curve_split_preview() -> None:
-    """POST_VIEW：用加粗彩色折线画拆分段，不受物体选中橙色影响。"""
+    """POST_VIEW：拆分分色折线 + 贝塞尔控制点/手柄预览。"""
     session = _CURVE_SPLIT_PREVIEW
-    if not session:
+    if session:
+        segments = session.get("segments") or []
+        width = float(session.get("line_width", 4.0))
+        for item in segments:
+            pts = np.asarray(item.get("points"), dtype=np.float64)
+            if len(pts) < 2:
+                continue
+            color = tuple(
+                float(v) for v in (item.get("color") or (1, 0.2, 0.1, 1))[:4]
+            )
+            if len(color) < 4:
+                color = color + (1.0,) * (4 - len(color))
+            edges = np.stack((pts[:-1], pts[1:]), axis=1)
+            _draw_edge_lines_world(edges, color, width)
+
+    bez = _CURVE_BEZIER_PREVIEW
+    if not bez:
         return
-    segments = session.get("segments") or []
-    if not segments:
-        return
-    width = float(session.get("line_width", 4.0))
-    for item in segments:
+    # 拟合后的光滑曲线
+    for item in bez.get("curves") or []:
         pts = np.asarray(item.get("points"), dtype=np.float64)
         if len(pts) < 2:
             continue
-        color = tuple(float(v) for v in (item.get("color") or (1, 0.2, 0.1, 1))[:4])
+        color = tuple(
+            float(v) for v in (item.get("color") or (0.2, 0.85, 1.0, 1.0))[:4]
+        )
         if len(color) < 4:
             color = color + (1.0,) * (4 - len(color))
         edges = np.stack((pts[:-1], pts[1:]), axis=1)
-        _draw_edge_lines_world(edges, color, width)
+        _draw_edge_lines_world(
+            edges, color, float(bez.get("line_width", 3.5))
+        )
+    # 手柄连杆
+    handle_edges = bez.get("handle_edges")
+    if handle_edges is not None and len(handle_edges) > 0:
+        _draw_edge_lines_world(
+            handle_edges,
+            (0.35, 0.95, 0.55, 0.95),
+            float(bez.get("handle_line_width", 1.8)),
+        )
+    # 手柄端点
+    handles = bez.get("handles")
+    if handles is not None and len(handles) > 0:
+        _draw_points_world(
+            handles,
+            (0.25, 1.0, 0.55, 1.0),
+            float(bez.get("handle_size", 8.0)),
+        )
+    # 锚点（控制点）
+    anchors = bez.get("anchors")
+    if anchors is not None and len(anchors) > 0:
+        _draw_points_world(
+            anchors,
+            (1.0, 0.85, 0.15, 1.0),
+            float(bez.get("anchor_size", 12.0)),
+        )
 
 
 def draw_curve_tool_hud() -> None:
-    """POST_PIXEL：视口左上角（User Perspective 下方）显示状态。"""
+    """POST_PIXEL：视口左下角显示状态。"""
     import blf
 
     text = _CURVE_TOOL_HUD
@@ -758,11 +852,8 @@ def draw_curve_tool_hud() -> None:
     font_id = 0
     blf.size(font_id, 15)
     width, height = blf.dimensions(font_id, text)
-    x = 16.0
-    # 放在视口信息文字下方（用户框出的位置）
-    y = float(context.region.height) - _CURVE_HUD_TOP_MARGIN_PX - height
-    if y < 8.0:
-        y = 8.0
+    x = float(_CURVE_HUD_LEFT_MARGIN_PX)
+    y = float(_CURVE_HUD_BOTTOM_MARGIN_PX)
     gpu.state.blend_set("ALPHA")
     try:
         shader = gpu.shader.from_builtin("UNIFORM_COLOR")
@@ -799,7 +890,7 @@ def draw_curve_tool_hud() -> None:
 
 
 def register_curve_tool_hud() -> None:
-    """注册曲线工具 HUD + 拆分预览绘制。"""
+    """注册曲线工具 HUD + 拆分/贝塞尔预览绘制。"""
     global _CURVE_TOOL_HUD_HANDLE, _CURVE_SPLIT_PREVIEW_HANDLE
     namespace = bpy.app.driver_namespace
 
@@ -833,9 +924,9 @@ def register_curve_tool_hud() -> None:
 
 
 def unregister_curve_tool_hud() -> None:
-    """注销曲线工具 HUD 与拆分预览。"""
+    """注销曲线工具 HUD 与预览。"""
     global _CURVE_TOOL_HUD_HANDLE, _CURVE_TOOL_HUD
-    global _CURVE_SPLIT_PREVIEW_HANDLE, _CURVE_SPLIT_PREVIEW
+    global _CURVE_SPLIT_PREVIEW_HANDLE, _CURVE_SPLIT_PREVIEW, _CURVE_BEZIER_PREVIEW
     namespace = bpy.app.driver_namespace
 
     handle = namespace.pop(CURVE_TOOL_HUD_KEY, None) or _CURVE_TOOL_HUD_HANDLE
@@ -855,6 +946,7 @@ def unregister_curve_tool_hud() -> None:
             pass
     _CURVE_SPLIT_PREVIEW_HANDLE = None
     _CURVE_SPLIT_PREVIEW = None
+    _CURVE_BEZIER_PREVIEW = None
 
 
 def register_label_draw_handler() -> None:

@@ -19,11 +19,14 @@ from ..algorithms.curve_edit import (
     split_polyline_at_breaks,
     transform_bezier_points,
 )
+from ..algorithms.region_fit import sample_cubic_bezier
 from ..registration import SCENE_PROP_NAME
 from ..ui.overlay import (
+    clear_curve_bezier_preview,
     clear_curve_split_preview,
     clear_curve_tool_hud,
     register_curve_tool_hud,
+    set_curve_bezier_preview,
     set_curve_split_preview,
     set_curve_tool_hud,
     unregister_curve_tool_hud,
@@ -58,7 +61,95 @@ def _header(context: bpy.types.Context, text: str) -> None:
 def _clear_header(context: bpy.types.Context) -> None:
     clear_curve_tool_hud()
     clear_curve_split_preview()
+    clear_curve_bezier_preview()
     _tag_redraw(context)
+
+
+def _sample_bezier_polyline(
+    bezier_points: list[dict],
+    cyclic: bool,
+    samples_per_span: int = 20,
+) -> np.ndarray:
+    """把贝塞尔锚点链采样成光滑折线（世界坐标）。"""
+    if not bezier_points:
+        return np.zeros((0, 3), dtype=np.float64)
+    n = len(bezier_points)
+    span_count = n if cyclic else max(n - 1, 0)
+    if span_count <= 0:
+        co = np.asarray(bezier_points[0]["co"], dtype=np.float64).reshape(1, 3)
+        return co
+    parts: list[np.ndarray] = []
+    for index in range(span_count):
+        nxt = (index + 1) % n
+        controls = np.vstack(
+            (
+                np.asarray(bezier_points[index]["co"], dtype=np.float64),
+                np.asarray(bezier_points[index]["handle_right"], dtype=np.float64),
+                np.asarray(bezier_points[nxt]["handle_left"], dtype=np.float64),
+                np.asarray(bezier_points[nxt]["co"], dtype=np.float64),
+            )
+        )
+        sampled = sample_cubic_bezier(controls, max(int(samples_per_span), 4))
+        if index > 0:
+            sampled = sampled[1:]
+        parts.append(sampled)
+    return np.vstack(parts)
+
+
+def _bezier_preview_from_payload(
+    payload: list[tuple],
+) -> dict | None:
+    """从拟合结果收集 GPU 预览：曲线 / 锚点 / 手柄。"""
+    curves: list[dict] = []
+    anchors: list[np.ndarray] = []
+    handles: list[np.ndarray] = []
+    handle_edges: list[np.ndarray] = []
+    palette = segment_colors_for_count(max(len(payload), 1))
+    for color_index, item in enumerate(payload):
+        _obj, fitted, cyclic = item
+        if not fitted:
+            continue
+        sampled = _sample_bezier_polyline(fitted, bool(cyclic))
+        if len(sampled) >= 2:
+            curves.append(
+                {
+                    "points": sampled,
+                    "color": palette[color_index % len(palette)],
+                }
+            )
+        for bp in fitted:
+            co = np.asarray(bp["co"], dtype=np.float64).reshape(3)
+            hl = np.asarray(bp["handle_left"], dtype=np.float64).reshape(3)
+            hr = np.asarray(bp["handle_right"], dtype=np.float64).reshape(3)
+            anchors.append(co)
+            handles.append(hl)
+            handles.append(hr)
+            handle_edges.append(np.stack((co, hl), axis=0))
+            handle_edges.append(np.stack((co, hr), axis=0))
+    if not anchors and not curves:
+        return None
+    extent = 1.0
+    if curves:
+        stacked = np.vstack([c["points"] for c in curves])
+        extent = float(np.linalg.norm(stacked.max(axis=0) - stacked.min(axis=0)))
+    return {
+        "curves": curves,
+        "anchors": (
+            np.vstack(anchors) if anchors else np.zeros((0, 3), dtype=np.float64)
+        ),
+        "handles": (
+            np.vstack(handles) if handles else np.zeros((0, 3), dtype=np.float64)
+        ),
+        "handle_edges": (
+            np.stack(handle_edges, axis=0)
+            if handle_edges
+            else np.zeros((0, 2, 3), dtype=np.float64)
+        ),
+        "line_width": float(max(3.0, min(7.0, extent * 0.008))),
+        "handle_line_width": 1.8,
+        "anchor_size": 12.0,
+        "handle_size": 8.0,
+    }
 
 
 def _selected_curve_objects(context: bpy.types.Context) -> list[bpy.types.Object]:
@@ -533,6 +624,7 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
         scene_props.curve_split_mode_active = True
         scene_props.curve_split_confirm_requested = False
         scene_props.curve_split_angle = self._angle
+        clear_curve_bezier_preview()
         register_curve_tool_hud()
         self._rebuild_preview(context)
         self._timer = context.window_manager.event_timer_add(
@@ -752,10 +844,14 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                         bp.handle_left = tuple(float(v) for v in hl)
                         bp.handle_right = tuple(float(v) for v in hr)
                     spline.use_cyclic_u = bool(source["cyclic"])
+                    self._preview_payload.append(
+                        (obj, fitted, bool(source["cyclic"]))
+                    )
                 obj["are_fit_kind"] = "contour_bezier"
                 obj["are_fit_similar"] = False
-                self._preview_payload.append((obj, None, False))
 
+        preview = _bezier_preview_from_payload(self._preview_payload)
+        set_curve_bezier_preview(preview)
         self._update_status(context)
         return True
 
@@ -828,6 +924,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         scene_props.curve_fit_confirm_requested = False
         scene_props.curve_fit_controls = self._controls
         scene_props.curve_fit_similar = self._similar
+        clear_curve_split_preview()
         register_curve_tool_hud()
         try:
             self._rebuild_preview(context)
