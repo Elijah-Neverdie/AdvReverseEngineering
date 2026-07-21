@@ -426,6 +426,7 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box = tip.box()
                     help_box.label(text="1. 点击领域编号 → 生成可编辑外轮廓曲线")
                     help_box.label(text="2. 曲线写入「拟合曲线」集合，可直接编辑")
+                    help_box.label(text="3. 生成后自动选中该曲线")
                     help_box.label(text="3. 物体属性 are_fit_region_id 标记领域")
                     help_box.label(text="Shift+点击多选后按 Enter 确认")
                     help_box.label(text="Esc 取消 · 不再焊接/内角/成面")
@@ -509,6 +510,7 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box.label(text="相似变换保持环向首尾，避免对边扭曲")
                     help_box.label(text="曲线写入「拟合曲线」集合")
                     help_box.label(text="选 3/4 条后点「合成区面」→「拟合曲面」")
+                    help_box.label(text="合成后沿用领域色，并隐藏拟合曲线集合")
                     help_box.label(text="Enter / 确认拟合 · Esc 取消")
 
             if scene_props.region_status:

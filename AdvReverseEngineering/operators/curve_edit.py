@@ -1449,6 +1449,117 @@ def _boundary_polyline_from_curve_obj(obj: bpy.types.Object) -> np.ndarray:
     return candidates[0]
 
 
+def _resolve_region_display_color(
+    curves: list[bpy.types.Object],
+) -> tuple[float, float, float, float]:
+    """从边界曲线的领域 ID / 源网格调色板取显示色。"""
+    region_id = -1
+    source_name = ""
+    for curve in curves:
+        try:
+            rid = int(curve.get("are_fit_region_id", -1))
+        except Exception:
+            rid = -1
+        if rid >= 0:
+            region_id = rid
+            source_name = str(curve.get("are_fit_source", "") or "")
+            break
+    if region_id < 0:
+        return (0.35, 0.75, 1.0, 0.85)
+
+    palette = None
+    source_obj = bpy.data.objects.get(source_name) if source_name else None
+    if source_obj is not None:
+        raw = source_obj.get("are_region_colors")
+        if raw is not None:
+            flat = np.asarray(list(raw), dtype=np.float32)
+            if len(flat) >= (region_id + 1) * 4:
+                palette = flat.reshape(-1, 4)
+
+    if palette is None:
+        from ..algorithms.regions import generate_region_colors
+
+        palette = generate_region_colors(max(region_id + 1, 1), alpha=0.85)
+
+    color = palette[int(region_id) % len(palette)]
+    rgba = (
+        float(color[0]),
+        float(color[1]),
+        float(color[2]),
+        float(color[3]) if len(color) > 3 else 0.85,
+    )
+    # 曲面略提高不透明度，便于实体显示
+    return (rgba[0], rgba[1], rgba[2], max(float(rgba[3]), 0.75))
+
+
+def _ensure_surface_material(
+    name: str,
+    color: tuple[float, float, float, float],
+) -> bpy.types.Material:
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        mat = bpy.data.materials.new(name)
+    mat.diffuse_color = color
+    try:
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+        output = nodes.new("ShaderNodeOutputMaterial")
+        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+        bsdf.inputs["Base Color"].default_value = color
+        if "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = float(color[3])
+        links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+    except Exception:
+        pass
+    try:
+        mat.blend_method = "BLEND" if color[3] < 0.999 else "OPAQUE"
+    except Exception:
+        pass
+    return mat
+
+
+def _apply_surface_region_color(
+    obj: bpy.types.Object,
+    color: tuple[float, float, float, float],
+) -> None:
+    """给合成曲面套用领域色（物体色 + 材质）。"""
+    obj.color = color
+    try:
+        obj.show_transparent = True
+    except Exception:
+        pass
+    mat_name = f"ARE_FitSurf_{obj.name}"
+    mat = _ensure_surface_material(mat_name, color)
+    mesh = obj.data
+    if mesh is None:
+        return
+    mesh.materials.clear()
+    mesh.materials.append(mat)
+
+
+def _hide_curve_collection(scene: bpy.types.Scene) -> None:
+    """合成曲面后隐藏「拟合曲线」集合。"""
+    col = bpy.data.collections.get(CURVE_COLLECTION_NAME)
+    if col is None:
+        col = bpy.data.collections.get(LEGACY_FIT_COLLECTION_NAME)
+    if col is None:
+        return
+    col.hide_viewport = True
+    try:
+        layer = scene.view_layers[0].layer_collection
+        stack = [layer]
+        while stack:
+            lc = stack.pop()
+            if lc.collection == col:
+                lc.hide_viewport = True
+                break
+            stack.extend(list(lc.children))
+    except Exception:
+        pass
+
+
 class ARE_OT_compose_region_surface(bpy.types.Operator):
     """将选中的 3/4 条贝塞尔边界拟合成区面网格。"""
 
@@ -1456,7 +1567,8 @@ class ARE_OT_compose_region_surface(bpy.types.Operator):
     bl_label = "合成区面"
     bl_description = (
         "选中 3 或 4 条端点近乎闭合的贝塞尔曲线，"
-        "用 Coons/三边规则网格合成区面，写入「拟合曲面」集合"
+        "用 Coons/三边规则网格合成区面，写入「拟合曲面」集合；"
+        "沿用领域显示色，并隐藏「拟合曲线」集合"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1518,11 +1630,23 @@ class ARE_OT_compose_region_surface(bpy.types.Operator):
             except Exception:
                 pass
 
+        region_color = _resolve_region_display_color(curves)
+        _apply_surface_region_color(obj, region_color)
+
         obj["are_fit_kind"] = "region_surface"
         obj["are_fit_surface_type"] = kind
         obj["are_fit_source_curves"] = [c.name for c in curves]
+        try:
+            obj["are_fit_region_id"] = int(curves[0].get("are_fit_region_id", -1))
+        except Exception:
+            obj["are_fit_region_id"] = -1
+        source_name = str(curves[0].get("are_fit_source", "") or "")
+        if source_name:
+            obj["are_fit_source"] = source_name
         obj.display_type = "SOLID"
         obj.show_wire = True
+
+        _hide_curve_collection(context.scene)
 
         for item in list(context.selected_objects):
             try:
@@ -1535,7 +1659,8 @@ class ARE_OT_compose_region_surface(bpy.types.Operator):
         label = "四边" if kind == "QUAD" else "三边"
         self.report(
             {"INFO"},
-            f"已合成{label}区面 →「{SURFACE_COLLECTION_NAME}」/{obj.name}",
+            f"已合成{label}区面 →「{SURFACE_COLLECTION_NAME}」/{obj.name}"
+            f"（已隐藏「{CURVE_COLLECTION_NAME}」）",
         )
         return {"FINISHED"}
 

@@ -974,6 +974,49 @@ class ARE_OT_fit_region(bpy.types.Operator):
                 str(value) for value in targets
             )
 
+        # 沿用领域显示色，便于后续合成曲面继承
+        try:
+            from .regions import _read_region_colors
+
+            rid = int(targets[0])
+            colors = _read_region_colors(self._object, max(rid + 1, 1))
+            if rid >= 0 and len(colors) > rid:
+                rgba = tuple(float(v) for v in colors[rid][:4])
+                curve_obj.color = (
+                    rgba[0],
+                    rgba[1],
+                    rgba[2],
+                    max(rgba[3] if len(rgba) > 3 else 0.85, 0.85),
+                )
+        except Exception:
+            pass
+
+        # 若此前合成曲面隐藏了「拟合曲线」集合，生成时重新显示
+        try:
+            collection.hide_viewport = False
+            layer = context.view_layer.layer_collection
+            stack = [layer]
+            while stack:
+                lc = stack.pop()
+                if lc.collection == collection:
+                    lc.hide_viewport = False
+                    break
+                stack.extend(list(lc.children))
+        except Exception:
+            pass
+
+        # 生成后选中该曲线，便于继续拆分/拟合
+        for item in list(context.selected_objects):
+            try:
+                item.select_set(False)
+            except ReferenceError:
+                pass
+        try:
+            curve_obj.select_set(True)
+            context.view_layer.objects.active = curve_obj
+        except ReferenceError:
+            pass
+
         self._preview_object = None
         self._committed = True
         self._debug_result = debug
