@@ -174,6 +174,7 @@ def unregister() -> None:
     from .operators.simplify import cancel_simplify_timers
     from .operators.update import cancel_update_check_timers
     from .ui.overlay import (
+        unregister_curve_tool_hud,
         unregister_draw_handler,
         unregister_label_draw_handler,
         unregister_overlay_ui,
@@ -193,6 +194,7 @@ def unregister() -> None:
     cancel_simplify_timers()
     unregister_label_hover_keymap()
     unregister_overlay_ui()
+    unregister_curve_tool_hud()
     unregister_split_draw_handler()
     unregister_label_draw_handler()
     unregister_draw_handler()

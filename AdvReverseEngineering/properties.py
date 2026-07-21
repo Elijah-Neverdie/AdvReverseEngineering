@@ -680,6 +680,66 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
 
     # ------------------------------------------------------------------
+    # 拟合曲线编辑（拆分 / 贝塞尔重拟合）
+    # ------------------------------------------------------------------
+    curve_split_mode_active: BoolProperty(
+        name="拆分曲线模式",
+        description="是否正在按折角拆分选中曲线",
+        default=False,
+    )
+    curve_split_confirm_requested: BoolProperty(
+        name="请求确认拆分曲线",
+        default=False,
+    )
+    curve_split_angle: FloatProperty(
+        name="折角阈值",
+        description="转向角达到该阈值（度）视为曲线断开处；Ctrl+滚轮调节",
+        default=35.0,
+        min=5.0,
+        max=170.0,
+        soft_min=10.0,
+        soft_max=90.0,
+        precision=1,
+    )
+    curve_split_status: StringProperty(
+        name="拆分曲线状态",
+        default="",
+    )
+    show_curve_split_help: BoolProperty(
+        name="拆分曲线说明",
+        default=False,
+    )
+    curve_fit_mode_active: BoolProperty(
+        name="拟合曲线模式",
+        description="是否正在将选中曲线拟合成贝塞尔",
+        default=False,
+    )
+    curve_fit_confirm_requested: BoolProperty(
+        name="请求确认拟合曲线",
+        default=False,
+    )
+    curve_fit_controls: IntProperty(
+        name="控制点数",
+        description="贝塞尔锚点数量；Ctrl+滚轮调节，最少 3",
+        default=4,
+        min=3,
+        max=32,
+    )
+    curve_fit_similar: BoolProperty(
+        name="相似模式",
+        description="多条曲线视为相似形状，拟合一条原型并变换对齐",
+        default=False,
+    )
+    curve_fit_status: StringProperty(
+        name="拟合曲线状态",
+        default="",
+    )
+    show_curve_fit_help: BoolProperty(
+        name="拟合曲线说明",
+        default=False,
+    )
+
+    # ------------------------------------------------------------------
     # 原点设置
     # ------------------------------------------------------------------
     origin_mode: EnumProperty(

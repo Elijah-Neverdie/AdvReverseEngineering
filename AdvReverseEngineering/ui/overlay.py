@@ -36,6 +36,10 @@ _MERGE_LABEL_SESSION: dict | None = None
 _FIT_ANGLE_LABEL_SESSION: dict | None = None
 # 拆分模式笔迹会话
 _SPLIT_STROKE_SESSION: dict | None = None
+# 曲线拆分/拟合工具左上角 HUD
+_CURVE_TOOL_HUD: str | None = None
+_CURVE_TOOL_HUD_HANDLE = None
+CURVE_TOOL_HUD_KEY = "AdvReverseEngineering.curve_tool_hud_handle"
 
 # 紫色半透明 (R, G, B, A)
 HIGHLIGHT_COLOR = (0.78, 0.22, 1.0, 0.55)
@@ -686,6 +690,100 @@ def unregister_split_draw_handler() -> None:
     _SPLIT_DRAW_HANDLE = None
     _SPLIT_STROKE_SESSION = None
     _HIGHLIGHT_CACHE.pop("paint", None)
+
+
+def set_curve_tool_hud(text: str | None) -> None:
+    """设置曲线工具左上角提示文案。"""
+    global _CURVE_TOOL_HUD
+    _CURVE_TOOL_HUD = None if text is None else str(text)
+
+
+def clear_curve_tool_hud() -> None:
+    """清除曲线工具 HUD 文案。"""
+    set_curve_tool_hud(None)
+
+
+def draw_curve_tool_hud() -> None:
+    """POST_PIXEL：视口左上角显示曲线拆分/拟合状态。"""
+    import blf
+
+    text = _CURVE_TOOL_HUD
+    if not text:
+        return
+    context = bpy.context
+    if context is None or context.region is None:
+        return
+    font_id = 0
+    blf.size(font_id, 16)
+    width, height = blf.dimensions(font_id, text)
+    x = 18.0
+    y = float(context.region.height) - height - 18.0
+    gpu.state.blend_set("ALPHA")
+    try:
+        # 半透明底条，保证白字可读
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        pad = 8.0
+        verts = (
+            (x - pad, y - pad),
+            (x + width + pad, y - pad),
+            (x + width + pad, y + height + pad),
+            (x - pad, y + height + pad),
+        )
+        batch = batch_for_shader(
+            shader,
+            "TRIS",
+            {
+                "pos": (
+                    verts[0],
+                    verts[1],
+                    verts[2],
+                    verts[0],
+                    verts[2],
+                    verts[3],
+                )
+            },
+        )
+        shader.bind()
+        shader.uniform_float("color", (0.05, 0.05, 0.08, 0.55))
+        batch.draw(shader)
+        blf.position(font_id, x, y, 0)
+        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+        blf.draw(font_id, text)
+    finally:
+        gpu.state.blend_set("NONE")
+
+
+def register_curve_tool_hud() -> None:
+    """注册曲线工具 HUD 绘制。"""
+    global _CURVE_TOOL_HUD_HANDLE
+    namespace = bpy.app.driver_namespace
+    old = namespace.get(CURVE_TOOL_HUD_KEY)
+    if old is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(old, "WINDOW")
+        except (ReferenceError, ValueError):
+            pass
+    _CURVE_TOOL_HUD_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+        draw_curve_tool_hud,
+        (),
+        "WINDOW",
+        "POST_PIXEL",
+    )
+    namespace[CURVE_TOOL_HUD_KEY] = _CURVE_TOOL_HUD_HANDLE
+
+
+def unregister_curve_tool_hud() -> None:
+    """注销曲线工具 HUD。"""
+    global _CURVE_TOOL_HUD_HANDLE, _CURVE_TOOL_HUD
+    namespace = bpy.app.driver_namespace
+    handle = namespace.pop(CURVE_TOOL_HUD_KEY, None) or _CURVE_TOOL_HUD_HANDLE
+    if handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+        except (ReferenceError, ValueError):
+            pass
+    _CURVE_TOOL_HUD_HANDLE = None
+    _CURVE_TOOL_HUD = None
 
 
 def register_label_draw_handler() -> None:

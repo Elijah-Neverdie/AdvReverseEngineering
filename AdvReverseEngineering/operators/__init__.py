@@ -1,6 +1,12 @@
 """AdvReverseEngineering 操作符子包。"""
 
 from .orient import ARE_OT_auto_orient
+from .curve_edit import (
+    ARE_OT_confirm_fit_bezier_curve,
+    ARE_OT_confirm_split_fit_curve,
+    ARE_OT_fit_bezier_curve,
+    ARE_OT_split_fit_curve,
+)
 from .region_fit import (
     ARE_OT_build_fit_surface,
     ARE_OT_confirm_fit_region,
@@ -45,6 +51,10 @@ classes = (
     ARE_OT_fit_step_back,
     ARE_OT_build_fit_surface,
     ARE_OT_confirm_fit_region,
+    ARE_OT_split_fit_curve,
+    ARE_OT_confirm_split_fit_curve,
+    ARE_OT_fit_bezier_curve,
+    ARE_OT_confirm_fit_bezier_curve,
     ARE_OT_check_github_update,
     ARE_OT_update_from_github,
 )

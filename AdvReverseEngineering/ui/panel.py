@@ -195,7 +195,20 @@ class ARE_PT_main(bpy.types.Panel):
             removing = bool(getattr(scene_props, "remove_mode_active", False))
             splitting = bool(scene_props.split_mode_active)
             fitting = bool(getattr(scene_props, "fit_mode_active", False))
-            modal_busy = merging or removing or splitting or fitting
+            curve_splitting = bool(
+                getattr(scene_props, "curve_split_mode_active", False)
+            )
+            curve_fitting = bool(
+                getattr(scene_props, "curve_fit_mode_active", False)
+            )
+            modal_busy = (
+                merging
+                or removing
+                or splitting
+                or fitting
+                or curve_splitting
+                or curve_fitting
+            )
 
             region_box.prop(
                 scene_props,
@@ -267,6 +280,23 @@ class ARE_PT_main(bpy.types.Panel):
                 "are.fit_region",
                 text="拟合领域",
                 icon="MOD_SMOOTH",
+            )
+
+            curve_row = region_box.row(align=True)
+            has_curve = any(
+                getattr(item, "type", "") == "CURVE"
+                for item in context.selected_objects
+            )
+            curve_row.enabled = bool(has_curve) and not modal_busy
+            curve_row.operator(
+                "are.split_fit_curve",
+                text="拆分曲线",
+                icon="MOD_EDGESPLIT",
+            )
+            curve_row.operator(
+                "are.fit_bezier_curve",
+                text="拟合曲线",
+                icon="CURVE_BEZCURVE",
             )
 
             clear_row = region_box.row(align=True)
@@ -386,6 +416,71 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box.label(text="3. 物体属性 are_fit_region_id 标记领域")
                     help_box.label(text="Shift+点击多选后按 Enter 确认")
                     help_box.label(text="Esc 取消 · 不再焊接/内角/成面")
+
+            if curve_splitting:
+                tip = region_box.box()
+                tip.label(text="拆分曲线", icon="INFO")
+                tip.prop(
+                    scene_props,
+                    "curve_split_angle",
+                    text="折角阈值 (°)",
+                )
+                if scene_props.curve_split_status:
+                    tip.label(text=scene_props.curve_split_status)
+                confirm_row = tip.row()
+                confirm_row.scale_y = 1.2
+                confirm_row.operator(
+                    "are.confirm_split_fit_curve",
+                    text="确认拆分",
+                    icon="CHECKMARK",
+                )
+                if _draw_foldout(
+                    tip,
+                    scene_props,
+                    "show_curve_split_help",
+                    "操作说明",
+                ):
+                    help_box = tip.box()
+                    help_box.label(text="1. 选中拟合外轮廓曲线后点「拆分曲线」")
+                    help_box.label(text="2. 折角处断开，连续段用不同颜色标记")
+                    help_box.label(text="3. Ctrl+滚轮调节折角阈值")
+                    help_box.label(text="4. 左上角显示将拆分为几条")
+                    help_box.label(text="Enter / 确认拆分 · Esc 取消")
+
+            if curve_fitting:
+                tip = region_box.box()
+                tip.label(text="拟合曲线（贝塞尔）", icon="INFO")
+                tip.prop(
+                    scene_props,
+                    "curve_fit_controls",
+                    text="控制点数",
+                )
+                tip.prop(
+                    scene_props,
+                    "curve_fit_similar",
+                    text="相似模式",
+                )
+                if scene_props.curve_fit_status:
+                    tip.label(text=scene_props.curve_fit_status)
+                confirm_row = tip.row()
+                confirm_row.scale_y = 1.2
+                confirm_row.operator(
+                    "are.confirm_fit_bezier_curve",
+                    text="确认拟合",
+                    icon="CHECKMARK",
+                )
+                if _draw_foldout(
+                    tip,
+                    scene_props,
+                    "show_curve_fit_help",
+                    "操作说明",
+                ):
+                    help_box = tip.box()
+                    help_box.label(text="1. 选中曲线后点「拟合曲线」")
+                    help_box.label(text="2. Ctrl+滚轮调节控制点数（最少 3）")
+                    help_box.label(text="3. 按 S 切换相似模式（多选时）")
+                    help_box.label(text="相似：拟一条原型，变换对齐各曲线")
+                    help_box.label(text="Enter / 确认拟合 · Esc 取消")
 
             if scene_props.region_status:
                 region_box.label(
