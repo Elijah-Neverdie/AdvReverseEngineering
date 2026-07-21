@@ -11,12 +11,15 @@ import numpy as np
 
 from .region_fit import (
     RegionFitError,
+    build_quad_patch,
+    build_triangular_patch,
     fit_cubic_bezier_controls,
     make_segment_color,
     polyline_length,
     polyline_parameters,
     resample_closed_polyline,
     resample_polyline,
+    sample_cubic_bezier,
 )
 
 
@@ -284,10 +287,11 @@ def order_open_curves_as_closed_loop(
     将开环折线排成闭合环（端点近乎相接）。
 
     返回 (顺序下标, 是否反向, 最大接缝距离)；无法成环则 None。
-    仅支持恰好 4 条，用于对边识别。
+    支持 3 或 4 条（三边/四边合成区面）。
     """
     curves = [_as_float_array(p) for p in polylines]
-    if len(curves) != 4:
+    count = len(curves)
+    if count not in (3, 4):
         return None
     if any(len(p) < 2 for p in curves):
         return None
@@ -297,19 +301,19 @@ def order_open_curves_as_closed_loop(
     max_gap = ref_len * float(max(max_gap_frac, 1e-4))
 
     ends = [(p[0].copy(), p[-1].copy()) for p in curves]
-    used = [False] * 4
+    used = [False] * count
     order = [0]
     flipped = [False]
     used[0] = True
     tip = ends[0][1].copy()
     worst_gap = 0.0
 
-    for _ in range(3):
+    for _ in range(count - 1):
         best_i = -1
         best_flip = False
         best_d = float("inf")
         best_tip = tip
-        for index in range(4):
+        for index in range(count):
             if used[index]:
                 continue
             start_pt, end_pt = ends[index]
@@ -345,6 +349,114 @@ def opposite_edge_pairs(count: int = 4) -> list[tuple[int, int]]:
     if int(count) != 4:
         return []
     return [(0, 2), (1, 3)]
+
+
+def sample_bezier_anchor_chain(
+    bezier_points: Sequence[dict],
+    cyclic: bool = False,
+    samples_per_span: int = 24,
+) -> np.ndarray:
+    """将贝塞尔锚点链（含手柄）采样为开/闭环折线。"""
+    if not bezier_points:
+        return np.zeros((0, 3), dtype=np.float64)
+    n = len(bezier_points)
+    span_count = n if cyclic else max(n - 1, 0)
+    if span_count <= 0:
+        co = _as_float_array(bezier_points[0]["co"]).reshape(3)
+        return co.reshape(1, 3)
+    parts: list[np.ndarray] = []
+    per = max(int(samples_per_span), 2)
+    for i in range(span_count):
+        a = bezier_points[i]
+        b = bezier_points[(i + 1) % n]
+        controls = np.vstack(
+            (
+                _as_float_array(a["co"]).reshape(3),
+                _as_float_array(a["handle_right"]).reshape(3),
+                _as_float_array(b["handle_left"]).reshape(3),
+                _as_float_array(b["co"]).reshape(3),
+            )
+        )
+        sampled = sample_cubic_bezier(controls, per)
+        if i > 0:
+            sampled = sampled[1:]
+        parts.append(sampled)
+    return np.vstack(parts)
+
+
+def orient_loop_polylines(
+    polylines: Sequence[np.ndarray],
+    max_gap_frac: float = 0.08,
+) -> list[np.ndarray] | None:
+    """排成闭合环并统一方向；失败返回 None。"""
+    ordered = order_open_curves_as_closed_loop(polylines, max_gap_frac=max_gap_frac)
+    if ordered is None:
+        return None
+    order, flipped, _gap = ordered
+    result: list[np.ndarray] = []
+    for index, reverse in zip(order, flipped):
+        pts = _as_float_array(polylines[index])
+        if reverse:
+            pts = pts[::-1].copy()
+        result.append(pts)
+    return result
+
+
+def prepare_triangular_sides_from_loop(
+    loop_sides: Sequence[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    从三边闭环取 (side_a, side_b, base)：
+    a/b 从底角指向 tip，base 为最短边。
+    """
+    sides = [_as_float_array(s) for s in loop_sides]
+    if len(sides) != 3:
+        raise RegionFitError("三边合成需要恰好三条边")
+    lengths = [float(polyline_length(s)) for s in sides]
+    base_i = int(np.argmin(lengths))
+    base = sides[base_i]
+    right = sides[(base_i + 1) % 3]  # base 终点 → tip
+    left_rev = sides[(base_i + 2) % 3]  # tip → base 起点
+    left = left_rev[::-1].copy()
+    return left, right, base
+
+
+def compose_patch_from_boundary_polylines(
+    polylines: Sequence[np.ndarray],
+    *,
+    segments_u: int = 12,
+    segments_v: int = 12,
+    max_gap_frac: float = 0.12,
+) -> tuple[np.ndarray, list[tuple[int, ...]], str]:
+    """
+    用 3/4 条边界折线合成区面网格。
+
+    返回 (vertices_world, faces, kind) ，kind 为 \"TRI\" 或 \"QUAD\"。
+    """
+    curves = [_as_float_array(p) for p in polylines]
+    if len(curves) not in (3, 4):
+        raise RegionFitError("合成区面需要选中 3 或 4 条曲线")
+    loop = orient_loop_polylines(curves, max_gap_frac=max_gap_frac)
+    if loop is None:
+        raise RegionFitError("曲线端点未近乎闭合，无法排成封闭边界")
+    # 接缝共点，利于 Coons 角点
+    for index in range(len(loop)):
+        nxt = (index + 1) % len(loop)
+        mid = 0.5 * (loop[index][-1] + loop[nxt][0])
+        loop[index][-1] = mid
+        loop[nxt][0] = mid
+
+    seg_u = max(int(segments_u), 2)
+    seg_v = max(int(segments_v), 2)
+    if len(loop) == 4:
+        vertices, faces = build_quad_patch(loop, seg_u, seg_v)
+        return vertices, faces, "QUAD"
+
+    left, right, base = prepare_triangular_sides_from_loop(loop)
+    vertices, faces = build_triangular_patch(
+        left, right, base, segments_long=seg_v, segments_base=seg_u
+    )
+    return vertices, faces, "TRI"
 
 
 def weld_bezier_loop_endpoints(
@@ -543,6 +655,7 @@ __all__ = (
     "apply_similarity",
     "best_closed_alignment",
     "best_open_alignment",
+    "compose_patch_from_boundary_polylines",
     "estimate_open_directed_similarity",
     "estimate_similarity_transform",
     "extract_subpolyline_by_arc",
@@ -551,7 +664,10 @@ __all__ = (
     "opposite_edge_pairs",
     "opposite_pair_colors",
     "order_open_curves_as_closed_loop",
+    "orient_loop_polylines",
     "point_at_arc_length",
+    "prepare_triangular_sides_from_loop",
+    "sample_bezier_anchor_chain",
     "sample_polyline_uniform",
     "segment_colors_for_count",
     "snap_bezier_endpoints",

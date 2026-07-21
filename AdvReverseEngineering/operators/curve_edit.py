@@ -12,6 +12,7 @@ from ..algorithms.curve_edit import (
     RegionFitError,
     best_closed_alignment,
     best_open_alignment,
+    compose_patch_from_boundary_polylines,
     estimate_open_directed_similarity,
     estimate_similarity_transform,
     find_break_indices,
@@ -19,6 +20,7 @@ from ..algorithms.curve_edit import (
     opposite_edge_pairs,
     opposite_pair_colors,
     order_open_curves_as_closed_loop,
+    sample_bezier_anchor_chain,
     sample_polyline_uniform,
     segment_colors_for_count,
     snap_bezier_endpoints,
@@ -39,7 +41,10 @@ from ..ui.overlay import (
     unregister_curve_tool_hud,
 )
 
-FIT_COLLECTION_NAME = "拟合面"
+FIT_COLLECTION_NAME = "拟合曲线"  # 兼容旧导出名
+CURVE_COLLECTION_NAME = "拟合曲线"
+SURFACE_COLLECTION_NAME = "拟合曲面"
+LEGACY_FIT_COLLECTION_NAME = "拟合面"
 CURVE_SEG_MAT_PREFIX = "ARE_CurveSeg_"
 DEFAULT_SPLIT_ANGLE = 35.0
 SPLIT_ANGLE_STEP = 2.0
@@ -50,6 +55,8 @@ BEZIER_CONTROLS_MIN = 3
 BEZIER_CONTROLS_MAX = 32
 SIMILAR_SAMPLE_COUNT = 64
 MODAL_TIMER_STEP = 0.1
+DEFAULT_SURFACE_SEG_U = 12
+DEFAULT_SURFACE_SEG_V = 12
 
 
 def _tag_redraw(context: bpy.types.Context) -> None:
@@ -458,12 +465,39 @@ def _write_bezier_spline(
     spline.use_cyclic_u = bool(cyclic)
 
 
-def _ensure_fit_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
-    col = bpy.data.collections.get(FIT_COLLECTION_NAME)
-    if col is None:
-        col = bpy.data.collections.new(FIT_COLLECTION_NAME)
-        scene.collection.children.link(col)
+def _ensure_named_collection(
+    scene: bpy.types.Scene,
+    name: str,
+    legacy_names: tuple[str, ...] = (),
+) -> bpy.types.Collection:
+    col = bpy.data.collections.get(name)
+    if col is not None:
+        return col
+    for legacy in legacy_names:
+        old = bpy.data.collections.get(legacy)
+        if old is not None:
+            old.name = name
+            return old
+    col = bpy.data.collections.new(name)
+    scene.collection.children.link(col)
     return col
+
+
+def _ensure_curve_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
+    return _ensure_named_collection(
+        scene,
+        CURVE_COLLECTION_NAME,
+        legacy_names=(LEGACY_FIT_COLLECTION_NAME,),
+    )
+
+
+def _ensure_surface_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
+    return _ensure_named_collection(scene, SURFACE_COLLECTION_NAME)
+
+
+def _ensure_fit_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
+    """兼容旧调用：曲线写入「拟合曲线」。"""
+    return _ensure_curve_collection(scene)
 
 
 def _any_curve_modal_busy(scene_props) -> bool:
@@ -1301,9 +1335,173 @@ class ARE_OT_confirm_fit_bezier_curve(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _bezier_dicts_from_spline(spline, matrix_world) -> list[dict]:
+    """把 Blender BEZIER spline 转为世界坐标锚点字典列表。"""
+    matrix = _matrix_np(matrix_world)
+    items: list[dict] = []
+    for bp in spline.bezier_points:
+        local = np.array(
+            [
+                [bp.co.x, bp.co.y, bp.co.z],
+                [bp.handle_left.x, bp.handle_left.y, bp.handle_left.z],
+                [bp.handle_right.x, bp.handle_right.y, bp.handle_right.z],
+            ],
+            dtype=np.float64,
+        )
+        world = _world_points_from_local(matrix, local)
+        items.append(
+            {
+                "co": world[0].copy(),
+                "handle_left": world[1].copy(),
+                "handle_right": world[2].copy(),
+            }
+        )
+    return items
+
+
+def _boundary_polyline_from_curve_obj(obj: bpy.types.Object) -> np.ndarray:
+    """从曲线物体提取一条开环边界折线（优先 BEZIER 采样）。"""
+    curve = obj.data
+    if curve is None or not curve.splines:
+        raise RegionFitError(f"{obj.name} 没有样条")
+    # 多段时取最长开环
+    candidates: list[np.ndarray] = []
+    for spline in curve.splines:
+        cyclic = bool(spline.use_cyclic_u)
+        if spline.type == "BEZIER" and len(spline.bezier_points) >= 2:
+            bez = _bezier_dicts_from_spline(spline, obj.matrix_world)
+            pts = sample_bezier_anchor_chain(
+                bez, cyclic=False, samples_per_span=24
+            )
+            # 闭环轮廓不适合作为单边；强制开环用途时去掉环标志
+            if cyclic and len(pts) > 2:
+                # 仍可作为边界边使用：去掉重复闭合点
+                if np.linalg.norm(pts[0] - pts[-1]) < 1e-9:
+                    pts = pts[:-1]
+            candidates.append(pts)
+            continue
+        local_pts: list[tuple[float, float, float]] = []
+        for point in spline.points:
+            local_pts.append(
+                (float(point.co.x), float(point.co.y), float(point.co.z))
+            )
+        if len(local_pts) < 2:
+            continue
+        world = _world_points_from_local(
+            obj.matrix_world, np.asarray(local_pts, dtype=np.float64)
+        )
+        candidates.append(world)
+    if not candidates:
+        raise RegionFitError(f"{obj.name} 无法提取边界折线")
+    candidates.sort(
+        key=lambda pts: float(
+            np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()
+        )
+        if len(pts) >= 2
+        else 0.0,
+        reverse=True,
+    )
+    return candidates[0]
+
+
+class ARE_OT_compose_region_surface(bpy.types.Operator):
+    """将选中的 3/4 条贝塞尔边界拟合成区面网格。"""
+
+    bl_idname = "are.compose_region_surface"
+    bl_label = "合成区面"
+    bl_description = (
+        "选中 3 或 4 条端点近乎闭合的贝塞尔曲线，"
+        "用 Coons/三边规则网格合成区面，写入「拟合曲面」集合"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        if scene_props is None:
+            return False
+        if _any_curve_modal_busy(scene_props):
+            return False
+        curves = _selected_curve_objects(context)
+        return len(curves) in (3, 4)
+
+    def execute(self, context: bpy.types.Context):
+        curves = _selected_curve_objects(context)
+        if len(curves) not in (3, 4):
+            self.report({"ERROR"}, "请选中 3 或 4 条曲线")
+            return {"CANCELLED"}
+        try:
+            polylines = [_boundary_polyline_from_curve_obj(obj) for obj in curves]
+            vertices, faces, kind = compose_patch_from_boundary_polylines(
+                polylines,
+                segments_u=DEFAULT_SURFACE_SEG_U,
+                segments_v=DEFAULT_SURFACE_SEG_V,
+            )
+        except RegionFitError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"合成区面失败: {exc}")
+            return {"CANCELLED"}
+
+        collection = _ensure_surface_collection(context.scene)
+        base = curves[0].name.rsplit("_S", 1)[0]
+        name = f"FitSurf_{base}_{kind}"
+        # 世界坐标写入，物体用单位矩阵
+        identity = curves[0].matrix_world.copy()
+        identity.identity()
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(
+            [tuple(map(float, v)) for v in vertices.tolist()],
+            [],
+            [tuple(face) for face in faces],
+        )
+        mesh.update()
+        try:
+            mesh.calc_normals()
+        except Exception:
+            pass
+        obj = bpy.data.objects.new(name, mesh)
+        obj.matrix_world = identity
+        if obj.name not in collection.objects:
+            collection.objects.link(obj)
+        # 避免同时挂在场景根集合造成重复
+        scene_col = context.scene.collection
+        if obj.name in scene_col.objects and collection != scene_col:
+            try:
+                scene_col.objects.unlink(obj)
+            except Exception:
+                pass
+
+        obj["are_fit_kind"] = "region_surface"
+        obj["are_fit_surface_type"] = kind
+        obj["are_fit_source_curves"] = [c.name for c in curves]
+        obj.display_type = "SOLID"
+        obj.show_wire = True
+
+        for item in list(context.selected_objects):
+            try:
+                item.select_set(False)
+            except ReferenceError:
+                pass
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        label = "四边" if kind == "QUAD" else "三边"
+        self.report(
+            {"INFO"},
+            f"已合成{label}区面 →「{SURFACE_COLLECTION_NAME}」/{obj.name}",
+        )
+        return {"FINISHED"}
+
+
 __all__ = (
     "ARE_OT_split_fit_curve",
     "ARE_OT_confirm_split_fit_curve",
     "ARE_OT_fit_bezier_curve",
     "ARE_OT_confirm_fit_bezier_curve",
+    "ARE_OT_compose_region_surface",
+    "CURVE_COLLECTION_NAME",
+    "SURFACE_COLLECTION_NAME",
+    "FIT_COLLECTION_NAME",
 )

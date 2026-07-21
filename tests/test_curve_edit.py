@@ -10,6 +10,7 @@ import numpy as np
 from AdvReverseEngineering.algorithms.curve_edit import (
     best_closed_alignment,
     best_open_alignment,
+    compose_patch_from_boundary_polylines,
     estimate_open_directed_similarity,
     estimate_similarity_transform,
     find_break_indices,
@@ -153,6 +154,44 @@ class CurveEditTests(unittest.TestCase):
         self.assertTrue(np.allclose(good[-1]["co"], top[-1], atol=1e-9))
         # 反向对齐后的首尾误差应明显更大
         self.assertGreater(bad_start_err + bad_end_err, 1.0)
+
+    def test_compose_quad_patch_from_square(self) -> None:
+        bottom = np.linspace([0, 0, 0], [1, 0, 0], 16)
+        right = np.linspace([1, 0, 0], [1, 1, 0], 16)
+        top = np.linspace([1, 1, 0], [0, 1, 0], 16)
+        left = np.linspace([0, 1, 0], [0, 0, 0], 16)
+        # 乱序传入
+        verts, faces, kind = compose_patch_from_boundary_polylines(
+            [right, left, bottom, top],
+            segments_u=4,
+            segments_v=4,
+        )
+        self.assertEqual(kind, "QUAD")
+        self.assertEqual(len(verts), 5 * 5)
+        self.assertGreater(len(faces), 0)
+        # 角点应接近单位正方形四角
+        corners = verts[[0, 4, 20, 24]]
+        for expected in (
+            [0, 0, 0],
+            [1, 0, 0],
+            [0, 1, 0],
+            [1, 1, 0],
+        ):
+            dists = np.linalg.norm(corners - np.asarray(expected), axis=1)
+            self.assertLess(float(dists.min()), 0.05)
+
+    def test_compose_tri_patch_from_triangle(self) -> None:
+        a = np.linspace([0, 0, 0], [1, 0, 0], 12)
+        b = np.linspace([1, 0, 0], [0.5, 0.8, 0], 12)
+        c = np.linspace([0.5, 0.8, 0], [0, 0, 0], 12)
+        verts, faces, kind = compose_patch_from_boundary_polylines(
+            [a, b, c],
+            segments_u=4,
+            segments_v=4,
+        )
+        self.assertEqual(kind, "TRI")
+        self.assertGreater(len(verts), 0)
+        self.assertGreater(len(faces), 0)
 
 
 if __name__ == "__main__":

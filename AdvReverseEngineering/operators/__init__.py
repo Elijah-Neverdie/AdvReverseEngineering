@@ -2,6 +2,7 @@
 
 from .orient import ARE_OT_auto_orient
 from .curve_edit import (
+    ARE_OT_compose_region_surface,
     ARE_OT_confirm_fit_bezier_curve,
     ARE_OT_confirm_split_fit_curve,
     ARE_OT_fit_bezier_curve,
@@ -55,6 +56,7 @@ classes = (
     ARE_OT_confirm_split_fit_curve,
     ARE_OT_fit_bezier_curve,
     ARE_OT_confirm_fit_bezier_curve,
+    ARE_OT_compose_region_surface,
     ARE_OT_check_github_update,
     ARE_OT_update_from_github,
 )

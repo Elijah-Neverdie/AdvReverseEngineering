@@ -29,7 +29,10 @@ from ..utils.viewport import hit_test_labels
 from .regions import REGION_ID_ATTR, read_region_ids
 
 
-FIT_COLLECTION_NAME = "拟合面"
+FIT_COLLECTION_NAME = "拟合曲线"  # 兼容旧导出名
+CURVE_COLLECTION_NAME = "拟合曲线"
+SURFACE_COLLECTION_NAME = "拟合曲面"
+LEGACY_FIT_COLLECTION_NAME = "拟合面"
 FIT_PREVIEW_NAME = "ARE_FitPreview"
 FIT_DEBUG_CTRL_NAME = "ARE_FitDebugControls"
 FIT_DEBUG_FOLD_NAME = "ARE_FitConcaveFolds"
@@ -177,12 +180,39 @@ def _build_label_session(
     }
 
 
-def _ensure_fit_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
-    collection = bpy.data.collections.get(FIT_COLLECTION_NAME)
-    if collection is None:
-        collection = bpy.data.collections.new(FIT_COLLECTION_NAME)
-        scene.collection.children.link(collection)
+def _ensure_named_collection(
+    scene: bpy.types.Scene,
+    name: str,
+    legacy_names: tuple[str, ...] = (),
+) -> bpy.types.Collection:
+    collection = bpy.data.collections.get(name)
+    if collection is not None:
+        return collection
+    for legacy in legacy_names:
+        old = bpy.data.collections.get(legacy)
+        if old is not None:
+            old.name = name
+            return old
+    collection = bpy.data.collections.new(name)
+    scene.collection.children.link(collection)
     return collection
+
+
+def _ensure_curve_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
+    return _ensure_named_collection(
+        scene,
+        CURVE_COLLECTION_NAME,
+        legacy_names=(LEGACY_FIT_COLLECTION_NAME,),
+    )
+
+
+def _ensure_surface_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
+    return _ensure_named_collection(scene, SURFACE_COLLECTION_NAME)
+
+
+def _ensure_fit_collection(scene: bpy.types.Scene) -> bpy.types.Collection:
+    """兼容旧调用：外轮廓曲线写入「拟合曲线」。"""
+    return _ensure_curve_collection(scene)
 
 
 def _delete_object(obj: bpy.types.Object | None) -> None:
@@ -794,7 +824,7 @@ class ARE_OT_fit_region(bpy.types.Operator):
     bl_idname = "are.fit_region"
     bl_label = "拟合领域"
     bl_description = (
-        "点击领域编号，生成可编辑外轮廓曲线到「拟合面」集合；"
+        "点击领域编号，生成可编辑外轮廓曲线到「拟合曲线」集合；"
         "Shift+多选后按 Enter 确认；曲线带 are_fit_region_id 属性"
     )
     bl_options = {"REGISTER", "UNDO"}
