@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import time
+
 import bpy
 import gpu
 import numpy as np
@@ -1001,16 +1003,35 @@ def _build_region_draw_arrays(
     忽略标签（<0）的面不进入绘制缓冲。
     可传入内存中的 region_ids/palette（合并预览）。
     """
+    coords, face_per_tri, colors = _build_region_draw_parts(
+        obj,
+        region_ids=region_ids,
+        palette=palette,
+    )
+    return coords, colors
+
+
+def _build_region_draw_parts(
+    obj: bpy.types.Object,
+    region_ids: np.ndarray | None = None,
+    palette: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    返回 (world_coords, face_per_tri, colors)。
+
+    合并预览可缓存 coords/face_per_tri，仅在标签变化时重算 colors。
+    """
     mesh = obj.data
     if region_ids is None:
         region_ids = _read_region_ids(mesh)
     else:
         region_ids = np.asarray(region_ids, dtype=np.int32)
 
+    empty_pos = np.empty((0, 3), dtype=np.float32)
+    empty_faces = np.empty(0, dtype=np.int64)
+    empty_col = np.empty((0, 4), dtype=np.float32)
     if region_ids is None or len(region_ids) == 0:
-        empty_pos = np.empty((0, 3), dtype=np.float32)
-        empty_col = np.empty((0, 4), dtype=np.float32)
-        return empty_pos, empty_col
+        return empty_pos, empty_faces, empty_col
 
     polygon_count = len(mesh.polygons)
     if len(region_ids) != polygon_count:
@@ -1018,9 +1039,7 @@ def _build_region_draw_arrays(
 
     valid_faces = np.flatnonzero(region_ids >= 0)
     if len(valid_faces) == 0:
-        empty_pos = np.empty((0, 3), dtype=np.float32)
-        empty_col = np.empty((0, 4), dtype=np.float32)
-        return empty_pos, empty_col
+        return empty_pos, empty_faces, empty_col
 
     region_count = int(region_ids.max()) + 1
     if palette is None:
@@ -1041,9 +1060,7 @@ def _build_region_draw_arrays(
         valid_faces,
     )
     if len(tri_verts) == 0:
-        empty_pos = np.empty((0, 3), dtype=np.float32)
-        empty_col = np.empty((0, 4), dtype=np.float32)
-        return empty_pos, empty_col
+        return empty_pos, empty_faces, empty_col
 
     local_all = _read_local_vertices(mesh)
     world = _local_to_world(obj, local_all[tri_verts])
@@ -1059,7 +1076,27 @@ def _build_region_draw_arrays(
         3,
         axis=0,
     )
-    return world, color_array
+    return world, face_per_tri, color_array
+
+
+def _region_tri_colors(
+    region_ids: np.ndarray,
+    face_per_tri: np.ndarray,
+    palette: np.ndarray,
+) -> np.ndarray:
+    """按已缓存的 face_per_tri 仅重算逐顶点颜色。"""
+    ids = np.asarray(region_ids, dtype=np.int32)
+    faces = np.asarray(face_per_tri, dtype=np.int64)
+    colors = np.asarray(palette, dtype=np.float32)
+    if len(faces) == 0:
+        return np.empty((0, 4), dtype=np.float32)
+    region_count = int(ids.max()) + 1 if len(ids) else 0
+    if len(colors) < region_count:
+        from ..algorithms.regions import generate_region_colors
+
+        extra = generate_region_colors(region_count - len(colors))
+        colors = np.vstack((colors, extra))
+    return np.repeat(colors[ids[faces]].astype(np.float32), 3, axis=0)
 
 
 def _build_selection_highlight_coords(
@@ -1075,6 +1112,14 @@ def _build_selection_highlight_coords(
         np.asarray(region_ids, dtype=np.int32) == highlight_id
     )
     if len(faces) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    # 超大领域高亮会卡死主线程；跳过几何构建，仅保留编号交互
+    if len(faces) > 250_000:
+        from ..utils.debug import are_debug
+
+        are_debug(
+            f"skip highlight id={highlight_id} faces={len(faces)} (>250k)"
+        )
         return np.empty((0, 3), dtype=np.float32)
 
     loop_start, loop_total, loop_verts = _read_loop_arrays(mesh)
@@ -1263,21 +1308,61 @@ def draw_overlays() -> None:
     ):
         hover_id = active_label_hover_id(scene_props)
         if use_merge_preview:
+            from ..utils.debug import are_debug
+
             live_ids = np.asarray(merge_session["region_ids"], dtype=np.int32)
             live_colors = merge_session.get("colors")
             version = merge_session.get("preview_version", 0)
             pointer = region_obj.as_pointer()
+            valid_count = int(np.count_nonzero(live_ids >= 0))
+            geom_key = (pointer, valid_count, len(live_ids))
+            color_key = (pointer, version, valid_count)
 
-            preview_key = (pointer, version)
-            if _MERGE_PREVIEW_CACHE.get("key") != preview_key:
-                coords, colors = _build_region_draw_arrays(
+            if _MERGE_PREVIEW_CACHE.get("geom_key") != geom_key:
+                t0 = time.perf_counter()
+                are_debug(
+                    f"merge_preview geom rebuild faces={len(live_ids)} "
+                    f"valid={valid_count}"
+                )
+                coords, face_per_tri, colors = _build_region_draw_parts(
                     region_obj,
                     region_ids=live_ids,
                     palette=live_colors,
                 )
-                _MERGE_PREVIEW_CACHE["key"] = preview_key
+                _MERGE_PREVIEW_CACHE["geom_key"] = geom_key
                 _MERGE_PREVIEW_CACHE["coords"] = coords
+                _MERGE_PREVIEW_CACHE["face_per_tri"] = face_per_tri
                 _MERGE_PREVIEW_CACHE["colors"] = colors
+                _MERGE_PREVIEW_CACHE["color_key"] = color_key
+                are_debug(
+                    f"merge_preview geom done tris={len(face_per_tri)} "
+                    f"ms={(time.perf_counter() - t0) * 1000.0:.1f}"
+                )
+            elif _MERGE_PREVIEW_CACHE.get("color_key") != color_key:
+                t0 = time.perf_counter()
+                are_debug(f"merge_preview colors only version={version}")
+                face_per_tri = _MERGE_PREVIEW_CACHE.get("face_per_tri")
+                if face_per_tri is None or live_colors is None:
+                    coords, face_per_tri, colors = _build_region_draw_parts(
+                        region_obj,
+                        region_ids=live_ids,
+                        palette=live_colors,
+                    )
+                    _MERGE_PREVIEW_CACHE["coords"] = coords
+                    _MERGE_PREVIEW_CACHE["face_per_tri"] = face_per_tri
+                    _MERGE_PREVIEW_CACHE["colors"] = colors
+                else:
+                    _MERGE_PREVIEW_CACHE["colors"] = _region_tri_colors(
+                        live_ids,
+                        face_per_tri,
+                        live_colors,
+                    )
+                _MERGE_PREVIEW_CACHE["color_key"] = color_key
+                are_debug(
+                    f"merge_preview colors done "
+                    f"ms={(time.perf_counter() - t0) * 1000.0:.1f}"
+                )
+
             _draw_colored_tris(
                 _MERGE_PREVIEW_CACHE["coords"],
                 _MERGE_PREVIEW_CACHE["colors"],
@@ -1292,6 +1377,8 @@ def draw_overlays() -> None:
                 slot_key = (pointer, version, anchor_id)
                 entry = _HIGHLIGHT_CACHE.get("anchor")
                 if entry is None or entry.get("key") != slot_key:
+                    t0 = time.perf_counter()
+                    are_debug(f"merge_preview anchor highlight id={anchor_id}")
                     entry = {
                         "key": slot_key,
                         "coords": _build_selection_highlight_coords(
@@ -1301,6 +1388,10 @@ def draw_overlays() -> None:
                         ),
                     }
                     _HIGHLIGHT_CACHE["anchor"] = entry
+                    are_debug(
+                        f"merge_preview anchor done "
+                        f"ms={(time.perf_counter() - t0) * 1000.0:.1f}"
+                    )
                 _draw_uniform_tris(entry["coords"], ANCHOR_HIGHLIGHT_COLOR)
             _draw_label_hover_highlight(
                 region_obj,

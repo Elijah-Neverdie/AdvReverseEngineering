@@ -44,6 +44,7 @@ from ..ui.overlay import (
 from ..utils.mesh import extract_face_topology, extract_mesh_data
 from ..utils.progress import progress_scope
 from ..utils.viewport import hit_test_labels
+from ..utils.debug import are_debug, are_debug_clear, debug_log_path
 
 
 REGION_ID_ATTR = "are_region_id"
@@ -298,6 +299,7 @@ def _build_label_session(
         "mesh_data": mesh_data,
         # 大网格上逐标签 scene.ray_cast 会让合并/悬停卡死；朝向过滤仍保留
         "skip_occlusion": True,
+        "skip_facing": False,
     }
 
 
@@ -1133,6 +1135,13 @@ class ARE_OT_merge_regions(bpy.types.Operator):
 
     def _refresh_preview(self, context: bpy.types.Context) -> None:
         """用内存标签刷新编号会话与覆盖层预览（不写 Mesh）。"""
+        import time as _time
+
+        t0 = _time.perf_counter()
+        are_debug(
+            f"merge._refresh_preview begin count={self._live_count} "
+            f"faces={len(self._live_ids)}"
+        )
         obj = self._object
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         mesh_data = self._mesh_data
@@ -1140,6 +1149,10 @@ class ARE_OT_merge_regions(bpy.types.Operator):
             self._live_ids,
             mesh_data,
             self._live_colors,
+        )
+        are_debug(
+            f"merge._refresh_preview labels={len(session.get('labels') or [])} "
+            f"ms={(_time.perf_counter() - t0) * 1000.0:.1f}"
         )
         session["object_name"] = obj.name
         # 预览版本号驱动 overlay 缓存，仅标签变化时重建三角缓冲。
@@ -1160,6 +1173,10 @@ class ARE_OT_merge_regions(bpy.types.Operator):
             )
         )
         _tag_redraw(context)
+        are_debug(
+            f"merge._refresh_preview end version={self._preview_serial} "
+            f"ms={(_time.perf_counter() - t0) * 1000.0:.1f}"
+        )
 
     def _push_history(self) -> None:
         self._history.append(
@@ -1228,6 +1245,11 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         return obj.data.attributes.get(REGION_ID_ATTR) is not None
 
     def invoke(self, context: bpy.types.Context, event):
+        import time as _time
+
+        are_debug_clear()
+        are_debug(f"merge.invoke begin log={debug_log_path()}")
+        t0 = _time.perf_counter()
         obj = context.active_object
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         region_ids = read_region_ids(obj.data)
@@ -1236,8 +1258,16 @@ class ARE_OT_merge_regions(bpy.types.Operator):
             return {"CANCELLED"}
 
         region_count = int(region_ids.max()) + 1
+        are_debug(
+            f"merge.invoke faces={len(region_ids)} regions={region_count}"
+        )
         colors = _read_region_colors(obj, region_count)
+        t1 = _time.perf_counter()
         mesh_data = extract_mesh_data(obj)
+        are_debug(
+            f"merge.invoke extract_mesh_data "
+            f"ms={(_time.perf_counter() - t1) * 1000.0:.1f}"
+        )
 
         self._object = obj
         self._mesh_data = mesh_data
@@ -1259,7 +1289,12 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         # 进入合并时清掉拟合内角标，避免残留会话拖慢投影/绘制
         set_fit_angle_label_session(None)
 
+        t2 = _time.perf_counter()
         session = _build_label_session(region_ids, mesh_data, colors)
+        are_debug(
+            f"merge.invoke build_labels n={len(session.get('labels') or [])} "
+            f"ms={(_time.perf_counter() - t2) * 1000.0:.1f}"
+        )
         session["object_name"] = obj.name
         session["preview_version"] = 0
         set_merge_label_session(session)
@@ -1278,6 +1313,10 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         _add_modal_timer(self, context)
         context.window_manager.modal_handler_add(self)
         _tag_redraw(context)
+        are_debug(
+            f"merge.invoke RUNNING_MODAL "
+            f"total_ms={(_time.perf_counter() - t0) * 1000.0:.1f}"
+        )
         return {"RUNNING_MODAL"}
 
     def cancel(self, context: bpy.types.Context):
@@ -1391,11 +1430,23 @@ class ARE_OT_merge_regions(bpy.types.Operator):
             try:
                 self._anchor_before_merge = anchor
                 self._push_history()
+                are_debug(
+                    f"merge.click merge_region_ids "
+                    f"anchor={anchor} hit={int(hit)}"
+                )
+                import time as _time
+
+                t_merge = _time.perf_counter()
                 new_ids, new_colors, new_count, new_anchor = merge_region_ids(
                     self._live_ids,
                     self._live_colors,
                     anchor,
                     int(hit),
+                )
+                are_debug(
+                    f"merge.click merge_region_ids done "
+                    f"count={new_count} "
+                    f"ms={(_time.perf_counter() - t_merge) * 1000.0:.1f}"
                 )
             except ValueError as exc:
                 if self._history:
