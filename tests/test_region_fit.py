@@ -1451,6 +1451,31 @@ class FitRegionSurfaceTests(unittest.TestCase):
         self.assertLess(len(cleaned), len(spiked))
         self.assertLess(float(cleaned[:, 1].max()), 1.05)
 
+    def test_weld_does_not_decimate_uniform_boundary(self) -> None:
+        """均匀重采样边界不应被「最长边5%」整边抽成稀疏折线。"""
+        from AdvReverseEngineering.algorithms.region_fit import (
+            resample_closed_polyline,
+            resolve_weld_min_distance,
+            weld_then_collapse_fit_loop,
+        )
+
+        square = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [10.0, 10.0, 0.0],
+                [0.0, 10.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        sampled = resample_closed_polyline(square, 100)
+        longest = 10.0
+        min_d = resolve_weld_min_distance(sampled, longest, weld_frac=0.05)
+        # 均匀间距约 0.4，5%最长边=0.5，取较小后应明显小于均匀间距
+        self.assertLess(min_d, 0.25)
+        cleaned = weld_then_collapse_fit_loop(sampled, corner_angle_deg=35.0)
+        self.assertGreaterEqual(len(cleaned), 85)
+
     def test_weld_spatial_close_hairpin_shoulders(self) -> None:
         """发夹两侧肩点空间很近但非相邻，也应按最长边 5% 焊掉短弧。"""
         from AdvReverseEngineering.algorithms.region_fit import (

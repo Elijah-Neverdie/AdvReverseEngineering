@@ -1321,6 +1321,41 @@ def estimate_longest_fit_side_length(
     )
 
 
+def resolve_weld_min_distance(
+    points: np.ndarray,
+    longest_side_length: float,
+    *,
+    weld_frac: float = _WELD_LONGEST_SIDE_FRAC,
+    sample_frac: float = 0.4,
+) -> float:
+    """
+    计算焊接距离阈值。
+
+    上限 = 最长拟合边 × weld_frac（默认 5%），用于拐角密点簇。
+    同时不超过中位相邻边长 × sample_frac，避免均匀重采样后
+    把整条光滑边抽成稀疏折线。
+    """
+    pts = _as_float_array(points)
+    if len(pts) < 2:
+        return 0.0
+    if float(np.linalg.norm(pts[0] - pts[-1])) < 1e-9 and len(pts) > 2:
+        pts = pts[:-1]
+    if len(pts) < 2:
+        return 0.0
+    edges = np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1)
+    positive = edges[edges > 1e-12]
+    if len(positive) == 0:
+        return 0.0
+    median_edge = float(np.median(positive))
+    cluster_cap = max(float(longest_side_length) * float(max(weld_frac, 0.0)), 0.0)
+    sample_cap = median_edge * float(max(sample_frac, 0.0))
+    if cluster_cap <= 0.0:
+        return max(sample_cap, 0.0)
+    if sample_cap <= 0.0:
+        return cluster_cap
+    return float(min(cluster_cap, sample_cap))
+
+
 def weld_close_points_closed_loop(
     points: np.ndarray,
     min_distance: float,
@@ -1451,8 +1486,8 @@ def weld_then_collapse_fit_loop(
     """
     准备用于内角计算的拟合闭环：收束尖刺 → 焊接过近点 → 再收束。
 
-    焊接阈值 = 最长拟合边弧长 × weld_frac（默认 5%）。
-    先收束可避免焊接抹平圆滑尖端后漏检；焊后再收束处理焊接形成的新尖刺。
+    焊接阈值 = min(最长边×weld_frac, 中位邻边×0.4)，
+    只合并异常过近的拐角簇，不把整条边抽成折线。
     """
     from ..utils.debug import are_debug
     import time as _time
@@ -1469,7 +1504,7 @@ def weld_then_collapse_fit_loop(
         if longest_side_length is not None and float(longest_side_length) > 0.0
         else estimate_longest_fit_side_length(pts, corner_angle_deg)
     )
-    min_dist = max(float(longest) * float(max(weld_frac, 0.0)), 0.0)
+    min_dist = resolve_weld_min_distance(pts, longest, weld_frac=weld_frac)
     n1 = len(pts)
     if min_dist > 0.0:
         pts = weld_close_points_closed_loop(pts, min_dist)
@@ -4198,7 +4233,7 @@ def extract_island_longest_sides(
             )
         )
         loop_rs = resample_closed_polyline(loop_pts, sample_count)
-        # 过近点焊接（最长边×5%）后再算内角并收束尖刺
+        # 重采样后再焊：阈值受中位邻边限制，不会把整条边抽成折线
         loop_rs = weld_then_collapse_fit_loop(
             loop_rs,
             corner_angle_deg=corner_angle_deg,
@@ -5752,4 +5787,5 @@ __all__ = (
     "soft_snap_quad_grid_to_points",
     "weld_close_points_closed_loop",
     "weld_then_collapse_fit_loop",
+    "resolve_weld_min_distance",
 )
