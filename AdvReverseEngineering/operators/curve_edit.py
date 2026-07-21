@@ -11,13 +11,17 @@ import numpy as np
 from ..algorithms.curve_edit import (
     RegionFitError,
     best_closed_alignment,
+    best_open_alignment,
     estimate_similarity_transform,
     find_break_indices,
     fit_bezier_n_controls,
+    opposite_edge_pairs,
+    order_open_curves_as_closed_loop,
     sample_polyline_uniform,
     segment_colors_for_count,
     split_polyline_at_breaks,
     transform_bezier_points,
+    weld_bezier_loop_endpoints,
 )
 from ..algorithms.region_fit import sample_cubic_bezier
 from ..registration import SCENE_PROP_NAME
@@ -418,6 +422,8 @@ def _write_bezier_spline(
     curve = obj.data
     _clear_splines(curve)
     curve.materials.clear()
+    curve.bevel_depth = 0.0
+    curve.bevel_resolution = 0
     matrix = obj.matrix_world
     spline = curve.splines.new("BEZIER")
     if len(bezier_points) > 1:
@@ -544,7 +550,7 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
 
     def _commit(self, context: bpy.types.Context) -> bool:
         collection = _ensure_fit_collection(context.scene)
-        created = 0
+        created_objs: list[bpy.types.Object] = []
         for obj, segments in getattr(self, "_preview_segments", []) or []:
             if len(segments) <= 1:
                 colors = segment_colors_for_count(1)
@@ -552,16 +558,18 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
                     obj, segments, colors, cyclic_flags=[False]
                 )
                 obj["are_fit_kind"] = "contour_split"
-                obj.display_type = "TEXTURED"
+                if obj.data is not None:
+                    obj.data.bevel_depth = 0.0
+                    obj.data.bevel_resolution = 0
+                obj.display_type = "WIRE"
                 obj.color = (1.0, 1.0, 1.0, 1.0)
-                created += 1
+                created_objs.append(obj)
                 continue
             base_name = obj.name
             backups_attrs = {
                 k: obj[k] for k in obj.keys() if k != "_RNA_UI"
             }
             matrix = obj.matrix_world.copy()
-            bevel = float(max(obj.data.bevel_depth, 0.0015))
             colors = segment_colors_for_count(len(segments))
             _write_poly_segments(
                 obj,
@@ -572,13 +580,14 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
             obj.name = f"{base_name}_S0"
             if obj.data is not None:
                 obj.data.name = obj.name
-                obj.data.bevel_depth = bevel
+                obj.data.bevel_depth = 0.0
+                obj.data.bevel_resolution = 0
             obj["are_fit_kind"] = "contour_split"
             obj["are_fit_split_index"] = 0
-            obj.display_type = "TEXTURED"
+            obj.display_type = "WIRE"
             obj.show_in_front = True
             obj.color = (1.0, 1.0, 1.0, 1.0)
-            created += 1
+            created_objs.append(obj)
             for index, segment in enumerate(segments[1:], start=1):
                 curve = bpy.data.curves.new(
                     f"{base_name}_S{index}", type="CURVE"
@@ -587,11 +596,11 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
                     f"{base_name}_S{index}", curve
                 )
                 curve.dimensions = "3D"
-                curve.bevel_depth = bevel
-                curve.bevel_resolution = 2
+                curve.bevel_depth = 0.0
+                curve.bevel_resolution = 0
                 new_obj.matrix_world = matrix
                 new_obj.show_in_front = True
-                new_obj.display_type = "TEXTURED"
+                new_obj.display_type = "WIRE"
                 new_obj.color = (1.0, 1.0, 1.0, 1.0)
                 if new_obj.name not in collection.objects:
                     collection.objects.link(new_obj)
@@ -608,11 +617,28 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
                     [colors[index % len(colors)]],
                     cyclic_flags=[False],
                 )
-                created += 1
+                created_objs.append(new_obj)
+
+        # 默认选中拆分后的全部曲线
+        for obj in list(context.selected_objects):
+            try:
+                obj.select_set(False)
+            except ReferenceError:
+                pass
+        for obj in created_objs:
+            try:
+                obj.select_set(True)
+            except ReferenceError:
+                pass
+        if created_objs:
+            context.view_layer.objects.active = created_objs[0]
+
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        scene_props.curve_split_status = f"已拆分为 {created} 条曲线"
+        scene_props.curve_split_status = (
+            f"已拆分为 {len(created_objs)} 条曲线（已全选）"
+        )
         self.report({"INFO"}, scene_props.curve_split_status)
-        return created > 0
+        return len(created_objs) > 0
 
     def _cleanup(self, context: bpy.types.Context, restore: bool) -> None:
         # 无论还原是否成功，都必须清掉 GPU 预览，避免残影
@@ -772,7 +798,8 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
     bl_label = "拟合曲线"
     bl_description = (
         "将选中曲线转为 n 个控制点的贝塞尔（默认 4，Ctrl+滚轮调节，最少 3）；"
-        "按 S 切换相似模式：多条相似曲线拟合一条原型并变换对齐"
+        "按 S 切换相似模式；四条端点近乎闭合时自动识别对边，"
+        "相似模式下对边两两相似并焊接端点保持封闭"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -781,8 +808,12 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         n = int(getattr(self, "_controls", DEFAULT_BEZIER_CONTROLS))
         similar = bool(getattr(self, "_similar", False))
         mode = "开" if similar else "关"
+        quad = bool(getattr(self, "_quad_loop_active", False))
+        extra = " · 四边形对边封闭" if quad else ""
+        if quad and similar:
+            extra = " · 对边两两相似·封闭"
         text = (
-            f"拟合曲线：控制点 {n} · 相似模式 {mode} · "
+            f"拟合曲线：控制点 {n} · 相似模式 {mode}{extra} · "
             "Ctrl+滚轮调点数 · S 切换相似 · Enter 确认 · Esc 取消"
         )
         scene_props.curve_fit_status = text
@@ -805,9 +836,105 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             return 0.0
         return float(np.linalg.norm(np.diff(ring, axis=0), axis=1).sum())
 
+    def _collect_quad_open_edges(self) -> list[tuple] | None:
+        """恰好 4 条物体、各一条开环样条时返回 [(obj, source), ...]。"""
+        if len(self._targets) != 4:
+            return None
+        edges: list[tuple] = []
+        for obj, sources in self._targets:
+            opens = [
+                source
+                for source in sources
+                if (not source["cyclic"]) and len(source["points"]) >= 2
+            ]
+            if len(opens) != 1:
+                return None
+            edges.append((obj, opens[0]))
+        return edges
+
+    def _rebuild_quad_loop_preview(
+        self,
+        edges: list[tuple],
+        similar: bool,
+    ) -> bool:
+        """
+        四条开环端点近乎闭合时：识别对边；相似则对边两两相似；焊接端点。
+        """
+        polylines = [source["points"] for _obj, source in edges]
+        ordered = order_open_curves_as_closed_loop(polylines)
+        if ordered is None:
+            return False
+        order, flipped, _gap = ordered
+        loop_items: list[tuple] = []
+        for index, reverse in zip(order, flipped):
+            obj, source = edges[index]
+            pts = np.asarray(source["points"], dtype=np.float64)
+            if reverse:
+                pts = pts[::-1].copy()
+            loop_items.append((obj, pts))
+
+        beziers: list[list[dict] | None] = [None, None, None, None]
+        if similar:
+            for pair_id, (a, b) in enumerate(opposite_edge_pairs(4)):
+                len_a = self._polyline_length(loop_items[a][1], False)
+                len_b = self._polyline_length(loop_items[b][1], False)
+                if len_a >= len_b:
+                    ref_i, dst_i = a, b
+                else:
+                    ref_i, dst_i = b, a
+                ref_pts = loop_items[ref_i][1]
+                dst_pts = loop_items[dst_i][1]
+                prototype = self._fit_one(ref_pts, False)
+                ref_samples = sample_polyline_uniform(
+                    ref_pts, SIMILAR_SAMPLE_COUNT, cyclic=False
+                )
+                dst_samples = sample_polyline_uniform(
+                    dst_pts, SIMILAR_SAMPLE_COUNT, cyclic=False
+                )
+                aligned, _rmse = best_open_alignment(ref_samples, dst_samples)
+                scale, rotation, translation = estimate_similarity_transform(
+                    ref_samples, aligned
+                )
+                fitted = transform_bezier_points(
+                    prototype, scale, rotation, translation
+                )
+                beziers[ref_i] = prototype
+                beziers[dst_i] = fitted
+                loop_items[ref_i][0]["are_fit_opposite_pair"] = int(pair_id)
+                loop_items[dst_i][0]["are_fit_opposite_pair"] = int(pair_id)
+        else:
+            for index, (_obj, pts) in enumerate(loop_items):
+                beziers[index] = self._fit_one(pts, False)
+
+        if any(item is None for item in beziers):
+            return False
+        welded = weld_bezier_loop_endpoints(beziers)
+        group_id = f"quad_{loop_items[0][0].name}"
+        for index, (obj, _pts) in enumerate(loop_items):
+            fitted = welded[index]
+            _write_bezier_spline(obj, fitted, cyclic=False)
+            obj["are_fit_kind"] = "contour_bezier"
+            obj["are_fit_quad_loop"] = True
+            obj["are_fit_similar"] = bool(similar)
+            if similar:
+                obj["are_fit_similar_group"] = group_id
+            self._preview_payload.append((obj, fitted, False))
+        self._quad_loop_active = True
+        return True
+
     def _rebuild_preview(self, context: bpy.types.Context) -> bool:
         similar = bool(getattr(self, "_similar", False))
         self._preview_payload = []
+        self._quad_loop_active = False
+        quad_edges = self._collect_quad_open_edges()
+        if quad_edges is not None and self._rebuild_quad_loop_preview(
+            quad_edges, similar
+        ):
+            preview = _bezier_preview_from_payload(self._preview_payload)
+            set_curve_bezier_preview(preview)
+            self._update_status(context)
+            return True
+
         if similar and len(self._targets) >= 2:
             ranked = []
             for obj, sources in self._targets:
@@ -841,16 +968,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 if cyclic or source["cyclic"]:
                     aligned, _rmse = best_closed_alignment(ref_samples, samples)
                 else:
-                    aligned = samples
-                    rev = samples[::-1]
-                    err = float(
-                        np.mean(np.sum((aligned - ref_samples) ** 2, axis=1))
-                    )
-                    err_r = float(
-                        np.mean(np.sum((rev - ref_samples) ** 2, axis=1))
-                    )
-                    if err_r < err:
-                        aligned = rev
+                    aligned, _rmse = best_open_alignment(ref_samples, samples)
                 scale, rotation, translation = estimate_similarity_transform(
                     ref_samples, aligned
                 )
@@ -920,6 +1038,11 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         n = int(self._controls)
         similar = "相似" if self._similar else "独立"
+        if getattr(self, "_quad_loop_active", False):
+            if self._similar:
+                similar = "对边两两相似·封闭"
+            else:
+                similar = "四边形封闭"
         scene_props.curve_fit_status = (
             f"已拟合为 {n} 控制点贝塞尔（{similar}）"
         )
@@ -990,6 +1113,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         self._similar = bool(getattr(scene_props, "curve_fit_similar", False))
         self._committed = False
         self._preview_payload = []
+        self._quad_loop_active = False
         scene_props.curve_fit_mode_active = True
         scene_props.curve_fit_confirm_requested = False
         scene_props.curve_fit_controls = self._controls

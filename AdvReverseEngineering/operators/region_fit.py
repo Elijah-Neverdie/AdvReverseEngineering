@@ -411,9 +411,9 @@ def _create_editable_contour_curve(
     _link_object_to_scene(obj, collection)
 
     curve.dimensions = "3D"
-    curve.bevel_depth = float(max(float(debug.get("bevel_depth", 0.002)) * 0.5, 1e-4))
-    curve.bevel_resolution = 2
-    curve.use_fill_caps = True
+    curve.bevel_depth = 0.0
+    curve.bevel_resolution = 0
+    curve.use_fill_caps = False
 
     for island in debug.get("islands", []):
         loop = _join_island_closed_loop(island)

@@ -259,6 +259,137 @@ def sample_polyline_uniform(
     return resample_polyline(pts, target)
 
 
+def best_open_alignment(
+    src: np.ndarray,
+    dst: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """开环采样对齐：仅尝试是否反向。"""
+    a = _as_float_array(src)
+    b = _as_float_array(dst)
+    if len(a) != len(b) or len(a) < 2:
+        raise RegionFitError("开环对齐需要等长采样点")
+    err = float(np.mean(np.sum((b - a) ** 2, axis=1)))
+    rev = b[::-1].copy()
+    err_r = float(np.mean(np.sum((rev - a) ** 2, axis=1)))
+    if err_r < err:
+        return rev, err_r
+    return b.copy(), err
+
+
+def order_open_curves_as_closed_loop(
+    polylines: Sequence[np.ndarray],
+    max_gap_frac: float = 0.08,
+) -> tuple[list[int], list[bool], float] | None:
+    """
+    将开环折线排成闭合环（端点近乎相接）。
+
+    返回 (顺序下标, 是否反向, 最大接缝距离)；无法成环则 None。
+    仅支持恰好 4 条，用于对边识别。
+    """
+    curves = [_as_float_array(p) for p in polylines]
+    if len(curves) != 4:
+        return None
+    if any(len(p) < 2 for p in curves):
+        return None
+
+    lengths = [float(polyline_length(p)) for p in curves]
+    ref_len = float(max(sum(lengths) / len(lengths), 1e-6))
+    max_gap = ref_len * float(max(max_gap_frac, 1e-4))
+
+    ends = [(p[0].copy(), p[-1].copy()) for p in curves]
+    used = [False] * 4
+    order = [0]
+    flipped = [False]
+    used[0] = True
+    tip = ends[0][1].copy()
+    worst_gap = 0.0
+
+    for _ in range(3):
+        best_i = -1
+        best_flip = False
+        best_d = float("inf")
+        best_tip = tip
+        for index in range(4):
+            if used[index]:
+                continue
+            start_pt, end_pt = ends[index]
+            d0 = float(np.linalg.norm(start_pt - tip))
+            d1 = float(np.linalg.norm(end_pt - tip))
+            if d0 < best_d:
+                best_d = d0
+                best_i = index
+                best_flip = False
+                best_tip = end_pt
+            if d1 < best_d:
+                best_d = d1
+                best_i = index
+                best_flip = True
+                best_tip = start_pt
+        if best_i < 0 or best_d > max_gap:
+            return None
+        used[best_i] = True
+        order.append(best_i)
+        flipped.append(best_flip)
+        tip = best_tip.copy()
+        worst_gap = max(worst_gap, best_d)
+
+    close_d = float(np.linalg.norm(tip - ends[0][0]))
+    if close_d > max_gap:
+        return None
+    worst_gap = max(worst_gap, close_d)
+    return order, flipped, worst_gap
+
+
+def opposite_edge_pairs(count: int = 4) -> list[tuple[int, int]]:
+    """有序闭环上的对边下标对：0-2、1-3。"""
+    if int(count) != 4:
+        return []
+    return [(0, 2), (1, 3)]
+
+
+def weld_bezier_loop_endpoints(
+    loop_beziers: Sequence[Sequence[dict]],
+) -> list[list[dict]]:
+    """
+    四段开环贝塞尔首尾共点，保持封闭。
+
+    每个接缝取相邻端点中点，手柄随锚点平移。
+    """
+    result = [
+        [
+            {
+                "co": np.asarray(bp["co"], dtype=np.float64).copy(),
+                "handle_left": np.asarray(bp["handle_left"], dtype=np.float64).copy(),
+                "handle_right": np.asarray(
+                    bp["handle_right"], dtype=np.float64
+                ).copy(),
+            }
+            for bp in bezier
+        ]
+        for bezier in loop_beziers
+    ]
+    n = len(result)
+    if n < 2:
+        return result
+    for index in range(n):
+        a = result[index]
+        b = result[(index + 1) % n]
+        if not a or not b:
+            continue
+        end_bp = a[-1]
+        start_bp = b[0]
+        mid = 0.5 * (end_bp["co"] + start_bp["co"])
+        delta_end = mid - end_bp["co"]
+        delta_start = mid - start_bp["co"]
+        end_bp["co"] = mid.copy()
+        end_bp["handle_left"] = end_bp["handle_left"] + delta_end
+        end_bp["handle_right"] = end_bp["handle_right"] + delta_end
+        start_bp["co"] = mid.copy()
+        start_bp["handle_left"] = start_bp["handle_left"] + delta_start
+        start_bp["handle_right"] = start_bp["handle_right"] + delta_start
+    return result
+
+
 def best_closed_alignment(
     src: np.ndarray,
     dst: np.ndarray,
@@ -359,14 +490,18 @@ __all__ = (
     "RegionFitError",
     "apply_similarity",
     "best_closed_alignment",
+    "best_open_alignment",
     "estimate_similarity_transform",
     "extract_subpolyline_by_arc",
     "find_break_indices",
     "fit_bezier_n_controls",
+    "opposite_edge_pairs",
+    "order_open_curves_as_closed_loop",
     "point_at_arc_length",
     "sample_polyline_uniform",
     "segment_colors_for_count",
     "split_polyline_at_breaks",
     "transform_bezier_points",
     "turn_angles_deg",
+    "weld_bezier_loop_endpoints",
 )

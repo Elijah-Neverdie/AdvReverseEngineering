@@ -12,9 +12,12 @@ from AdvReverseEngineering.algorithms.curve_edit import (
     estimate_similarity_transform,
     find_break_indices,
     fit_bezier_n_controls,
+    opposite_edge_pairs,
+    order_open_curves_as_closed_loop,
     split_polyline_at_breaks,
     transform_bezier_points,
     turn_angles_deg,
+    weld_bezier_loop_endpoints,
 )
 
 
@@ -67,6 +70,60 @@ class CurveEditTests(unittest.TestCase):
         proto = fit_bezier_n_controls(src, 4, cyclic=True)
         xform = transform_bezier_points(proto, scale, rotation, translation)
         self.assertEqual(len(xform), 4)
+
+    def test_order_open_curves_as_closed_quad(self) -> None:
+        # 故意乱序 + 一条反向，端点应能串成单位正方形
+        bottom = np.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        right = np.array([[1.0, 0.0, 0.0], [1.0, 0.5, 0.0], [1.0, 1.0, 0.0]])
+        top = np.array([[1.0, 1.0, 0.0], [0.5, 1.0, 0.0], [0.0, 1.0, 0.0]])
+        left = np.array([[0.0, 1.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.0]])
+        # 乱序：right, left(反向), bottom, top
+        left_rev = left[::-1].copy()
+        result = order_open_curves_as_closed_loop(
+            [right, left_rev, bottom, top]
+        )
+        self.assertIsNotNone(result)
+        order, flipped, gap = result
+        self.assertLess(gap, 0.05)
+        self.assertEqual(len(order), 4)
+        self.assertEqual(set(order), {0, 1, 2, 3})
+        self.assertEqual(opposite_edge_pairs(4), [(0, 2), (1, 3)])
+
+    def test_weld_bezier_loop_endpoints_closes(self) -> None:
+        def _line_bez(a, b):
+            a = np.asarray(a, dtype=np.float64)
+            b = np.asarray(b, dtype=np.float64)
+            mid = 0.5 * (a + b)
+            return [
+                {
+                    "co": a.copy(),
+                    "handle_left": a - np.array([0.1, 0.0, 0.0]),
+                    "handle_right": a + np.array([0.1, 0.0, 0.0]),
+                },
+                {
+                    "co": mid.copy(),
+                    "handle_left": mid - np.array([0.05, 0.0, 0.0]),
+                    "handle_right": mid + np.array([0.05, 0.0, 0.0]),
+                },
+                {
+                    "co": b.copy(),
+                    "handle_left": b - np.array([0.1, 0.0, 0.0]),
+                    "handle_right": b + np.array([0.1, 0.0, 0.0]),
+                },
+            ]
+
+        # 故意留缝隙
+        sides = [
+            _line_bez([0.0, 0.0, 0.0], [1.02, 0.0, 0.0]),
+            _line_bez([1.0, 0.0, 0.0], [1.0, 1.01, 0.0]),
+            _line_bez([1.0, 1.0, 0.0], [-0.01, 1.0, 0.0]),
+            _line_bez([0.0, 1.0, 0.0], [0.0, -0.02, 0.0]),
+        ]
+        welded = weld_bezier_loop_endpoints(sides)
+        for index in range(4):
+            end_co = welded[index][-1]["co"]
+            start_co = welded[(index + 1) % 4][0]["co"]
+            self.assertTrue(np.allclose(end_co, start_co, atol=1e-9))
 
 
 if __name__ == "__main__":

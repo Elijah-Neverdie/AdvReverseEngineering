@@ -444,7 +444,8 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box.label(text="1. 选中拟合外轮廓曲线后点「拆分曲线」")
                     help_box.label(text="2. 折角处断开，连续段用不同颜色标记")
                     help_box.label(text="3. Ctrl+滚轮调节折角阈值")
-                    help_box.label(text="4. 左上角显示将拆分为几条")
+                    help_box.label(text="4. 左下角显示将拆分为几条")
+                    help_box.label(text="5. 确认后全选拆分结果（无粗细）")
                     help_box.label(text="Enter / 确认拆分 · Esc 取消")
 
             if curve_fitting:
@@ -480,6 +481,8 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box.label(text="2. Ctrl+滚轮调节控制点数（最少 3）")
                     help_box.label(text="3. 按 S 切换相似模式（多选时）")
                     help_box.label(text="相似：拟一条原型，变换对齐各曲线")
+                    help_box.label(text="四条端点近闭合：自动对边，相似=对边两两")
+                    help_box.label(text="四边形拟合后焊接端点保持封闭")
                     help_box.label(text="Enter / 确认拟合 · Esc 取消")
 
             if scene_props.region_status:
