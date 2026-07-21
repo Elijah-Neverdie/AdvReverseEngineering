@@ -12,13 +12,16 @@ from ..algorithms.curve_edit import (
     RegionFitError,
     best_closed_alignment,
     best_open_alignment,
+    estimate_open_directed_similarity,
     estimate_similarity_transform,
     find_break_indices,
     fit_bezier_n_controls,
     opposite_edge_pairs,
+    opposite_pair_colors,
     order_open_curves_as_closed_loop,
     sample_polyline_uniform,
     segment_colors_for_count,
+    snap_bezier_endpoints,
     split_polyline_at_breaks,
     transform_bezier_points,
     weld_bezier_loop_endpoints,
@@ -148,14 +151,24 @@ def _sample_bezier_polyline(
 def _bezier_preview_from_payload(
     payload: list[tuple],
 ) -> dict | None:
-    """从拟合结果收集 GPU 预览：曲线 / 锚点 / 手柄。"""
+    """从拟合结果收集 GPU 预览：曲线 / 锚点 / 手柄。
+
+    payload 项: (obj, fitted, cyclic) 或 (obj, fitted, cyclic, color_id)
+    color_id 用于对边同色（0/1）。
+    """
     curves: list[dict] = []
     anchors: list[np.ndarray] = []
     handles: list[np.ndarray] = []
     handle_edges: list[np.ndarray] = []
     palette = segment_colors_for_count(max(len(payload), 1))
+    pair_palette = opposite_pair_colors()
     for color_index, item in enumerate(payload):
-        _obj, fitted, cyclic = item
+        if len(item) >= 4:
+            _obj, fitted, cyclic, color_id = item[0], item[1], item[2], item[3]
+            color = pair_palette[int(color_id) % len(pair_palette)]
+        else:
+            _obj, fitted, cyclic = item[0], item[1], item[2]
+            color = palette[color_index % len(palette)]
         if not fitted:
             continue
         sampled = _sample_bezier_polyline(fitted, bool(cyclic))
@@ -163,7 +176,7 @@ def _bezier_preview_from_payload(
             curves.append(
                 {
                     "points": sampled,
-                    "color": palette[color_index % len(palette)],
+                    "color": color,
                 }
             )
         for bp in fitted:
@@ -797,32 +810,51 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
     bl_idname = "are.fit_bezier_curve"
     bl_label = "拟合曲线"
     bl_description = (
-        "将选中曲线转为 n 个控制点的贝塞尔（默认 4，Ctrl+滚轮调节，最少 3）；"
-        "按 S 切换相似模式；四条端点近乎闭合时自动识别对边，"
-        "相似模式下对边两两相似并焊接端点保持封闭"
+        "将选中曲线转为贝塞尔；四条闭合对边时：Ctrl/Shift 滚轮分别调两组控制点数，"
+        "相似模式对边两两相似（保持环向首尾），对边同色预览"
     )
     bl_options = {"REGISTER", "UNDO"}
 
+    def _clamp_controls(self, value: int) -> int:
+        return int(
+            max(BEZIER_CONTROLS_MIN, min(BEZIER_CONTROLS_MAX, int(value)))
+        )
+
     def _update_status(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        n = int(getattr(self, "_controls", DEFAULT_BEZIER_CONTROLS))
+        na = int(getattr(self, "_controls_a", DEFAULT_BEZIER_CONTROLS))
+        nb = int(getattr(self, "_controls_b", DEFAULT_BEZIER_CONTROLS))
         similar = bool(getattr(self, "_similar", False))
         mode = "开" if similar else "关"
         quad = bool(getattr(self, "_quad_loop_active", False))
-        extra = " · 四边形对边封闭" if quad else ""
-        if quad and similar:
-            extra = " · 对边两两相似·封闭"
-        text = (
-            f"拟合曲线：控制点 {n} · 相似模式 {mode}{extra} · "
-            "Ctrl+滚轮调点数 · S 切换相似 · Enter 确认 · Esc 取消"
-        )
+        if quad:
+            extra = " · 对边两两相似·封闭" if similar else " · 四边形对边封闭"
+            text = (
+                f"拟合曲线：组A {na} · 组B {nb} · 相似 {mode}{extra} · "
+                "Ctrl滚轮调A · Shift滚轮调B · S 切换相似 · Enter 确认 · Esc 取消"
+            )
+        else:
+            text = (
+                f"拟合曲线：控制点 {na} · 相似模式 {mode} · "
+                "Ctrl+滚轮调点数 · S 切换相似 · Enter 确认 · Esc 取消"
+            )
         scene_props.curve_fit_status = text
         _header(context, text)
 
-    def _fit_one(self, points: np.ndarray, cyclic: bool) -> list[dict]:
+    def _fit_one(
+        self,
+        points: np.ndarray,
+        cyclic: bool,
+        control_count: int | None = None,
+    ) -> list[dict]:
+        n = (
+            int(self._controls_a)
+            if control_count is None
+            else int(control_count)
+        )
         return fit_bezier_n_controls(
             points,
-            control_count=int(self._controls),
+            control_count=n,
             cyclic=bool(cyclic),
         )
 
@@ -859,6 +891,8 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
     ) -> bool:
         """
         四条开环端点近乎闭合时：识别对边；相似则对边两两相似；焊接端点。
+
+        相似变换严格保持环向首尾对应（禁止反向对齐），避免对边扭曲。
         """
         polylines = [source["points"] for _obj, source in edges]
         ordered = order_open_curves_as_closed_loop(polylines)
@@ -873,9 +907,15 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 pts = pts[::-1].copy()
             loop_items.append((obj, pts))
 
+        counts = [
+            self._clamp_controls(self._controls_a),
+            self._clamp_controls(self._controls_b),
+        ]
         beziers: list[list[dict] | None] = [None, None, None, None]
+        pair_ids = [0, 1, 0, 1]
         if similar:
             for pair_id, (a, b) in enumerate(opposite_edge_pairs(4)):
+                n_ctrl = counts[pair_id]
                 len_a = self._polyline_length(loop_items[a][1], False)
                 len_b = self._polyline_length(loop_items[b][1], False)
                 if len_a >= len_b:
@@ -884,19 +924,22 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                     ref_i, dst_i = b, a
                 ref_pts = loop_items[ref_i][1]
                 dst_pts = loop_items[dst_i][1]
-                prototype = self._fit_one(ref_pts, False)
+                prototype = self._fit_one(ref_pts, False, n_ctrl)
                 ref_samples = sample_polyline_uniform(
                     ref_pts, SIMILAR_SAMPLE_COUNT, cyclic=False
                 )
                 dst_samples = sample_polyline_uniform(
                     dst_pts, SIMILAR_SAMPLE_COUNT, cyclic=False
                 )
-                aligned, _rmse = best_open_alignment(ref_samples, dst_samples)
-                scale, rotation, translation = estimate_similarity_transform(
-                    ref_samples, aligned
+                # 环向已统一：禁止 reverse，否则首尾对调导致扭曲
+                scale, rotation, translation = estimate_open_directed_similarity(
+                    ref_samples, dst_samples
                 )
                 fitted = transform_bezier_points(
                     prototype, scale, rotation, translation
+                )
+                fitted = snap_bezier_endpoints(
+                    fitted, dst_pts[0], dst_pts[-1]
                 )
                 beziers[ref_i] = prototype
                 beziers[dst_i] = fitted
@@ -904,7 +947,8 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 loop_items[dst_i][0]["are_fit_opposite_pair"] = int(pair_id)
         else:
             for index, (_obj, pts) in enumerate(loop_items):
-                beziers[index] = self._fit_one(pts, False)
+                pair_id = pair_ids[index]
+                beziers[index] = self._fit_one(pts, False, counts[pair_id])
 
         if any(item is None for item in beziers):
             return False
@@ -912,13 +956,15 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         group_id = f"quad_{loop_items[0][0].name}"
         for index, (obj, _pts) in enumerate(loop_items):
             fitted = welded[index]
+            pair_id = pair_ids[index]
             _write_bezier_spline(obj, fitted, cyclic=False)
             obj["are_fit_kind"] = "contour_bezier"
             obj["are_fit_quad_loop"] = True
+            obj["are_fit_opposite_pair"] = int(pair_id)
             obj["are_fit_similar"] = bool(similar)
             if similar:
                 obj["are_fit_similar_group"] = group_id
-            self._preview_payload.append((obj, fitted, False))
+            self._preview_payload.append((obj, fitted, False, pair_id))
         self._quad_loop_active = True
         return True
 
@@ -926,6 +972,8 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         similar = bool(getattr(self, "_similar", False))
         self._preview_payload = []
         self._quad_loop_active = False
+        # 兼容旧逻辑：非四边形时用组 A 作为统一控制点数
+        self._controls = self._clamp_controls(self._controls_a)
         quad_edges = self._collect_quad_open_edges()
         if quad_edges is not None and self._rebuild_quad_loop_preview(
             quad_edges, similar
@@ -1036,16 +1084,21 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
 
     def _commit(self, context: bpy.types.Context) -> bool:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        n = int(self._controls)
+        na = int(self._controls_a)
+        nb = int(self._controls_b)
         similar = "相似" if self._similar else "独立"
         if getattr(self, "_quad_loop_active", False):
             if self._similar:
                 similar = "对边两两相似·封闭"
             else:
                 similar = "四边形封闭"
-        scene_props.curve_fit_status = (
-            f"已拟合为 {n} 控制点贝塞尔（{similar}）"
-        )
+            scene_props.curve_fit_status = (
+                f"已拟合为贝塞尔（组A={na} 组B={nb}，{similar}）"
+            )
+        else:
+            scene_props.curve_fit_status = (
+                f"已拟合为 {na} 控制点贝塞尔（{similar}）"
+            )
         self.report({"INFO"}, scene_props.curve_fit_status)
         return True
 
@@ -1104,19 +1157,27 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             self.report({"ERROR"}, "选中曲线没有可用样条")
             return {"CANCELLED"}
 
-        self._controls = int(
+        self._controls_a = self._clamp_controls(
             getattr(scene_props, "curve_fit_controls", DEFAULT_BEZIER_CONTROLS)
         )
-        self._controls = max(
-            BEZIER_CONTROLS_MIN, min(BEZIER_CONTROLS_MAX, self._controls)
+        self._controls_b = self._clamp_controls(
+            getattr(
+                scene_props,
+                "curve_fit_controls_b",
+                getattr(
+                    scene_props, "curve_fit_controls", DEFAULT_BEZIER_CONTROLS
+                ),
+            )
         )
+        self._controls = self._controls_a
         self._similar = bool(getattr(scene_props, "curve_fit_similar", False))
         self._committed = False
         self._preview_payload = []
         self._quad_loop_active = False
         scene_props.curve_fit_mode_active = True
         scene_props.curve_fit_confirm_requested = False
-        scene_props.curve_fit_controls = self._controls
+        scene_props.curve_fit_controls = self._controls_a
+        scene_props.curve_fit_controls_b = self._controls_b
         scene_props.curve_fit_similar = self._similar
         clear_curve_split_preview()
         register_curve_tool_hud()
@@ -1171,27 +1232,42 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 self.report({"ERROR"}, str(exc))
             return {"RUNNING_MODAL"}
 
-        if event.ctrl and event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
+        if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
             delta = 1 if event.type == "WHEELUPMOUSE" else -1
-            self._controls = int(
-                min(
-                    BEZIER_CONTROLS_MAX,
-                    max(BEZIER_CONTROLS_MIN, self._controls + delta),
-                )
-            )
-            scene_props.curve_fit_controls = self._controls
-            try:
-                self._rebuild_preview(context)
-            except RegionFitError as exc:
-                self.report({"ERROR"}, str(exc))
-            return {"RUNNING_MODAL"}
+            # Shift（无 Ctrl）：调组 B；Ctrl：调组 A（非四边形时即统一点数）
+            if event.shift and not event.ctrl:
+                self._controls_b = self._clamp_controls(self._controls_b + delta)
+                scene_props.curve_fit_controls_b = self._controls_b
+                try:
+                    self._rebuild_preview(context)
+                except RegionFitError as exc:
+                    self.report({"ERROR"}, str(exc))
+                return {"RUNNING_MODAL"}
+            if event.ctrl:
+                self._controls_a = self._clamp_controls(self._controls_a + delta)
+                self._controls = self._controls_a
+                scene_props.curve_fit_controls = self._controls_a
+                try:
+                    self._rebuild_preview(context)
+                except RegionFitError as exc:
+                    self.report({"ERROR"}, str(exc))
+                return {"RUNNING_MODAL"}
 
-        panel_n = int(getattr(scene_props, "curve_fit_controls", self._controls))
+        panel_a = self._clamp_controls(
+            getattr(scene_props, "curve_fit_controls", self._controls_a)
+        )
+        panel_b = self._clamp_controls(
+            getattr(scene_props, "curve_fit_controls_b", self._controls_b)
+        )
         panel_sim = bool(getattr(scene_props, "curve_fit_similar", self._similar))
-        if panel_n != self._controls or panel_sim != self._similar:
-            self._controls = max(
-                BEZIER_CONTROLS_MIN, min(BEZIER_CONTROLS_MAX, panel_n)
-            )
+        if (
+            panel_a != self._controls_a
+            or panel_b != self._controls_b
+            or panel_sim != self._similar
+        ):
+            self._controls_a = panel_a
+            self._controls_b = panel_b
+            self._controls = self._controls_a
             self._similar = panel_sim
             try:
                 self._rebuild_preview(context)

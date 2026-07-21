@@ -719,15 +719,22 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
         default=False,
     )
     curve_fit_controls: IntProperty(
-        name="控制点数",
-        description="贝塞尔锚点数量；Ctrl+滚轮调节，最少 3",
+        name="控制点数A",
+        description="对边组 A 的贝塞尔锚点数；Ctrl+滚轮调节，最少 3",
+        default=4,
+        min=3,
+        max=32,
+    )
+    curve_fit_controls_b: IntProperty(
+        name="控制点数B",
+        description="对边组 B 的贝塞尔锚点数；Shift+滚轮调节，最少 3",
         default=4,
         min=3,
         max=32,
     )
     curve_fit_similar: BoolProperty(
         name="相似模式",
-        description="多条曲线视为相似形状，拟合一条原型并变换对齐",
+        description="多条曲线视为相似形状；四边形时对边两两相似（保持环向首尾）",
         default=False,
     )
     curve_fit_status: StringProperty(

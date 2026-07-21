@@ -444,6 +444,58 @@ def estimate_similarity_transform(
     return scale, rotation, translation
 
 
+def estimate_open_directed_similarity(
+    src: np.ndarray,
+    dst: np.ndarray,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """
+    开环有向相似变换：严格按采样顺序对应（src[i]→dst[i]）。
+
+    对闭合四边形的对边必须使用本函数，禁止再做反向对齐；
+    否则会把环向首尾对调，变换后手柄扭曲。
+    """
+    return estimate_similarity_transform(src, dst)
+
+
+def snap_bezier_endpoints(
+    bezier_points: Sequence[dict],
+    start: np.ndarray,
+    end: np.ndarray,
+) -> list[dict]:
+    """将首尾锚点钉到指定端点，手柄随锚点平移。"""
+    if not bezier_points:
+        return []
+    result = [
+        {
+            "co": np.asarray(bp["co"], dtype=np.float64).copy(),
+            "handle_left": np.asarray(bp["handle_left"], dtype=np.float64).copy(),
+            "handle_right": np.asarray(
+                bp["handle_right"], dtype=np.float64
+            ).copy(),
+        }
+        for bp in bezier_points
+    ]
+    start_pt = _as_float_array(start).reshape(3)
+    end_pt = _as_float_array(end).reshape(3)
+    delta0 = start_pt - result[0]["co"]
+    result[0]["co"] = start_pt.copy()
+    result[0]["handle_left"] = result[0]["handle_left"] + delta0
+    result[0]["handle_right"] = result[0]["handle_right"] + delta0
+    delta1 = end_pt - result[-1]["co"]
+    result[-1]["co"] = end_pt.copy()
+    result[-1]["handle_left"] = result[-1]["handle_left"] + delta1
+    result[-1]["handle_right"] = result[-1]["handle_right"] + delta1
+    return result
+
+
+def opposite_pair_colors() -> list[tuple[float, float, float, float]]:
+    """对边预览色：组0 / 组1。"""
+    return [
+        (1.0, 0.28, 0.22, 1.0),
+        (0.15, 0.85, 1.0, 1.0),
+    ]
+
+
 def apply_similarity(
     points: np.ndarray,
     scale: float,
@@ -491,15 +543,18 @@ __all__ = (
     "apply_similarity",
     "best_closed_alignment",
     "best_open_alignment",
+    "estimate_open_directed_similarity",
     "estimate_similarity_transform",
     "extract_subpolyline_by_arc",
     "find_break_indices",
     "fit_bezier_n_controls",
     "opposite_edge_pairs",
+    "opposite_pair_colors",
     "order_open_curves_as_closed_loop",
     "point_at_arc_length",
     "sample_polyline_uniform",
     "segment_colors_for_count",
+    "snap_bezier_endpoints",
     "split_polyline_at_breaks",
     "transform_bezier_points",
     "turn_angles_deg",

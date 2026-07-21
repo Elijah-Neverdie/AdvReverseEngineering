@@ -9,11 +9,15 @@ import numpy as np
 
 from AdvReverseEngineering.algorithms.curve_edit import (
     best_closed_alignment,
+    best_open_alignment,
+    estimate_open_directed_similarity,
     estimate_similarity_transform,
     find_break_indices,
     fit_bezier_n_controls,
     opposite_edge_pairs,
     order_open_curves_as_closed_loop,
+    sample_polyline_uniform,
+    snap_bezier_endpoints,
     split_polyline_at_breaks,
     transform_bezier_points,
     turn_angles_deg,
@@ -124,6 +128,31 @@ class CurveEditTests(unittest.TestCase):
             end_co = welded[index][-1]["co"]
             start_co = welded[(index + 1) % 4][0]["co"]
             self.assertTrue(np.allclose(end_co, start_co, atol=1e-9))
+
+    def test_opposite_directed_similarity_preserves_loop_ends(self) -> None:
+        """对边环向相反时，有向相似必须保持首尾，不能用反向对齐。"""
+        bottom = np.linspace([0.0, 0.0, 0.0], [2.0, 0.0, 0.0], 32)
+        # 闭环上的顶边：右→左
+        top = np.linspace([2.0, 1.0, 0.0], [0.0, 1.0, 0.0], 32)
+        ref = sample_polyline_uniform(bottom, 48, cyclic=False)
+        dst = sample_polyline_uniform(top, 48, cyclic=False)
+
+        # 错误做法：反向对齐会把顶边变成左→右，变换后首尾对调
+        aligned_bad, _ = best_open_alignment(ref, dst)
+        scale_b, rot_b, t_b = estimate_similarity_transform(ref, aligned_bad)
+        proto = fit_bezier_n_controls(bottom, 4, cyclic=False)
+        bad = transform_bezier_points(proto, scale_b, rot_b, t_b)
+        bad_start_err = float(np.linalg.norm(bad[0]["co"] - top[0]))
+        bad_end_err = float(np.linalg.norm(bad[-1]["co"] - top[-1]))
+
+        # 正确：有向相似 + 端点钉扎
+        scale, rot, trans = estimate_open_directed_similarity(ref, dst)
+        good = transform_bezier_points(proto, scale, rot, trans)
+        good = snap_bezier_endpoints(good, top[0], top[-1])
+        self.assertTrue(np.allclose(good[0]["co"], top[0], atol=1e-9))
+        self.assertTrue(np.allclose(good[-1]["co"], top[-1], atol=1e-9))
+        # 反向对齐后的首尾误差应明显更大
+        self.assertGreater(bad_start_err + bad_end_err, 1.0)
 
 
 if __name__ == "__main__":
