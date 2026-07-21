@@ -769,16 +769,26 @@ def compute_region_label_anchors(
     extent = float(np.linalg.norm(centers.max(axis=0) - centers.min(axis=0)))
     offset = max(extent * float(offset_ratio), float(min_offset))
 
-    anchors: dict[int, dict] = {}
-    for region_id, centroid in centroids.items():
-        mask = ids == int(region_id)
-        if not np.any(mask):
+    # 单次扫面 O(F)：避免「每领域扫全网」在大网格上卡死合并/刷新
+    best_dist = {int(rid): float("inf") for rid in centroids}
+    best_face = {int(rid): -1 for rid in centroids}
+    for face_index, region_id in enumerate(ids):
+        rid = int(region_id)
+        if rid < 0:
             continue
-        face_indices = np.flatnonzero(mask)
-        region_centers = centers[face_indices]
-        distances = np.linalg.norm(region_centers - centroid, axis=1)
-        best_local = int(np.argmin(distances))
-        face_index = int(face_indices[best_local])
+        centroid = centroids.get(rid)
+        if centroid is None:
+            continue
+        delta = centers[face_index] - centroid
+        dist_sq = float(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2])
+        if dist_sq < best_dist[rid]:
+            best_dist[rid] = dist_sq
+            best_face[rid] = face_index
+
+    anchors: dict[int, dict] = {}
+    for region_id, face_index in best_face.items():
+        if face_index < 0:
+            continue
         normal = normals[face_index]
         length = float(np.linalg.norm(normal))
         if length < 1e-12:
@@ -790,7 +800,7 @@ def compute_region_label_anchors(
             "world_co": face_center + normal * offset,
             "face_center": face_center.copy(),
             "normal": normal.copy(),
-            "face_index": face_index,
+            "face_index": int(face_index),
         }
     return anchors
 

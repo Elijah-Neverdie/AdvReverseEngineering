@@ -162,8 +162,12 @@ def active_label_hover_id(scene_props) -> int:
 
 
 def update_merge_label_projections(context: bpy.types.Context) -> None:
-    """根据当前视角刷新标签屏幕坐标，并过滤背面/遮挡编号。"""
+    """根据当前视角刷新领域编号标签屏幕坐标。"""
     _update_label_session_projections(context, _MERGE_LABEL_SESSION)
+
+
+def update_fit_angle_label_projections(context: bpy.types.Context) -> None:
+    """根据当前视角刷新拟合内角标签屏幕坐标。"""
     _update_label_session_projections(context, _FIT_ANGLE_LABEL_SESSION)
 
 
@@ -432,7 +436,7 @@ def draw_fit_angle_labels() -> None:
     if session is None:
         return
 
-    update_merge_label_projections(context)
+    update_fit_angle_label_projections(context)
     gpu.state.blend_set("ALPHA")
     try:
         for label in session.get("labels", []):

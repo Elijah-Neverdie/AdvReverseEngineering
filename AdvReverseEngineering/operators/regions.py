@@ -33,6 +33,7 @@ from ..ui.overlay import (
     get_merge_label_session,
     register_label_draw_handler,
     register_split_draw_handler,
+    set_fit_angle_label_session,
     set_merge_label_session,
     set_region_highlight,
     set_split_stroke_session,
@@ -295,6 +296,8 @@ def _build_label_session(
             else np.asarray(colors, dtype=np.float32).copy()
         ),
         "mesh_data": mesh_data,
+        # 大网格上逐标签 scene.ray_cast 会让合并/悬停卡死；朝向过滤仍保留
+        "skip_occlusion": True,
     }
 
 
@@ -1252,6 +1255,9 @@ class ARE_OT_merge_regions(bpy.types.Operator):
         self._committed = False
         self._closed = False
         self._timer = None
+
+        # 进入合并时清掉拟合内角标，避免残留会话拖慢投影/绘制
+        set_fit_angle_label_session(None)
 
         session = _build_label_session(region_ids, mesh_data, colors)
         session["object_name"] = obj.name
