@@ -51,7 +51,7 @@ DEFAULT_SPLIT_ANGLE = 35.0
 SPLIT_ANGLE_STEP = 2.0
 SPLIT_ANGLE_MIN = 5.0
 SPLIT_ANGLE_MAX = 170.0
-DEFAULT_BEZIER_CONTROLS = 4
+DEFAULT_BEZIER_CONTROLS = 3
 BEZIER_CONTROLS_MIN = 3
 BEZIER_CONTROLS_MAX = 32
 SIMILAR_SAMPLE_COUNT = 64
@@ -840,12 +840,13 @@ class ARE_OT_confirm_split_fit_curve(bpy.types.Operator):
 
 
 class ARE_OT_fit_bezier_curve(bpy.types.Operator):
-    """将选中曲线拟合成 n 控制点贝塞尔；S 切换相似模式。"""
+    """预览 3/4 条贝塞尔边界，确认后直接生成曲面。"""
 
     bl_idname = "are.fit_bezier_curve"
-    bl_label = "拟合曲线"
+    bl_label = "拟合曲面"
     bl_description = (
-        "将选中曲线转为贝塞尔；四条闭合对边时：Ctrl/Shift 滚轮分别调两组控制点数，"
+        "预览选中的 3/4 条贝塞尔边界，确认后直接生成曲面并删除边界曲线；"
+        "四条闭合对边时：Ctrl/Shift 滚轮分别调两组控制点数，"
         "相似模式对边两两相似（保持环向首尾），对边同色预览；"
         "缝合开口(V)沿切向延伸端点至交点封闭缺口"
     )
@@ -870,12 +871,12 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             if stitch:
                 extra += " · 已缝合开口"
             text = (
-                f"拟合曲线：组A {na} · 组B {nb} · 相似 {mode} · 缝合 {stitch_s}"
+                f"拟合曲面预览：组A {na} · 组B {nb} · 相似 {mode} · 缝合 {stitch_s}"
                 f"{extra} · Ctrl滚轮A · Shift滚轮B · S相似 · V缝合 · Enter确认"
             )
         else:
             text = (
-                f"拟合曲线：控制点 {na} · 相似模式 {mode} · "
+                f"拟合曲面预览：控制点 {na} · 相似模式 {mode} · "
                 "Ctrl+滚轮调点数 · S 切换相似 · Enter 确认 · Esc 取消"
             )
         scene_props.curve_fit_status = text
@@ -1142,23 +1143,32 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
 
     def _commit(self, context: bpy.types.Context) -> bool:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
-        na = int(self._controls_a)
-        nb = int(self._controls_b)
-        similar = "相似" if self._similar else "独立"
-        if getattr(self, "_quad_loop_active", False):
-            if self._similar:
-                similar = "对边两两相似·封闭"
-            else:
-                similar = "四边形封闭"
-            if self._stitch_open:
-                similar += f"·缝合{int(getattr(self, '_stitch_count', 0))}处"
-            scene_props.curve_fit_status = (
-                f"已拟合为贝塞尔（组A={na} 组B={nb}，{similar}）"
-            )
-        else:
-            scene_props.curve_fit_status = (
-                f"已拟合为 {na} 控制点贝塞尔（{similar}）"
-            )
+        curves = [
+            obj
+            for obj, _sources in getattr(self, "_targets", [])
+            if _is_object_alive(obj)
+        ]
+        if len(curves) not in (3, 4):
+            self.report({"ERROR"}, "拟合曲面需要 3 或 4 条有效边界曲线")
+            return False
+
+        try:
+            obj, kind = _compose_surface_from_curves(context, curves)
+        except RegionFitError as exc:
+            self.report({"ERROR"}, str(exc))
+            return False
+        except Exception as exc:
+            self.report({"ERROR"}, f"生成拟合曲面失败: {exc}")
+            return False
+
+        # 曲面已生成；边界曲线不再保留。
+        _delete_curve_objects(curves)
+
+        label = "四边" if kind == "QUAD" else "三边"
+        scene_props.curve_fit_status = (
+            f"已生成{label}拟合曲面 →「{SURFACE_COLLECTION_NAME}」/{obj.name}"
+            "（边界曲线已删除）"
+        )
         self.report({"INFO"}, scene_props.curve_fit_status)
         return True
 
@@ -1191,12 +1201,12 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             return False
         if _any_curve_modal_busy(scene_props):
             return False
-        return bool(_selected_curve_objects(context))
+        return len(_selected_curve_objects(context)) in (3, 4)
 
     def invoke(self, context: bpy.types.Context, event):
         curves = _selected_curve_objects(context)
-        if not curves:
-            self.report({"ERROR"}, "请先选中曲线物体")
+        if len(curves) not in (3, 4):
+            self.report({"ERROR"}, "请先选中 3 或 4 条边界曲线")
             return {"CANCELLED"}
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         self._targets = []
@@ -1277,7 +1287,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             return {"RUNNING_MODAL"}
 
         if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
-            self.report({"INFO"}, "已取消拟合曲线")
+            self.report({"INFO"}, "已取消拟合曲面")
             self._cleanup(context, restore=True)
             return {"CANCELLED"}
 
@@ -1365,7 +1375,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
 
 class ARE_OT_confirm_fit_bezier_curve(bpy.types.Operator):
     bl_idname = "are.confirm_fit_bezier_curve"
-    bl_label = "确认拟合曲线"
+    bl_label = "确认生成拟合曲面"
     bl_options = {"INTERNAL"}
 
     @classmethod
@@ -1560,8 +1570,94 @@ def _hide_curve_collection(scene: bpy.types.Scene) -> None:
         pass
 
 
+def _delete_curve_objects(curves: list[bpy.types.Object]) -> None:
+    """删除边界曲线物体及其无主数据块。"""
+    for curve_obj in curves:
+        try:
+            curve_data = curve_obj.data
+            bpy.data.objects.remove(curve_obj, do_unlink=True)
+            if curve_data is not None and getattr(curve_data, "users", 0) == 0:
+                bpy.data.curves.remove(curve_data)
+        except (ReferenceError, RuntimeError):
+            pass
+
+
+def _compose_surface_from_curves(
+    context: bpy.types.Context,
+    curves: list[bpy.types.Object],
+) -> tuple[bpy.types.Object, str]:
+    """
+    由 3/4 条边界曲线生成拟合曲面网格。
+
+    Returns:
+        (surface_object, kind)  kind 为 ``QUAD`` 或 ``TRI``。
+    """
+    if len(curves) not in (3, 4):
+        raise RegionFitError("拟合曲面需要选中 3 或 4 条曲线")
+    polylines = [_boundary_polyline_from_curve_obj(obj) for obj in curves]
+    vertices, faces, kind = compose_patch_from_boundary_polylines(
+        polylines,
+        segments_u=DEFAULT_SURFACE_SEG_U,
+        segments_v=DEFAULT_SURFACE_SEG_V,
+    )
+
+    collection = _ensure_surface_collection(context.scene)
+    base = curves[0].name.rsplit("_S", 1)[0]
+    name = f"FitSurf_{base}_{kind}"
+    # 世界坐标写入，物体用单位矩阵
+    identity = curves[0].matrix_world.copy()
+    identity.identity()
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(
+        [tuple(map(float, v)) for v in vertices.tolist()],
+        [],
+        [tuple(face) for face in faces],
+    )
+    mesh.update()
+    try:
+        mesh.calc_normals()
+    except Exception:
+        pass
+    obj = bpy.data.objects.new(name, mesh)
+    obj.matrix_world = identity
+    if obj.name not in collection.objects:
+        collection.objects.link(obj)
+    # 避免同时挂在场景根集合造成重复
+    scene_col = context.scene.collection
+    if obj.name in scene_col.objects and collection != scene_col:
+        try:
+            scene_col.objects.unlink(obj)
+        except Exception:
+            pass
+
+    region_color = _resolve_region_display_color(curves)
+    _apply_surface_region_color(obj, region_color)
+
+    obj["are_fit_kind"] = "region_surface"
+    obj["are_fit_surface_type"] = kind
+    obj["are_fit_source_curves"] = [c.name for c in curves]
+    try:
+        obj["are_fit_region_id"] = int(curves[0].get("are_fit_region_id", -1))
+    except Exception:
+        obj["are_fit_region_id"] = -1
+    source_name = str(curves[0].get("are_fit_source", "") or "")
+    if source_name:
+        obj["are_fit_source"] = source_name
+    obj.display_type = "SOLID"
+    obj.show_wire = True
+
+    for item in list(context.selected_objects):
+        try:
+            item.select_set(False)
+        except ReferenceError:
+            pass
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+    return obj, kind
+
+
 class ARE_OT_compose_region_surface(bpy.types.Operator):
-    """将选中的 3/4 条贝塞尔边界拟合成区面网格。"""
+    """将选中的 3/4 条贝塞尔边界拟合成区面网格（内部/兼容入口）。"""
 
     bl_idname = "are.compose_region_surface"
     bl_label = "合成区面"
@@ -1588,12 +1684,7 @@ class ARE_OT_compose_region_surface(bpy.types.Operator):
             self.report({"ERROR"}, "请选中 3 或 4 条曲线")
             return {"CANCELLED"}
         try:
-            polylines = [_boundary_polyline_from_curve_obj(obj) for obj in curves]
-            vertices, faces, kind = compose_patch_from_boundary_polylines(
-                polylines,
-                segments_u=DEFAULT_SURFACE_SEG_U,
-                segments_v=DEFAULT_SURFACE_SEG_V,
-            )
+            obj, kind = _compose_surface_from_curves(context, curves)
         except RegionFitError as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1601,61 +1692,7 @@ class ARE_OT_compose_region_surface(bpy.types.Operator):
             self.report({"ERROR"}, f"合成区面失败: {exc}")
             return {"CANCELLED"}
 
-        collection = _ensure_surface_collection(context.scene)
-        base = curves[0].name.rsplit("_S", 1)[0]
-        name = f"FitSurf_{base}_{kind}"
-        # 世界坐标写入，物体用单位矩阵
-        identity = curves[0].matrix_world.copy()
-        identity.identity()
-        mesh = bpy.data.meshes.new(name)
-        mesh.from_pydata(
-            [tuple(map(float, v)) for v in vertices.tolist()],
-            [],
-            [tuple(face) for face in faces],
-        )
-        mesh.update()
-        try:
-            mesh.calc_normals()
-        except Exception:
-            pass
-        obj = bpy.data.objects.new(name, mesh)
-        obj.matrix_world = identity
-        if obj.name not in collection.objects:
-            collection.objects.link(obj)
-        # 避免同时挂在场景根集合造成重复
-        scene_col = context.scene.collection
-        if obj.name in scene_col.objects and collection != scene_col:
-            try:
-                scene_col.objects.unlink(obj)
-            except Exception:
-                pass
-
-        region_color = _resolve_region_display_color(curves)
-        _apply_surface_region_color(obj, region_color)
-
-        obj["are_fit_kind"] = "region_surface"
-        obj["are_fit_surface_type"] = kind
-        obj["are_fit_source_curves"] = [c.name for c in curves]
-        try:
-            obj["are_fit_region_id"] = int(curves[0].get("are_fit_region_id", -1))
-        except Exception:
-            obj["are_fit_region_id"] = -1
-        source_name = str(curves[0].get("are_fit_source", "") or "")
-        if source_name:
-            obj["are_fit_source"] = source_name
-        obj.display_type = "SOLID"
-        obj.show_wire = True
-
         _hide_curve_collection(context.scene)
-
-        for item in list(context.selected_objects):
-            try:
-                item.select_set(False)
-            except ReferenceError:
-                pass
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-
         label = "四边" if kind == "QUAD" else "三边"
         self.report(
             {"INFO"},

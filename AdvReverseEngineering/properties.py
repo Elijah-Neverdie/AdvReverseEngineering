@@ -724,14 +724,14 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     curve_fit_controls: IntProperty(
         name="控制点数A",
         description="对边组 A 的贝塞尔锚点数；Ctrl+滚轮调节，最少 3",
-        default=4,
+        default=3,
         min=3,
         max=32,
     )
     curve_fit_controls_b: IntProperty(
         name="控制点数B",
         description="对边组 B 的贝塞尔锚点数；Shift+滚轮调节，最少 3",
-        default=4,
+        default=3,
         min=3,
         max=32,
     )

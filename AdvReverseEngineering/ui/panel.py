@@ -293,22 +293,18 @@ class ARE_PT_main(bpy.types.Panel):
                 if getattr(item, "type", "") == "CURVE"
             )
             edit_row = curve_row.row(align=True)
-            edit_row.enabled = bool(has_curve) and not modal_busy
-            edit_row.operator(
+            split_row = edit_row.row(align=True)
+            split_row.enabled = bool(has_curve) and not modal_busy
+            split_row.operator(
                 "are.split_fit_curve",
                 text="拆分曲线",
                 icon="MOD_EDGESPLIT",
             )
-            edit_row.operator(
+            fit_surf_row = edit_row.row(align=True)
+            fit_surf_row.enabled = curve_count in (3, 4) and not modal_busy
+            fit_surf_row.operator(
                 "are.fit_bezier_curve",
-                text="拟合曲线",
-                icon="CURVE_BEZCURVE",
-            )
-            compose_row = curve_row.row(align=True)
-            compose_row.enabled = curve_count in (3, 4) and not modal_busy
-            compose_row.operator(
-                "are.compose_region_surface",
-                text="合成区面",
+                text="拟合曲面",
                 icon="MESH_GRID",
             )
 
@@ -464,7 +460,7 @@ class ARE_PT_main(bpy.types.Panel):
 
             if curve_fitting:
                 tip = region_box.box()
-                tip.label(text="拟合曲线（贝塞尔）", icon="INFO")
+                tip.label(text="拟合曲面（贝塞尔边界预览）", icon="INFO")
                 tip.prop(
                     scene_props,
                     "curve_fit_controls",
@@ -492,7 +488,7 @@ class ARE_PT_main(bpy.types.Panel):
                 confirm_row.scale_y = 1.2
                 confirm_row.operator(
                     "are.confirm_fit_bezier_curve",
-                    text="确认拟合",
+                    text="确认生成曲面",
                     icon="CHECKMARK",
                 )
                 if _draw_foldout(
@@ -502,16 +498,15 @@ class ARE_PT_main(bpy.types.Panel):
                     "操作说明",
                 ):
                     help_box = tip.box()
-                    help_box.label(text="1. 选中曲线后点「拟合曲线」")
+                    help_box.label(text="1. 选中 3/4 条曲线后点「拟合曲面」")
                     help_box.label(text="2. Ctrl+滚轮调组A点数；Shift+滚轮调组B")
                     help_box.label(text="3. 按 S 切换相似；按 V 切换缝合开口")
                     help_box.label(text="四条端点近闭合：对边同色，相似=对边两两")
                     help_box.label(text="缝合开口：切向延伸缺口两端至交点封闭")
                     help_box.label(text="相似变换保持环向首尾，避免对边扭曲")
-                    help_box.label(text="曲线写入「拟合曲线」集合")
-                    help_box.label(text="选 3/4 条后点「合成区面」→「拟合曲面」")
-                    help_box.label(text="合成后沿用领域色，并隐藏拟合曲线集合")
-                    help_box.label(text="Enter / 确认拟合 · Esc 取消")
+                    help_box.label(text="确认后生成拟合曲面并删除边界曲线")
+                    help_box.label(text="曲面沿用领域显示色")
+                    help_box.label(text="Enter / 确认生成曲面 · Esc 取消")
 
             if scene_props.region_status:
                 region_box.label(
