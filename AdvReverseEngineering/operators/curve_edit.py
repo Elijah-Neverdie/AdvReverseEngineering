@@ -2007,14 +2007,106 @@ def _blend_surface_colors(
     )
 
 
+def _mesh_world_geometry(
+    obj: bpy.types.Object,
+) -> tuple[np.ndarray, list[tuple[int, ...]]]:
+    """读取网格世界坐标顶点与面索引。"""
+    mesh = obj.data
+    if mesh is None or len(mesh.vertices) == 0:
+        return np.zeros((0, 3), dtype=np.float64), []
+    n = len(mesh.vertices)
+    local = np.empty(n * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", local)
+    local = local.reshape(n, 3)
+    matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+    homo = np.hstack((local, np.ones((n, 1), dtype=np.float64)))
+    world = (matrix @ homo.T).T[:, :3]
+    faces = [tuple(int(i) for i in poly.vertices) for poly in mesh.polygons]
+    return world, faces
+
+
+def _weld_mesh_geometry(
+    vertices: np.ndarray,
+    faces: list[tuple[int, ...]],
+    *,
+    threshold: float = 1e-5,
+) -> tuple[np.ndarray, list[tuple[int, ...]]]:
+    """按距离焊接重合顶点，保持面连通。"""
+    verts = np.asarray(vertices, dtype=np.float64)
+    if len(verts) == 0:
+        return verts, []
+    thr = max(float(threshold), 1e-9)
+    # 网格量化加速近邻合并
+    quant = np.round(verts / thr).astype(np.int64)
+    key_to_new: dict[tuple[int, int, int], int] = {}
+    remap = np.empty(len(verts), dtype=np.int64)
+    unique: list[np.ndarray] = []
+    for index, key in enumerate(map(tuple, quant.tolist())):
+        found = key_to_new.get(key)
+        if found is None:
+            found = len(unique)
+            key_to_new[key] = found
+            unique.append(verts[index].copy())
+        remap[index] = found
+    welded = np.vstack(unique) if unique else np.zeros((0, 3), dtype=np.float64)
+    new_faces: list[tuple[int, ...]] = []
+    for face in faces:
+        mapped = [int(remap[i]) for i in face]
+        # 去掉退化重复顶点，保留至少三角
+        cleaned: list[int] = []
+        for vid in mapped:
+            if not cleaned or cleaned[-1] != vid:
+                cleaned.append(vid)
+        if len(cleaned) >= 3 and cleaned[0] == cleaned[-1]:
+            cleaned.pop()
+        if len(cleaned) >= 3 and len(set(cleaned)) >= 3:
+            new_faces.append(tuple(cleaned))
+    return welded, new_faces
+
+
+def _merge_mesh_geometries(
+    parts: list[tuple[np.ndarray, list[tuple[int, ...]]]],
+    *,
+    weld_threshold: float = 1e-5,
+) -> tuple[np.ndarray, list[tuple[int, ...]]]:
+    """拼接多段网格并焊接重合边界。"""
+    all_verts: list[np.ndarray] = []
+    all_faces: list[tuple[int, ...]] = []
+    offset = 0
+    for verts, faces in parts:
+        pts = np.asarray(verts, dtype=np.float64)
+        if len(pts) == 0:
+            continue
+        all_verts.append(pts)
+        for face in faces:
+            all_faces.append(tuple(int(i) + offset for i in face))
+        offset += len(pts)
+    if not all_verts:
+        return np.zeros((0, 3), dtype=np.float64), []
+    stacked = np.vstack(all_verts)
+    return _weld_mesh_geometry(stacked, all_faces, threshold=weld_threshold)
+
+
+def _delete_mesh_objects(objects: list[bpy.types.Object]) -> None:
+    """删除网格物体及其无主 mesh 数据块。"""
+    for obj in objects:
+        try:
+            mesh = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh is not None and getattr(mesh, "users", 0) == 0:
+                bpy.data.meshes.remove(mesh)
+        except (ReferenceError, RuntimeError):
+            pass
+
+
 class ARE_OT_bridge_fit_surfaces(bpy.types.Operator):
-    """将两张拟合曲面沿最近对边做贝塞尔曲率桥接。"""
+    """将两张拟合曲面沿最近对边做贝塞尔曲率桥接，并合并为一张曲面。"""
 
     bl_idname = "are.bridge_fit_surfaces"
     bl_label = "桥接曲面"
     bl_description = (
-        "选中两张「拟合曲面」，自动找最近对边，"
-        "用继承邻边切向的贝塞尔连接线做 Coons 桥接，写入「拟合曲面」集合"
+        "选中两张「拟合曲面」，沿最近对边做贝塞尔曲率桥接，"
+        "并将选中曲面与桥接面合并为一张曲面写入「拟合曲面」集合"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -2035,11 +2127,28 @@ class ARE_OT_bridge_fit_surfaces(bpy.types.Operator):
         try:
             sides_a = _fit_surface_boundary_sides(surfaces[0])
             sides_b = _fit_surface_boundary_sides(surfaces[1])
-            vertices, faces = bridge_fit_surface_boundaries(
+            bridge_verts, bridge_faces = bridge_fit_surface_boundaries(
                 sides_a,
                 sides_b,
                 segments_u=DEFAULT_SURFACE_SEG_U,
                 segments_v=DEFAULT_SURFACE_SEG_V,
+            )
+            geom_a = _mesh_world_geometry(surfaces[0])
+            geom_b = _mesh_world_geometry(surfaces[1])
+            # 估计焊接阈值：取桥接边典型边长的一小部分
+            edge_lens = []
+            for side in (sides_a[0], sides_b[0]):
+                if len(side) >= 2:
+                    edge_lens.append(
+                        float(np.linalg.norm(np.diff(side, axis=0), axis=1).mean())
+                    )
+            weld_eps = max(
+                (min(edge_lens) if edge_lens else 1e-3) * 0.02,
+                1e-5,
+            )
+            vertices, faces = _merge_mesh_geometries(
+                [geom_a, geom_b, (bridge_verts, bridge_faces)],
+                weld_threshold=weld_eps,
             )
         except RegionFitError as exc:
             self.report({"ERROR"}, str(exc))
@@ -2048,8 +2157,14 @@ class ARE_OT_bridge_fit_surfaces(bpy.types.Operator):
             self.report({"ERROR"}, f"桥接曲面失败: {exc}")
             return {"CANCELLED"}
 
+        if len(vertices) < 3 or not faces:
+            self.report({"ERROR"}, "桥接合并结果为空")
+            return {"CANCELLED"}
+
         collection = _ensure_surface_collection(context.scene)
-        name = f"FitBridge_{surfaces[0].name}_{surfaces[1].name}"
+        base_a = surfaces[0].name
+        base_b = surfaces[1].name
+        name = f"FitSurf_{base_a}_{base_b}_MERGED"
         identity = surfaces[0].matrix_world.copy()
         identity.identity()
         mesh = bpy.data.meshes.new(name)
@@ -2077,7 +2192,7 @@ class ARE_OT_bridge_fit_surfaces(bpy.types.Operator):
         color = _blend_surface_colors(surfaces)
         _apply_surface_region_color(obj, color)
         obj["are_fit_kind"] = "region_surface"
-        obj["are_fit_surface_type"] = "BRIDGE"
+        obj["are_fit_surface_type"] = "MERGED"
         obj["are_fit_bridge_of"] = [surfaces[0].name, surfaces[1].name]
         try:
             obj["are_fit_region_id"] = int(
@@ -2088,16 +2203,20 @@ class ARE_OT_bridge_fit_surfaces(bpy.types.Operator):
         source_name = str(surfaces[0].get("are_fit_source", "") or "")
         if source_name:
             obj["are_fit_source"] = source_name
-        # 桥接面也写入四边边界，便于继续桥接
+        # 合并后外轮廓写入边界，便于继续桥接
         try:
-            bridge_sides = extract_mesh_boundary_loop_sides(vertices, faces)
-            flat, counts = pack_boundary_sides(bridge_sides)
+            merged_sides = extract_mesh_boundary_loop_sides(vertices, faces)
+            flat, counts = pack_boundary_sides(merged_sides)
             obj["are_fit_boundary_flat"] = flat
             obj["are_fit_boundary_counts"] = counts
         except Exception:
             pass
         obj.display_type = "SOLID"
         obj.show_wire = True
+
+        # 删除原选中曲面，只保留合并结果
+        source_names = [surfaces[0].name, surfaces[1].name]
+        _delete_mesh_objects(list(surfaces))
 
         for item in list(context.selected_objects):
             try:
@@ -2108,7 +2227,8 @@ class ARE_OT_bridge_fit_surfaces(bpy.types.Operator):
         context.view_layer.objects.active = obj
         self.report(
             {"INFO"},
-            f"已桥接曲面 →「{SURFACE_COLLECTION_NAME}」/{obj.name}",
+            f"已桥接并合并 →「{SURFACE_COLLECTION_NAME}」/{obj.name}"
+            f"（已合并 {source_names[0]} + {source_names[1]}）",
         )
         return {"FINISHED"}
 
