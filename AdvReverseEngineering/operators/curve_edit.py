@@ -600,6 +600,11 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
         collection = _ensure_fit_collection(context.scene)
         created_objs: list[bpy.types.Object] = []
         for obj, segments in getattr(self, "_preview_segments", []) or []:
+            # 保留拟合领域写入的显示色，供后续合成曲面同步
+            try:
+                region_display_color = tuple(float(v) for v in obj.color[:4])
+            except Exception:
+                region_display_color = (1.0, 1.0, 1.0, 1.0)
             if len(segments) <= 1:
                 colors = segment_colors_for_count(1)
                 _write_poly_segments(
@@ -610,7 +615,7 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
                     obj.data.bevel_depth = 0.0
                     obj.data.bevel_resolution = 0
                 obj.display_type = "WIRE"
-                obj.color = (1.0, 1.0, 1.0, 1.0)
+                obj.color = region_display_color
                 created_objs.append(obj)
                 continue
             base_name = obj.name
@@ -634,7 +639,7 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
             obj["are_fit_split_index"] = 0
             obj.display_type = "WIRE"
             obj.show_in_front = True
-            obj.color = (1.0, 1.0, 1.0, 1.0)
+            obj.color = region_display_color
             created_objs.append(obj)
             for index, segment in enumerate(segments[1:], start=1):
                 curve = bpy.data.curves.new(
@@ -649,7 +654,7 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
                 new_obj.matrix_world = matrix
                 new_obj.show_in_front = True
                 new_obj.display_type = "WIRE"
-                new_obj.color = (1.0, 1.0, 1.0, 1.0)
+                new_obj.color = region_display_color
                 if new_obj.name not in collection.objects:
                     collection.objects.link(new_obj)
                 for key, value in backups_attrs.items():
@@ -1459,32 +1464,69 @@ def _boundary_polyline_from_curve_obj(obj: bpy.types.Object) -> np.ndarray:
     return candidates[0]
 
 
+def _rgba_from_object_color(obj: bpy.types.Object) -> tuple[float, float, float, float] | None:
+    """读取物体 Viewport Display 颜色；近白默认色视为未设置。"""
+    try:
+        color = tuple(float(v) for v in obj.color[:4])
+    except Exception:
+        return None
+    if len(color) < 3:
+        return None
+    # 拟合曲线生成时会写入领域色；未写入时多为 (1,1,1,*)
+    if color[0] > 0.98 and color[1] > 0.98 and color[2] > 0.98:
+        return None
+    alpha = float(color[3]) if len(color) > 3 else 0.85
+    return (color[0], color[1], color[2], max(alpha, 0.75))
+
+
 def _resolve_region_display_color(
     curves: list[bpy.types.Object],
 ) -> tuple[float, float, float, float]:
-    """从边界曲线的领域 ID / 源网格调色板取显示色。"""
+    """
+    从边界曲线同步领域显示色。
+
+    优先用曲线已写入的 ``obj.color``（拟合领域时从源网格调色板拷贝），
+    再回退到源网格 ``are_region_colors`` / 算法调色板。
+    """
     region_id = -1
     source_name = ""
+    curve_color = None
     for curve in curves:
         try:
             rid = int(curve.get("are_fit_region_id", -1))
         except Exception:
             rid = -1
-        if rid >= 0:
-            region_id = rid
-            source_name = str(curve.get("are_fit_source", "") or "")
-            break
+        if rid < 0:
+            continue
+        region_id = rid
+        source_name = str(curve.get("are_fit_source", "") or "")
+        curve_color = _rgba_from_object_color(curve)
+        if curve_color is not None:
+            return curve_color
+        break
+
     if region_id < 0:
+        # 无领域标记时仍尝试继承任一条曲线的显示色
+        for curve in curves:
+            curve_color = _rgba_from_object_color(curve)
+            if curve_color is not None:
+                return curve_color
         return (0.35, 0.75, 1.0, 0.85)
 
     palette = None
     source_obj = bpy.data.objects.get(source_name) if source_name else None
     if source_obj is not None:
-        raw = source_obj.get("are_region_colors")
-        if raw is not None:
-            flat = np.asarray(list(raw), dtype=np.float32)
-            if len(flat) >= (region_id + 1) * 4:
-                palette = flat.reshape(-1, 4)
+        # 与领域叠加相同：优先读源网格调色板
+        try:
+            from .regions import _read_region_colors
+
+            palette = _read_region_colors(source_obj, max(region_id + 1, 1))
+        except Exception:
+            raw = source_obj.get("are_region_colors")
+            if raw is not None:
+                flat = np.asarray(list(raw), dtype=np.float32)
+                if len(flat) >= (region_id + 1) * 4:
+                    palette = flat.reshape(-1, 4)
 
     if palette is None:
         from ..algorithms.regions import generate_region_colors
@@ -1498,7 +1540,6 @@ def _resolve_region_display_color(
         float(color[2]),
         float(color[3]) if len(color) > 3 else 0.85,
     )
-    # 曲面略提高不透明度，便于实体显示
     return (rgba[0], rgba[1], rgba[2], max(float(rgba[3]), 0.75))
 
 
@@ -1509,7 +1550,9 @@ def _ensure_surface_material(
     mat = bpy.data.materials.get(name)
     if mat is None:
         mat = bpy.data.materials.new(name)
-    mat.diffuse_color = color
+    # Solid/Material 模式下的回退色；真正可视主要靠 GPU 叠加（同领域分色）
+    opaque = (float(color[0]), float(color[1]), float(color[2]), 1.0)
+    mat.diffuse_color = opaque
     try:
         mat.use_nodes = True
         nodes = mat.node_tree.nodes
@@ -1517,14 +1560,14 @@ def _ensure_surface_material(
         nodes.clear()
         output = nodes.new("ShaderNodeOutputMaterial")
         bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-        bsdf.inputs["Base Color"].default_value = color
+        bsdf.inputs["Base Color"].default_value = opaque
         if "Alpha" in bsdf.inputs:
-            bsdf.inputs["Alpha"].default_value = float(color[3])
+            bsdf.inputs["Alpha"].default_value = 1.0
         links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
     except Exception:
         pass
     try:
-        mat.blend_method = "BLEND" if color[3] < 0.999 else "OPAQUE"
+        mat.blend_method = "OPAQUE"
     except Exception:
         pass
     return mat
@@ -1534,14 +1577,22 @@ def _apply_surface_region_color(
     obj: bpy.types.Object,
     color: tuple[float, float, float, float],
 ) -> None:
-    """给合成曲面套用领域色（物体色 + 材质）。"""
-    obj.color = color
+    """给合成曲面写入领域色（自定义属性 + 物体色 + 材质回退）。"""
+    rgba = (
+        float(color[0]),
+        float(color[1]),
+        float(color[2]),
+        max(float(color[3]) if len(color) > 3 else 0.85, 0.75),
+    )
+    # 视口 GPU 叠加读取此属性（与 are_region_colors 同思路）
+    obj["are_fit_display_color"] = list(rgba)
+    obj.color = rgba
     try:
         obj.show_transparent = True
     except Exception:
         pass
     mat_name = f"ARE_FitSurf_{obj.name}"
-    mat = _ensure_surface_material(mat_name, color)
+    mat = _ensure_surface_material(mat_name, rgba)
     mesh = obj.data
     if mesh is None:
         return

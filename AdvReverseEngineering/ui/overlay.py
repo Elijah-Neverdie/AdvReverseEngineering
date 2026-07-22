@@ -26,6 +26,7 @@ OVERLAY_UI_KEY = "AdvReverseEngineering.overlay_ui_callback"
 # 世界坐标 / 颜色缓存：signature 记录矩阵、网格与领域版本。
 _BOTTOM_CACHE: dict[int, dict] = {}
 _REGION_CACHE: dict[int, dict] = {}
+_FIT_SURFACE_CACHE: dict[int, dict] = {}
 # 合并预览缓存：按 (对象指针, 预览版本) 复用三角缓冲，避免每帧重建。
 _MERGE_PREVIEW_CACHE: dict = {}
 _HIGHLIGHT_CACHE: dict = {}
@@ -67,6 +68,9 @@ BOTTOM_FACES_ATTR = "are_bottom_faces"
 REGION_ID_ATTR = "are_region_id"
 REGION_VERSION_ATTR = "are_region_version"
 REGION_COLORS_ATTR = "are_region_colors"
+FIT_SURFACE_KIND = "region_surface"
+FIT_DISPLAY_COLOR_ATTR = "are_fit_display_color"
+FIT_KIND_ATTR = "are_fit_kind"
 
 
 def set_bottom_face_highlight(
@@ -1248,6 +1252,114 @@ def _cached_bottom_coords(
     return coords
 
 
+def _read_fit_surface_display_color(
+    obj: bpy.types.Object,
+) -> tuple[float, float, float, float]:
+    """读取合成曲面领域色；缺失时回退物体色/源领域调色板/默认青。"""
+    raw = obj.get(FIT_DISPLAY_COLOR_ATTR)
+    if raw is not None:
+        try:
+            values = [float(v) for v in list(raw)[:4]]
+            if len(values) >= 3:
+                alpha = values[3] if len(values) > 3 else 0.85
+                return (
+                    values[0],
+                    values[1],
+                    values[2],
+                    max(float(alpha), 0.55),
+                )
+        except Exception:
+            pass
+    try:
+        color = tuple(float(v) for v in obj.color[:4])
+        if not (color[0] > 0.98 and color[1] > 0.98 and color[2] > 0.98):
+            return (
+                color[0],
+                color[1],
+                color[2],
+                max(color[3] if len(color) > 3 else 0.85, 0.55),
+            )
+    except Exception:
+        pass
+
+    # 旧曲面：按 are_fit_region_id 从源网格调色板同步
+    try:
+        rid = int(obj.get("are_fit_region_id", -1))
+    except Exception:
+        rid = -1
+    if rid >= 0:
+        source_name = str(obj.get("are_fit_source", "") or "")
+        source_obj = bpy.data.objects.get(source_name) if source_name else None
+        if source_obj is not None:
+            palette = _read_region_colors(source_obj, max(rid + 1, 1))
+            if len(palette) > rid:
+                c = palette[rid]
+                return (
+                    float(c[0]),
+                    float(c[1]),
+                    float(c[2]),
+                    max(float(c[3]) if len(c) > 3 else 0.85, 0.55),
+                )
+    return (0.35, 0.75, 1.0, 0.75)
+
+
+def _build_fit_surface_world_coords(obj: bpy.types.Object) -> np.ndarray:
+    """构建合成曲面全部面的世界坐标三角（沿法线外移，同领域叠加）。"""
+    mesh = obj.data
+    face_count = len(mesh.polygons)
+    if face_count == 0 or len(mesh.vertices) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    return _build_bottom_world_coords(obj, list(range(face_count)))
+
+
+def _cached_fit_surface_coords(obj: bpy.types.Object) -> np.ndarray:
+    """按签名缓存合成曲面绘制坐标。"""
+    pointer = obj.as_pointer()
+    signature = _bottom_signature(obj)
+    entry = _FIT_SURFACE_CACHE.get(pointer)
+    if entry is not None and entry["signature"] == signature:
+        return entry["coords"]
+    coords = _build_fit_surface_world_coords(obj)
+    _FIT_SURFACE_CACHE[pointer] = {
+        "signature": signature,
+        "coords": coords,
+    }
+    return coords
+
+
+def _iter_visible_fit_surfaces(
+    context: bpy.types.Context,
+) -> list[bpy.types.Object]:
+    """当前视图中可见的合成曲面物体。"""
+    result: list[bpy.types.Object] = []
+    # draw handler 中 visible_objects 不一定完整，直接扫数据块更稳
+    for obj in bpy.data.objects:
+        try:
+            if obj.type != "MESH":
+                continue
+            if str(obj.get(FIT_KIND_ATTR, "") or "") != FIT_SURFACE_KIND:
+                continue
+            if not _is_region_mesh_overlay_visible(context, obj):
+                continue
+            result.append(obj)
+        except ReferenceError:
+            continue
+    return result
+
+
+def _draw_fit_surface_overlays(context: bpy.types.Context) -> None:
+    """
+    用领域分色同款 GPU 半透明叠加绘制合成曲面颜色。
+
+    不依赖视口 Solid 的 Color 模式（Object/Material），
+    颜色来自拟合曲线同步写入的 are_fit_display_color。
+    """
+    for obj in _iter_visible_fit_surfaces(context):
+        color = _read_fit_surface_display_color(obj)
+        coords = _cached_fit_surface_coords(obj)
+        _draw_uniform_tris(coords, color)
+
+
 def _read_region_ids(mesh: bpy.types.Mesh) -> np.ndarray | None:
     """读取 FACE 域领域标签。"""
     attribute = mesh.attributes.get(REGION_ID_ATTR)
@@ -1823,6 +1935,9 @@ def draw_overlays() -> None:
         if face_indices:
             coords = _cached_bottom_coords(obj, face_indices)
             _draw_uniform_tris(coords, HIGHLIGHT_COLOR)
+
+    # 合成曲面：与领域分色同款 GPU 叠加，颜色同步自拟合曲线/领域
+    _draw_fit_surface_overlays(context)
 
 
 def draw_overlay_controls(self, context: bpy.types.Context) -> None:
