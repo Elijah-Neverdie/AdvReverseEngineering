@@ -15,6 +15,7 @@ from ..algorithms.curve_edit import (
     bridge_fit_surface_boundaries,
     compose_patch_from_boundary_polylines,
     compose_patch_from_boundary_polylines_ex,
+    default_surface_segments,
     estimate_open_directed_similarity,
     estimate_similarity_transform,
     extract_mesh_boundary_loop_sides,
@@ -57,12 +58,18 @@ SPLIT_ANGLE_STEP = 2.0
 SPLIT_ANGLE_MIN = 5.0
 SPLIT_ANGLE_MAX = 170.0
 DEFAULT_BEZIER_CONTROLS = 3
-BEZIER_CONTROLS_MIN = 3
+BEZIER_CONTROLS_MIN = 2
 BEZIER_CONTROLS_MAX = 32
 SIMILAR_SAMPLE_COUNT = 64
 MODAL_TIMER_STEP = 0.1
 DEFAULT_SURFACE_SEG_U = 12
 DEFAULT_SURFACE_SEG_V = 12
+SURFACE_SEG_MIN = 1
+SURFACE_SEG_MAX = 64
+
+
+def _clamp_surface_segments(value: int) -> int:
+    return int(max(SURFACE_SEG_MIN, min(SURFACE_SEG_MAX, int(value))))
 
 
 def _tag_redraw(context: bpy.types.Context) -> None:
@@ -992,8 +999,10 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
     bl_description = (
         "预览选中的 3/4 条贝塞尔边界，可在编辑模式拖动锚点/手柄微调，"
         "确认后生成曲面并删除边界曲线；"
-        "四条闭合对边时：Ctrl/Shift 滚轮分别调两组控制点数，"
-        "相似模式对边两两相似（保持环向首尾），对边同色预览；"
+        "控制点最少 2；Ctrl/Shift 滚轮分别调两组控制点数；"
+        "Ctrl/Shift+PgUp/PgDn 分别调两组曲面细分（最少 1），"
+        "默认细分按短边控制点数与边长比估算；"
+        "四条闭合对边时相似模式对边两两相似（保持环向首尾），对边同色预览；"
         "缝合开口(V)沿切向延伸端点至交点封闭缺口"
     )
     bl_options = {"REGISTER", "UNDO"}
@@ -1003,27 +1012,77 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             max(BEZIER_CONTROLS_MIN, min(BEZIER_CONTROLS_MAX, int(value)))
         )
 
+    def _sync_segment_props(self, context: bpy.types.Context) -> None:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        scene_props.curve_fit_segments_u = int(self._seg_u)
+        scene_props.curve_fit_segments_v = int(self._seg_v)
+
+    def _refresh_default_segments(self, context: bpy.types.Context) -> None:
+        """按短边控制点数与边长比刷新默认细分（手动调过后跳过）。"""
+        if bool(getattr(self, "_segments_manual", False)):
+            self._sync_segment_props(context)
+            return
+        len_u = float(getattr(self, "_pair_len_u", 1.0))
+        len_v = float(getattr(self, "_pair_len_v", 1.0))
+        cu = self._clamp_controls(getattr(self, "_controls_a", DEFAULT_BEZIER_CONTROLS))
+        cv = self._clamp_controls(getattr(self, "_controls_b", DEFAULT_BEZIER_CONTROLS))
+        if not bool(getattr(self, "_quad_loop_active", False)):
+            cv = cu
+        seg_u, seg_v = default_surface_segments(
+            len_u,
+            len_v,
+            cu,
+            cv,
+            seg_min=SURFACE_SEG_MIN,
+            seg_max=SURFACE_SEG_MAX,
+        )
+        self._seg_u = _clamp_surface_segments(seg_u)
+        self._seg_v = _clamp_surface_segments(seg_v)
+        self._sync_segment_props(context)
+
+    def _update_pair_lengths_from_sources(self) -> None:
+        """非四边形环：用最短/最长边估计 U/V 长度。"""
+        lengths: list[float] = []
+        for _obj, sources in getattr(self, "_targets", []):
+            for source in sources:
+                lengths.append(
+                    self._polyline_length(source["points"], source["cyclic"])
+                )
+        if not lengths:
+            self._pair_len_u = 1.0
+            self._pair_len_v = 1.0
+            return
+        self._pair_len_u = float(min(lengths))
+        self._pair_len_v = float(max(lengths))
+
     def _update_status(self, context: bpy.types.Context) -> None:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
         na = int(getattr(self, "_controls_a", DEFAULT_BEZIER_CONTROLS))
         nb = int(getattr(self, "_controls_b", DEFAULT_BEZIER_CONTROLS))
+        su = int(getattr(self, "_seg_u", SURFACE_SEG_MIN))
+        sv = int(getattr(self, "_seg_v", SURFACE_SEG_MIN))
         similar = bool(getattr(self, "_similar", False))
         stitch = bool(getattr(self, "_stitch_open", False))
         mode = "开" if similar else "关"
         stitch_s = "开" if stitch else "关"
         quad = bool(getattr(self, "_quad_loop_active", False))
         edit_hint = " · 可拖锚点/手柄微调 · Tab切编辑"
+        seg_hint = (
+            f" · 细分U {su}/V {sv}"
+            " · Ctrl+Pg±调U · Shift+Pg±调V"
+        )
         if quad:
             extra = " · 对边两两相似·封闭" if similar else " · 四边形对边封闭"
             if stitch:
                 extra += " · 已缝合开口"
             text = (
                 f"拟合曲面预览：组A {na} · 组B {nb} · 相似 {mode} · 缝合 {stitch_s}"
-                f"{extra}{edit_hint} · Ctrl滚轮A · Shift滚轮B · S相似 · V缝合 · Enter确认"
+                f"{seg_hint}{extra}{edit_hint}"
+                " · Ctrl滚轮A · Shift滚轮B · S相似 · V缝合 · Enter确认"
             )
         else:
             text = (
-                f"拟合曲面预览：控制点 {na} · 相似模式 {mode}"
+                f"拟合曲面预览：控制点 {na} · 相似模式 {mode}{seg_hint}"
                 f"{edit_hint} · Ctrl+滚轮调点数 · S相似 · Enter确认 · Esc取消"
             )
         scene_props.curve_fit_status = text
@@ -1146,6 +1205,12 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         ]
         beziers: list[list[dict] | None] = [None, None, None, None]
         pair_ids = [0, 1, 0, 1]
+        lengths = [
+            self._polyline_length(pts, False) for _obj, pts in loop_items
+        ]
+        # 对边组 A→U（底/顶），组 B→V（左/右）
+        self._pair_len_u = 0.5 * (float(lengths[0]) + float(lengths[2]))
+        self._pair_len_v = 0.5 * (float(lengths[1]) + float(lengths[3]))
         if similar:
             for pair_id, (a, b) in enumerate(opposite_edge_pairs(4)):
                 n_ctrl = counts[pair_id]
@@ -1212,11 +1277,13 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         if quad_edges is not None and self._rebuild_quad_loop_preview(
             quad_edges, similar
         ):
+            self._refresh_default_segments(context)
             preview = _bezier_preview_from_payload(self._preview_payload)
             set_curve_bezier_preview(preview)
             self._update_status(context)
             return True
 
+        self._update_pair_lengths_from_sources()
         if similar and len(self._targets) >= 2:
             ranked = []
             for obj, sources in self._targets:
@@ -1313,6 +1380,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
 
         preview = _bezier_preview_from_payload(self._preview_payload)
         set_curve_bezier_preview(preview)
+        self._refresh_default_segments(context)
         self._update_status(context)
         return True
 
@@ -1331,7 +1399,12 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             return False
 
         try:
-            obj, kind = _compose_surface_from_curves(context, curves)
+            obj, kind = _compose_surface_from_curves(
+                context,
+                curves,
+                segments_u=int(getattr(self, "_seg_u", DEFAULT_SURFACE_SEG_U)),
+                segments_v=int(getattr(self, "_seg_v", DEFAULT_SURFACE_SEG_V)),
+            )
         except RegionFitError as exc:
             self.report({"ERROR"}, str(exc))
             return False
@@ -1424,6 +1497,15 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             )
         )
         self._controls = self._controls_a
+        self._seg_u = _clamp_surface_segments(
+            getattr(scene_props, "curve_fit_segments_u", DEFAULT_BEZIER_CONTROLS)
+        )
+        self._seg_v = _clamp_surface_segments(
+            getattr(scene_props, "curve_fit_segments_v", DEFAULT_BEZIER_CONTROLS)
+        )
+        self._segments_manual = False
+        self._pair_len_u = 1.0
+        self._pair_len_v = 1.0
         self._similar = bool(getattr(scene_props, "curve_fit_similar", False))
         self._stitch_open = bool(
             getattr(scene_props, "curve_fit_stitch_open", False)
@@ -1439,6 +1521,8 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         scene_props.curve_fit_confirm_requested = False
         scene_props.curve_fit_controls = self._controls_a
         scene_props.curve_fit_controls_b = self._controls_b
+        scene_props.curve_fit_segments_u = self._seg_u
+        scene_props.curve_fit_segments_v = self._seg_v
         scene_props.curve_fit_similar = self._similar
         scene_props.curve_fit_stitch_open = self._stitch_open
         clear_curve_split_preview()
@@ -1543,16 +1627,46 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                     self.report({"ERROR"}, str(exc))
                 return {"RUNNING_MODAL"}
 
+        if event.type in {"PAGE_UP", "PAGE_DOWN"} and event.value == "PRESS":
+            delta = 1 if event.type == "PAGE_UP" else -1
+            if event.ctrl and not event.shift:
+                self._seg_u = _clamp_surface_segments(self._seg_u + delta)
+                self._segments_manual = True
+                scene_props.curve_fit_segments_u = self._seg_u
+                self._update_status(context)
+                _tag_redraw(context)
+                return {"RUNNING_MODAL"}
+            if event.shift and not event.ctrl:
+                self._seg_v = _clamp_surface_segments(self._seg_v + delta)
+                self._segments_manual = True
+                scene_props.curve_fit_segments_v = self._seg_v
+                self._update_status(context)
+                _tag_redraw(context)
+                return {"RUNNING_MODAL"}
+
         panel_a = self._clamp_controls(
             getattr(scene_props, "curve_fit_controls", self._controls_a)
         )
         panel_b = self._clamp_controls(
             getattr(scene_props, "curve_fit_controls_b", self._controls_b)
         )
+        panel_su = _clamp_surface_segments(
+            getattr(scene_props, "curve_fit_segments_u", self._seg_u)
+        )
+        panel_sv = _clamp_surface_segments(
+            getattr(scene_props, "curve_fit_segments_v", self._seg_v)
+        )
         panel_sim = bool(getattr(scene_props, "curve_fit_similar", self._similar))
         panel_stitch = bool(
             getattr(scene_props, "curve_fit_stitch_open", self._stitch_open)
         )
+        if panel_su != self._seg_u or panel_sv != self._seg_v:
+            self._seg_u = panel_su
+            self._seg_v = panel_sv
+            self._segments_manual = True
+            self._update_status(context)
+            _tag_redraw(context)
+            return {"RUNNING_MODAL"}
         if (
             panel_a != self._controls_a
             or panel_b != self._controls_b
@@ -1847,6 +1961,9 @@ def _delete_curve_objects(curves: list[bpy.types.Object]) -> None:
 def _compose_surface_from_curves(
     context: bpy.types.Context,
     curves: list[bpy.types.Object],
+    *,
+    segments_u: int = DEFAULT_SURFACE_SEG_U,
+    segments_v: int = DEFAULT_SURFACE_SEG_V,
 ) -> tuple[bpy.types.Object, str]:
     """
     由 3/4 条边界曲线生成拟合曲面网格。
@@ -1859,8 +1976,8 @@ def _compose_surface_from_curves(
     polylines = [_boundary_polyline_from_curve_obj(obj) for obj in curves]
     vertices, faces, kind, loop_sides = compose_patch_from_boundary_polylines_ex(
         polylines,
-        segments_u=DEFAULT_SURFACE_SEG_U,
-        segments_v=DEFAULT_SURFACE_SEG_V,
+        segments_u=_clamp_surface_segments(segments_u),
+        segments_v=_clamp_surface_segments(segments_v),
     )
 
     collection = _ensure_surface_collection(context.scene)
@@ -1898,6 +2015,8 @@ def _compose_surface_from_curves(
     obj["are_fit_kind"] = "region_surface"
     obj["are_fit_surface_type"] = kind
     obj["are_fit_source_curves"] = [c.name for c in curves]
+    obj["are_fit_segments_u"] = int(_clamp_surface_segments(segments_u))
+    obj["are_fit_segments_v"] = int(_clamp_surface_segments(segments_v))
     # 持久化定向边界，供后续「桥接曲面」沿贝塞尔曲率连接
     flat, counts = pack_boundary_sides(loop_sides)
     obj["are_fit_boundary_flat"] = flat

@@ -723,17 +723,31 @@ class ARE_SceneProperties(bpy.types.PropertyGroup):
     )
     curve_fit_controls: IntProperty(
         name="控制点数A",
-        description="对边组 A 的贝塞尔锚点数；Ctrl+滚轮调节，最少 3",
+        description="对边组 A 的贝塞尔锚点数；Ctrl+滚轮调节，最少 2",
         default=3,
-        min=3,
+        min=2,
         max=32,
     )
     curve_fit_controls_b: IntProperty(
         name="控制点数B",
-        description="对边组 B 的贝塞尔锚点数；Shift+滚轮调节，最少 3",
+        description="对边组 B 的贝塞尔锚点数；Shift+滚轮调节，最少 2",
         default=3,
-        min=3,
+        min=2,
         max=32,
+    )
+    curve_fit_segments_u: IntProperty(
+        name="曲面细分U",
+        description="拟合曲面对边组 A 方向细分；Ctrl+PgUp/PgDn 调节，最少 1",
+        default=3,
+        min=1,
+        max=64,
+    )
+    curve_fit_segments_v: IntProperty(
+        name="曲面细分V",
+        description="拟合曲面对边组 B 方向细分；Shift+PgUp/PgDn 调节，最少 1",
+        default=3,
+        min=1,
+        max=64,
     )
     curve_fit_similar: BoolProperty(
         name="相似模式",

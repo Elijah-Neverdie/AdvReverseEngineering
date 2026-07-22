@@ -189,7 +189,7 @@ def fit_bezier_n_controls(
     返回每项: {co, handle_left, handle_right}。
     """
     pts = _as_float_array(points)
-    n = max(int(control_count), 3)
+    n = max(int(control_count), 2)
     if len(pts) < 2:
         raise RegionFitError("折线点数不足，无法拟合贝塞尔")
 
@@ -529,6 +529,38 @@ def prepare_triangular_sides_from_loop(
     return left, right, base
 
 
+def default_surface_segments(
+    length_u: float,
+    length_v: float,
+    controls_u: int,
+    controls_v: int,
+    *,
+    seg_min: int = 1,
+    seg_max: int = 64,
+) -> tuple[int, int]:
+    """
+    默认曲面细分：短边方向 = 该边控制点数；
+    长边 = 短边控制点数 × (长边长/短边长)；对边共用同一细分。
+    """
+    lu = max(float(length_u), 1e-12)
+    lv = max(float(length_v), 1e-12)
+    cu = max(int(controls_u), 2)
+    cv = max(int(controls_v), 2)
+    lo = max(int(seg_min), 1)
+    hi = max(int(seg_max), lo)
+
+    def _clamp(value: int) -> int:
+        return int(max(lo, min(hi, int(value))))
+
+    if lu <= lv:
+        seg_u = cu
+        seg_v = max(lo, int(round(cu * (lv / lu))))
+    else:
+        seg_v = cv
+        seg_u = max(lo, int(round(cv * (lu / lv))))
+    return _clamp(seg_u), _clamp(seg_v)
+
+
 def compose_patch_from_boundary_polylines(
     polylines: Sequence[np.ndarray],
     *,
@@ -573,8 +605,8 @@ def compose_patch_from_boundary_polylines_ex(
         loop[index][-1] = mid
         loop[nxt][0] = mid
 
-    seg_u = max(int(segments_u), 2)
-    seg_v = max(int(segments_v), 2)
+    seg_u = max(int(segments_u), 1)
+    seg_v = max(int(segments_v), 1)
     if len(loop) == 4:
         vertices, faces = build_quad_patch(loop, seg_u, seg_v)
         return vertices, faces, "QUAD", loop
@@ -748,8 +780,8 @@ def bridge_fit_surface_boundaries(
     t_b0 = _tangent_at_corner(edge_b, prev_b, next_b, at_start=True)
     t_b1 = _tangent_at_corner(edge_b, prev_b, next_b, at_start=False)
 
-    seg_u = max(int(segments_u), 2)
-    seg_v = max(int(segments_v), 2)
+    seg_u = max(int(segments_u), 1)
+    seg_v = max(int(segments_v), 1)
     # 对边采样点数一致
     bottom = resample_polyline(edge_a, seg_u + 1)
     top = resample_polyline(edge_b, seg_u + 1)
@@ -1090,6 +1122,7 @@ __all__ = (
     "closest_points_on_rays",
     "compose_patch_from_boundary_polylines",
     "compose_patch_from_boundary_polylines_ex",
+    "default_surface_segments",
     "estimate_open_directed_similarity",
     "estimate_similarity_transform",
     "extract_mesh_boundary_loop_sides",

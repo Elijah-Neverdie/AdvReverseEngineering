@@ -12,6 +12,7 @@ from AdvReverseEngineering.algorithms.curve_edit import (
     best_open_alignment,
     bridge_fit_surface_boundaries,
     compose_patch_from_boundary_polylines,
+    default_surface_segments,
     estimate_open_directed_similarity,
     estimate_similarity_transform,
     find_break_indices,
@@ -61,6 +62,27 @@ class CurveEditTests(unittest.TestCase):
         )
         bez_c = fit_bezier_n_controls(circle, 6, cyclic=True)
         self.assertEqual(len(bez_c), 6)
+
+    def test_fit_bezier_min_two_controls(self) -> None:
+        line = np.linspace([0, 0, 0], [1, 0, 0], 12)
+        bez = fit_bezier_n_controls(line, 1, cyclic=False)
+        self.assertEqual(len(bez), 2)
+        bez2 = fit_bezier_n_controls(line, 2, cyclic=False)
+        self.assertEqual(len(bez2), 2)
+
+    def test_default_surface_segments_short_edge_controls(self) -> None:
+        # U 为短边、控制点 3 → U 细分 3；V 为 2 倍长 → 细分 6
+        su, sv = default_surface_segments(1.0, 2.0, 3, 5)
+        self.assertEqual(su, 3)
+        self.assertEqual(sv, 6)
+        # V 为短边、控制点 4 → V 细分 4；U 为 3 倍长 → 细分 12
+        su2, sv2 = default_surface_segments(3.0, 1.0, 8, 4)
+        self.assertEqual(su2, 12)
+        self.assertEqual(sv2, 4)
+        # 等长时取 U 为短边侧（≤），细分=各自控制点逻辑：lu<=lv → u=cu
+        su3, sv3 = default_surface_segments(1.0, 1.0, 3, 5)
+        self.assertEqual(su3, 3)
+        self.assertEqual(sv3, 3)
 
     def test_similarity_roundtrip(self) -> None:
         src = np.array(

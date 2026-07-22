@@ -485,6 +485,16 @@ class ARE_PT_main(bpy.types.Panel):
                     "curve_fit_controls_b",
                     text="控制点数B",
                 )
+                tip.prop(
+                    scene_props,
+                    "curve_fit_segments_u",
+                    text="曲面细分U",
+                )
+                tip.prop(
+                    scene_props,
+                    "curve_fit_segments_v",
+                    text="曲面细分V",
+                )
                 mode_row = tip.row(align=True)
                 mode_row.prop(
                     scene_props,
@@ -514,12 +524,14 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box = tip.box()
                     help_box.label(text="1. 选中 3/4 条曲线后点「拟合曲面」")
                     help_box.label(text="2. 自动进入编辑模式，可拖锚点/手柄微调")
-                    help_box.label(text="3. Ctrl+滚轮调组A点数；Shift+滚轮调组B")
-                    help_box.label(text="4. 按 S 切换相似；按 V 切换缝合开口")
+                    help_box.label(text="3. 控制点最少 2；Ctrl/Shift+滚轮调组A/B点数")
+                    help_box.label(text="4. Ctrl/Shift+PgUp/PgDn 调细分U/V（最少 1）")
+                    help_box.label(text="默认细分：短边=该边控制点数，长边按边长比放大")
+                    help_box.label(text="5. 按 S 切换相似；按 V 切换缝合开口")
                     help_box.label(text="四条端点近闭合：对边同色，相似=对边两两")
                     help_box.label(text="缝合开口：切向延伸缺口两端至交点封闭")
                     help_box.label(text="调点数/相似/缝合会重新拟合并覆盖手动微调")
-                    help_box.label(text="确认后按当前贝塞尔生成拟合曲面并删除边界")
+                    help_box.label(text="确认后按当前贝塞尔与细分生成曲面并删除边界")
                     help_box.label(text="曲面沿用领域显示色")
                     help_box.label(text="Enter / 确认生成曲面 · Esc 取消")
 
