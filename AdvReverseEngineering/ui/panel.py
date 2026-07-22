@@ -455,7 +455,8 @@ class ARE_PT_main(bpy.types.Panel):
                     help_box.label(text="2. 折角处断开，连续段用不同颜色标记")
                     help_box.label(text="3. Ctrl+滚轮调节折角阈值")
                     help_box.label(text="4. 左下角显示将拆分为几条")
-                    help_box.label(text="5. 确认后全选拆分结果（无粗细）")
+                    help_box.label(text="5. 确认前禁止点选/取消选中其他物体")
+                    help_box.label(text="6. 确认后全选拆分结果（无粗细）")
                     help_box.label(text="Enter / 确认拆分 · Esc 取消")
 
             if curve_fitting:
@@ -499,12 +500,13 @@ class ARE_PT_main(bpy.types.Panel):
                 ):
                     help_box = tip.box()
                     help_box.label(text="1. 选中 3/4 条曲线后点「拟合曲面」")
-                    help_box.label(text="2. Ctrl+滚轮调组A点数；Shift+滚轮调组B")
-                    help_box.label(text="3. 按 S 切换相似；按 V 切换缝合开口")
+                    help_box.label(text="2. 自动进入编辑模式，可拖锚点/手柄微调")
+                    help_box.label(text="3. Ctrl+滚轮调组A点数；Shift+滚轮调组B")
+                    help_box.label(text="4. 按 S 切换相似；按 V 切换缝合开口")
                     help_box.label(text="四条端点近闭合：对边同色，相似=对边两两")
                     help_box.label(text="缝合开口：切向延伸缺口两端至交点封闭")
-                    help_box.label(text="相似变换保持环向首尾，避免对边扭曲")
-                    help_box.label(text="确认后生成拟合曲面并删除边界曲线")
+                    help_box.label(text="调点数/相似/缝合会重新拟合并覆盖手动微调")
+                    help_box.label(text="确认后按当前贝塞尔生成拟合曲面并删除边界")
                     help_box.label(text="曲面沿用领域显示色")
                     help_box.label(text="Enter / 确认生成曲面 · Esc 取消")
 

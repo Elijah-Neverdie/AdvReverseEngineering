@@ -512,6 +512,127 @@ def _any_curve_modal_busy(scene_props) -> bool:
     )
 
 
+def _target_objects(targets) -> list[bpy.types.Object]:
+    objs: list[bpy.types.Object] = []
+    for item in targets or []:
+        obj = item[0] if isinstance(item, tuple) else item
+        if _is_object_alive(obj):
+            objs.append(obj)
+    return objs
+
+
+def _lock_non_target_select(
+    allowed: list[bpy.types.Object],
+) -> list[tuple[bpy.types.Object, bool]]:
+    """
+    禁止点选非目标物体（hide_select），返回需还原的 (obj, old_hide_select)。
+    """
+    allowed_set = {obj for obj in allowed if _is_object_alive(obj)}
+    backups: list[tuple[bpy.types.Object, bool]] = []
+    for obj in list(bpy.data.objects):
+        try:
+            if obj in allowed_set:
+                if obj.hide_select:
+                    backups.append((obj, True))
+                    obj.hide_select = False
+            else:
+                if not obj.hide_select:
+                    backups.append((obj, False))
+                    obj.hide_select = True
+        except ReferenceError:
+            continue
+    return backups
+
+
+def _restore_hide_select(
+    backups: list[tuple[bpy.types.Object, bool]] | None,
+) -> None:
+    for obj, was_hidden in backups or []:
+        try:
+            if _is_object_alive(obj):
+                obj.hide_select = bool(was_hidden)
+        except ReferenceError:
+            continue
+
+
+def _force_select_targets(
+    context: bpy.types.Context,
+    targets: list[bpy.types.Object],
+) -> None:
+    """强制保持目标物体选中，避免取消选择后卡在模态。"""
+    alive = [obj for obj in targets if _is_object_alive(obj)]
+    if not alive:
+        return
+    if context.mode == "EDIT_CURVE":
+        selected = set()
+        for obj in list(context.selected_objects):
+            try:
+                selected.add(obj)
+            except ReferenceError:
+                pass
+        if all(obj in selected for obj in alive) and len(selected) == len(alive):
+            return
+    for obj in list(context.selected_objects):
+        try:
+            if obj not in alive:
+                obj.select_set(False)
+        except ReferenceError:
+            pass
+    for obj in alive:
+        try:
+            obj.select_set(True)
+        except ReferenceError:
+            pass
+    try:
+        active = context.view_layer.objects.active
+        if active not in alive:
+            context.view_layer.objects.active = alive[0]
+    except Exception:
+        try:
+            context.view_layer.objects.active = alive[0]
+        except Exception:
+            pass
+
+
+def _ensure_object_mode(context: bpy.types.Context) -> None:
+    if getattr(context, "mode", "OBJECT") == "OBJECT":
+        return
+    try:
+        bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception:
+        pass
+
+
+def _enter_curve_edit_mode(
+    context: bpy.types.Context,
+    targets: list[bpy.types.Object],
+) -> bool:
+    """多选目标曲线后进入编辑模式，便于拖锚点/手柄。"""
+    alive = [
+        obj for obj in targets if _is_object_alive(obj) and obj.type == "CURVE"
+    ]
+    if not alive:
+        return False
+    _ensure_object_mode(context)
+    _force_select_targets(context, alive)
+    try:
+        bpy.ops.object.mode_set(mode="EDIT")
+        return True
+    except Exception:
+        return False
+
+
+def _region_is_view3d_window(context: bpy.types.Context) -> bool:
+    space = getattr(context, "space_data", None)
+    region = getattr(context, "region", None)
+    return (
+        space is not None
+        and getattr(space, "type", "") == "VIEW_3D"
+        and region is not None
+        and getattr(region, "type", "") == "WINDOW"
+    )
+
+
 class ARE_OT_split_fit_curve(bpy.types.Operator):
     """按折角阈值预览分色，确认后拆成多条曲线。"""
 
@@ -529,7 +650,7 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
         angle = float(getattr(self, "_angle", DEFAULT_SPLIT_ANGLE))
         text = (
             f"拆分曲线：将拆分为 {n} 条 · 折角阈值 {angle:.0f}° · "
-            "Ctrl+滚轮调节 · Enter 确认 · Esc 取消"
+            "Ctrl+滚轮调节 · Enter 确认 · Esc 取消 · 禁止改选物体"
         )
         scene_props.curve_split_status = text
         _header(context, text)
@@ -696,9 +817,12 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
     def _cleanup(self, context: bpy.types.Context, restore: bool) -> None:
         # 无论还原是否成功，都必须清掉 GPU 预览，避免残影
         try:
+            _ensure_object_mode(context)
             if restore:
                 _restore_curve_backups(getattr(self, "_backups", None))
         finally:
+            _restore_hide_select(getattr(self, "_hide_select_backups", None))
+            self._hide_select_backups = []
             scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
             if scene_props is not None:
                 scene_props.curve_split_mode_active = False
@@ -753,6 +877,9 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
         self._committed = False
         self._preview_segments = []
         self._segment_count = 0
+        target_objs = _target_objects(self._targets)
+        self._hide_select_backups = _lock_non_target_select(target_objs)
+        _force_select_targets(context, target_objs)
         scene_props.curve_split_mode_active = True
         scene_props.curve_split_confirm_requested = False
         scene_props.curve_split_angle = self._angle
@@ -767,13 +894,15 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
 
     def modal(self, context: bpy.types.Context, event):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        target_objs = _target_objects(getattr(self, "_targets", []))
         # 目标曲线被删除/撤销后立刻退出，并清预览
-        if not all(
-            _is_object_alive(obj) for obj, _sources in getattr(self, "_targets", [])
-        ):
+        if not target_objs:
             self.report({"WARNING"}, "目标曲线已丢失，已退出拆分")
             self._cleanup(context, restore=False)
             return {"CANCELLED"}
+
+        # 始终保持目标选中；禁止空选/点选其他物体导致无法退出
+        _force_select_targets(context, target_objs)
 
         if scene_props.curve_split_confirm_requested:
             scene_props.curve_split_confirm_requested = False
@@ -794,6 +923,12 @@ class ARE_OT_split_fit_curve(bpy.types.Operator):
                 self._cleanup(context, restore=False)
                 return {"FINISHED"}
             return {"RUNNING_MODAL"}
+
+        # 拦截视口内点选/框选，避免取消选择；侧栏 UI 仍可点确认
+        if event.type in {"LEFTMOUSE", "A"} and event.value == "PRESS":
+            if _region_is_view3d_window(context):
+                _force_select_targets(context, target_objs)
+                return {"RUNNING_MODAL"}
 
         if event.ctrl and event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
             delta = (
@@ -850,7 +985,8 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
     bl_idname = "are.fit_bezier_curve"
     bl_label = "拟合曲面"
     bl_description = (
-        "预览选中的 3/4 条贝塞尔边界，确认后直接生成曲面并删除边界曲线；"
+        "预览选中的 3/4 条贝塞尔边界，可在编辑模式拖动锚点/手柄微调，"
+        "确认后生成曲面并删除边界曲线；"
         "四条闭合对边时：Ctrl/Shift 滚轮分别调两组控制点数，"
         "相似模式对边两两相似（保持环向首尾），对边同色预览；"
         "缝合开口(V)沿切向延伸端点至交点封闭缺口"
@@ -871,21 +1007,50 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         mode = "开" if similar else "关"
         stitch_s = "开" if stitch else "关"
         quad = bool(getattr(self, "_quad_loop_active", False))
+        edit_hint = " · 可拖锚点/手柄微调 · Tab切编辑"
         if quad:
             extra = " · 对边两两相似·封闭" if similar else " · 四边形对边封闭"
             if stitch:
                 extra += " · 已缝合开口"
             text = (
                 f"拟合曲面预览：组A {na} · 组B {nb} · 相似 {mode} · 缝合 {stitch_s}"
-                f"{extra} · Ctrl滚轮A · Shift滚轮B · S相似 · V缝合 · Enter确认"
+                f"{extra}{edit_hint} · Ctrl滚轮A · Shift滚轮B · S相似 · V缝合 · Enter确认"
             )
         else:
             text = (
-                f"拟合曲面预览：控制点 {na} · 相似模式 {mode} · "
-                "Ctrl+滚轮调点数 · S 切换相似 · Enter 确认 · Esc 取消"
+                f"拟合曲面预览：控制点 {na} · 相似模式 {mode}"
+                f"{edit_hint} · Ctrl+滚轮调点数 · S相似 · Enter确认 · Esc取消"
             )
         scene_props.curve_fit_status = text
         _header(context, text)
+
+    def _sync_preview_from_live_curves(self, context: bpy.types.Context) -> None:
+        """从当前贝塞尔物体同步 GPU 预览（用户拖动手柄后）。"""
+        payload: list[tuple] = []
+        for obj, _sources in getattr(self, "_targets", []):
+            if not _is_object_alive(obj) or obj.type != "CURVE" or obj.data is None:
+                continue
+            pair_id = int(obj.get("are_fit_opposite_pair", -1))
+            for spline in obj.data.splines:
+                if spline.type != "BEZIER" or len(spline.bezier_points) < 2:
+                    continue
+                fitted = _bezier_dicts_from_spline(spline, obj.matrix_world)
+                cyclic = bool(spline.use_cyclic_u)
+                if pair_id >= 0:
+                    payload.append((obj, fitted, cyclic, pair_id))
+                else:
+                    payload.append((obj, fitted, cyclic))
+        self._preview_payload = payload
+        set_curve_bezier_preview(_bezier_preview_from_payload(payload))
+        _tag_redraw(context)
+
+    def _refit_and_enter_edit(self, context: bpy.types.Context) -> bool:
+        """退出编辑 → 重拟合 → 再进入编辑模式。"""
+        _ensure_object_mode(context)
+        ok = self._rebuild_preview(context)
+        if ok:
+            _enter_curve_edit_mode(context, _target_objects(self._targets))
+        return ok
 
     def _fit_one(
         self,
@@ -1148,6 +1313,9 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
 
     def _commit(self, context: bpy.types.Context) -> bool:
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        _ensure_object_mode(context)
+        # 确认前用当前（可能已手动微调）贝塞尔同步一次
+        self._sync_preview_from_live_curves(context)
         curves = [
             obj
             for obj, _sources in getattr(self, "_targets", [])
@@ -1180,9 +1348,12 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
     def _cleanup(self, context: bpy.types.Context, restore: bool) -> None:
         # 无论还原是否成功，都必须清掉 GPU 预览，避免残影
         try:
+            _ensure_object_mode(context)
             if restore:
                 _restore_curve_backups(getattr(self, "_backups", None))
         finally:
+            _restore_hide_select(getattr(self, "_hide_select_backups", None))
+            self._hide_select_backups = []
             scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
             if scene_props is not None:
                 scene_props.curve_fit_mode_active = False
@@ -1231,6 +1402,9 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         if not self._targets:
             self.report({"ERROR"}, "选中曲线没有可用样条")
             return {"CANCELLED"}
+        if len(self._targets) not in (3, 4):
+            self.report({"ERROR"}, "请先选中 3 或 4 条边界曲线")
+            return {"CANCELLED"}
 
         self._controls_a = self._clamp_controls(
             getattr(scene_props, "curve_fit_controls", DEFAULT_BEZIER_CONTROLS)
@@ -1253,6 +1427,9 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         self._committed = False
         self._preview_payload = []
         self._quad_loop_active = False
+        target_objs = _target_objects(self._targets)
+        self._hide_select_backups = _lock_non_target_select(target_objs)
+        _force_select_targets(context, target_objs)
         scene_props.curve_fit_mode_active = True
         scene_props.curve_fit_confirm_requested = False
         scene_props.curve_fit_controls = self._controls_a
@@ -1262,7 +1439,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
         clear_curve_split_preview()
         register_curve_tool_hud()
         try:
-            self._rebuild_preview(context)
+            self._refit_and_enter_edit(context)
         except RegionFitError as exc:
             self._cleanup(context, restore=True)
             self.report({"ERROR"}, str(exc))
@@ -1275,13 +1452,14 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
 
     def modal(self, context: bpy.types.Context, event):
         scene_props = getattr(context.scene, SCENE_PROP_NAME)
+        target_objs = _target_objects(getattr(self, "_targets", []))
         # 目标曲线被删除/撤销后立刻退出，并清预览
-        if not all(
-            _is_object_alive(obj) for obj, _sources in getattr(self, "_targets", [])
-        ):
+        if len(target_objs) not in (3, 4):
             self.report({"WARNING"}, "目标曲线已丢失，已退出拟合")
             self._cleanup(context, restore=False)
             return {"CANCELLED"}
+
+        _force_select_targets(context, target_objs)
 
         if scene_props.curve_fit_confirm_requested:
             scene_props.curve_fit_confirm_requested = False
@@ -1291,7 +1469,17 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 return {"FINISHED"}
             return {"RUNNING_MODAL"}
 
-        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+        if event.type in {"ESC"} and event.value == "PRESS":
+            self.report({"INFO"}, "已取消拟合曲面")
+            self._cleanup(context, restore=True)
+            return {"CANCELLED"}
+
+        # 编辑模式中右键用于取消选择控制点，不退出工具
+        if (
+            event.type == "RIGHTMOUSE"
+            and event.value == "PRESS"
+            and context.mode != "EDIT_CURVE"
+        ):
             self.report({"INFO"}, "已取消拟合曲面")
             self._cleanup(context, restore=True)
             return {"CANCELLED"}
@@ -1303,11 +1491,19 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 return {"FINISHED"}
             return {"RUNNING_MODAL"}
 
+        if event.type == "TIMER":
+            # 用户拖动手柄后刷新预览叠加
+            if context.mode == "EDIT_CURVE":
+                self._sync_preview_from_live_curves(context)
+            else:
+                _force_select_targets(context, target_objs)
+            return {"PASS_THROUGH"}
+
         if event.type == "S" and event.value == "PRESS" and not event.ctrl:
             self._similar = not self._similar
             scene_props.curve_fit_similar = self._similar
             try:
-                self._rebuild_preview(context)
+                self._refit_and_enter_edit(context)
             except RegionFitError as exc:
                 self.report({"ERROR"}, str(exc))
             return {"RUNNING_MODAL"}
@@ -1316,7 +1512,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             self._stitch_open = not self._stitch_open
             scene_props.curve_fit_stitch_open = self._stitch_open
             try:
-                self._rebuild_preview(context)
+                self._refit_and_enter_edit(context)
             except RegionFitError as exc:
                 self.report({"ERROR"}, str(exc))
             return {"RUNNING_MODAL"}
@@ -1328,7 +1524,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 self._controls_b = self._clamp_controls(self._controls_b + delta)
                 scene_props.curve_fit_controls_b = self._controls_b
                 try:
-                    self._rebuild_preview(context)
+                    self._refit_and_enter_edit(context)
                 except RegionFitError as exc:
                     self.report({"ERROR"}, str(exc))
                 return {"RUNNING_MODAL"}
@@ -1337,7 +1533,7 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
                 self._controls = self._controls_a
                 scene_props.curve_fit_controls = self._controls_a
                 try:
-                    self._rebuild_preview(context)
+                    self._refit_and_enter_edit(context)
                 except RegionFitError as exc:
                     self.report({"ERROR"}, str(exc))
                 return {"RUNNING_MODAL"}
@@ -1364,9 +1560,19 @@ class ARE_OT_fit_bezier_curve(bpy.types.Operator):
             self._similar = panel_sim
             self._stitch_open = panel_stitch
             try:
-                self._rebuild_preview(context)
+                self._refit_and_enter_edit(context)
             except RegionFitError as exc:
                 self.report({"ERROR"}, str(exc))
+            return {"RUNNING_MODAL"}
+
+        # 物体模式下拦截点选其他物体；编辑模式放行以拖锚点/手柄
+        if (
+            context.mode != "EDIT_CURVE"
+            and event.type in {"LEFTMOUSE", "A"}
+            and event.value == "PRESS"
+            and _region_is_view3d_window(context)
+        ):
+            _force_select_targets(context, target_objs)
             return {"RUNNING_MODAL"}
 
         return {"PASS_THROUGH"}
