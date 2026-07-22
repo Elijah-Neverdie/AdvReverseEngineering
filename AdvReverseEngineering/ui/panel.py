@@ -307,6 +307,19 @@ class ARE_PT_main(bpy.types.Panel):
                 text="拟合曲面",
                 icon="MESH_GRID",
             )
+            fit_surf_count = sum(
+                1
+                for item in context.selected_objects
+                if getattr(item, "type", "") == "MESH"
+                and str(item.get("are_fit_kind", "") or "") == "region_surface"
+            )
+            bridge_row = edit_row.row(align=True)
+            bridge_row.enabled = fit_surf_count == 2 and not modal_busy
+            bridge_row.operator(
+                "are.bridge_fit_surfaces",
+                text="桥接曲面",
+                icon="MOD_BOOLEAN",
+            )
 
             clear_row = region_box.row(align=True)
             clear_row.enabled = mesh_ready and not modal_busy

@@ -10,6 +10,7 @@ import numpy as np
 from AdvReverseEngineering.algorithms.curve_edit import (
     best_closed_alignment,
     best_open_alignment,
+    bridge_fit_surface_boundaries,
     compose_patch_from_boundary_polylines,
     estimate_open_directed_similarity,
     estimate_similarity_transform,
@@ -17,12 +18,14 @@ from AdvReverseEngineering.algorithms.curve_edit import (
     fit_bezier_n_controls,
     opposite_edge_pairs,
     order_open_curves_as_closed_loop,
+    pack_boundary_sides,
     sample_polyline_uniform,
     snap_bezier_endpoints,
     split_polyline_at_breaks,
     stitch_oriented_loop_polylines,
     transform_bezier_points,
     turn_angles_deg,
+    unpack_boundary_sides,
     weld_bezier_loop_endpoints,
 )
 
@@ -226,6 +229,41 @@ class CurveEditTests(unittest.TestCase):
             allow_large_gaps=True,
         )
         self.assertIsNotNone(ordered)
+
+    def test_pack_unpack_boundary_sides(self) -> None:
+        sides = [
+            np.linspace([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 5),
+            np.linspace([1.0, 0.0, 0.0], [1.0, 1.0, 0.0], 4),
+        ]
+        flat, counts = pack_boundary_sides(sides)
+        restored = unpack_boundary_sides(flat, counts)
+        self.assertEqual(len(restored), 2)
+        np.testing.assert_allclose(restored[0], sides[0])
+        np.testing.assert_allclose(restored[1], sides[1])
+
+    def test_bridge_two_quad_boundaries(self) -> None:
+        # 左补丁 x=0..1，右补丁 x=1.4..2.4，中间缺口沿贝塞尔桥接
+        left_sides = [
+            np.linspace([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 8),
+            np.linspace([1.0, 0.0, 0.0], [1.0, 1.0, 0.2], 8),
+            np.linspace([1.0, 1.0, 0.2], [0.0, 1.0, 0.0], 8),
+            np.linspace([0.0, 1.0, 0.0], [0.0, 0.0, 0.0], 8),
+        ]
+        right_sides = [
+            np.linspace([1.4, 0.0, 0.0], [2.4, 0.0, 0.0], 8),
+            np.linspace([2.4, 0.0, 0.0], [2.4, 1.0, 0.0], 8),
+            np.linspace([2.4, 1.0, 0.0], [1.4, 1.0, 0.2], 8),
+            np.linspace([1.4, 1.0, 0.2], [1.4, 0.0, 0.0], 8),
+        ]
+        verts, faces = bridge_fit_surface_boundaries(
+            left_sides, right_sides, segments_u=6, segments_v=6
+        )
+        self.assertGreaterEqual(len(verts), (6 + 1) * (6 + 1))
+        self.assertGreater(len(faces), 0)
+        # 桥接网格应落在缺口附近（x 大致在 1~1.4）
+        xs = verts[:, 0]
+        self.assertGreater(float(xs.min()), 0.85)
+        self.assertLess(float(xs.max()), 1.55)
 
 
 if __name__ == "__main__":

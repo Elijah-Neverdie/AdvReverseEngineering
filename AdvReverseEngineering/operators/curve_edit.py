@@ -12,14 +12,18 @@ from ..algorithms.curve_edit import (
     RegionFitError,
     best_closed_alignment,
     best_open_alignment,
+    bridge_fit_surface_boundaries,
     compose_patch_from_boundary_polylines,
+    compose_patch_from_boundary_polylines_ex,
     estimate_open_directed_similarity,
     estimate_similarity_transform,
+    extract_mesh_boundary_loop_sides,
     find_break_indices,
     fit_bezier_n_controls,
     opposite_edge_pairs,
     opposite_pair_colors,
     order_open_curves_as_closed_loop,
+    pack_boundary_sides,
     sample_bezier_anchor_chain,
     sample_polyline_uniform,
     segment_colors_for_count,
@@ -27,6 +31,7 @@ from ..algorithms.curve_edit import (
     split_polyline_at_breaks,
     stitch_oriented_loop_polylines,
     transform_bezier_points,
+    unpack_boundary_sides,
     weld_bezier_loop_endpoints,
 )
 from ..algorithms.region_fit import sample_cubic_bezier
@@ -1852,7 +1857,7 @@ def _compose_surface_from_curves(
     if len(curves) not in (3, 4):
         raise RegionFitError("拟合曲面需要选中 3 或 4 条曲线")
     polylines = [_boundary_polyline_from_curve_obj(obj) for obj in curves]
-    vertices, faces, kind = compose_patch_from_boundary_polylines(
+    vertices, faces, kind, loop_sides = compose_patch_from_boundary_polylines_ex(
         polylines,
         segments_u=DEFAULT_SURFACE_SEG_U,
         segments_v=DEFAULT_SURFACE_SEG_V,
@@ -1893,6 +1898,10 @@ def _compose_surface_from_curves(
     obj["are_fit_kind"] = "region_surface"
     obj["are_fit_surface_type"] = kind
     obj["are_fit_source_curves"] = [c.name for c in curves]
+    # 持久化定向边界，供后续「桥接曲面」沿贝塞尔曲率连接
+    flat, counts = pack_boundary_sides(loop_sides)
+    obj["are_fit_boundary_flat"] = flat
+    obj["are_fit_boundary_counts"] = counts
     try:
         obj["are_fit_region_id"] = int(curves[0].get("are_fit_region_id", -1))
     except Exception:
@@ -1911,6 +1920,197 @@ def _compose_surface_from_curves(
     obj.select_set(True)
     context.view_layer.objects.active = obj
     return obj, kind
+
+
+def _is_fit_surface_object(obj: bpy.types.Object | None) -> bool:
+    if obj is None:
+        return False
+    try:
+        return (
+            obj.type == "MESH"
+            and str(obj.get("are_fit_kind", "") or "") == "region_surface"
+        )
+    except ReferenceError:
+        return False
+
+
+def _selected_fit_surfaces(context: bpy.types.Context) -> list[bpy.types.Object]:
+    return [
+        obj
+        for obj in list(context.selected_objects)
+        if _is_fit_surface_object(obj)
+    ]
+
+
+def _fit_surface_boundary_sides(obj: bpy.types.Object) -> list[np.ndarray]:
+    """读取持久化边界；缺失时从网格开放边界回退提取。"""
+    flat = obj.get("are_fit_boundary_flat")
+    counts = obj.get("are_fit_boundary_counts")
+    if flat is not None and counts is not None:
+        sides = unpack_boundary_sides(flat, counts)
+        if len(sides) >= 3:
+            # 变换到世界坐标（合成时多为单位矩阵，仍统一处理）
+            matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+            world_sides = []
+            for side in sides:
+                homo = np.hstack(
+                    (side, np.ones((len(side), 1), dtype=np.float64))
+                )
+                world = (matrix @ homo.T).T[:, :3]
+                world_sides.append(world)
+            return world_sides
+
+    mesh = obj.data
+    if mesh is None:
+        raise RegionFitError(f"{obj.name} 没有网格数据")
+    # 世界坐标顶点
+    n = len(mesh.vertices)
+    local = np.empty(n * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", local)
+    local = local.reshape(n, 3)
+    matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+    homo = np.hstack((local, np.ones((n, 1), dtype=np.float64)))
+    world = (matrix @ homo.T).T[:, :3]
+    faces = [tuple(p.vertices) for p in mesh.polygons]
+    return extract_mesh_boundary_loop_sides(world, faces)
+
+
+def _blend_surface_colors(
+    objs: list[bpy.types.Object],
+) -> tuple[float, float, float, float]:
+    colors = []
+    for obj in objs:
+        raw = obj.get("are_fit_display_color")
+        if raw is not None:
+            try:
+                values = [float(v) for v in list(raw)[:4]]
+                if len(values) >= 3:
+                    alpha = values[3] if len(values) > 3 else 0.85
+                    colors.append(
+                        (values[0], values[1], values[2], max(alpha, 0.75))
+                    )
+                    continue
+            except Exception:
+                pass
+        got = _rgba_from_object_color(obj)
+        if got is not None:
+            colors.append(got)
+    if not colors:
+        return (0.35, 0.75, 1.0, 0.85)
+    arr = np.asarray(colors, dtype=np.float64)
+    mean = arr.mean(axis=0)
+    return (
+        float(mean[0]),
+        float(mean[1]),
+        float(mean[2]),
+        max(float(mean[3]), 0.75),
+    )
+
+
+class ARE_OT_bridge_fit_surfaces(bpy.types.Operator):
+    """将两张拟合曲面沿最近对边做贝塞尔曲率桥接。"""
+
+    bl_idname = "are.bridge_fit_surfaces"
+    bl_label = "桥接曲面"
+    bl_description = (
+        "选中两张「拟合曲面」，自动找最近对边，"
+        "用继承邻边切向的贝塞尔连接线做 Coons 桥接，写入「拟合曲面」集合"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        scene_props = getattr(context.scene, SCENE_PROP_NAME, None)
+        if scene_props is None:
+            return False
+        if _any_curve_modal_busy(scene_props):
+            return False
+        return len(_selected_fit_surfaces(context)) == 2
+
+    def execute(self, context: bpy.types.Context):
+        surfaces = _selected_fit_surfaces(context)
+        if len(surfaces) != 2:
+            self.report({"ERROR"}, "请选中两张拟合曲面")
+            return {"CANCELLED"}
+        try:
+            sides_a = _fit_surface_boundary_sides(surfaces[0])
+            sides_b = _fit_surface_boundary_sides(surfaces[1])
+            vertices, faces = bridge_fit_surface_boundaries(
+                sides_a,
+                sides_b,
+                segments_u=DEFAULT_SURFACE_SEG_U,
+                segments_v=DEFAULT_SURFACE_SEG_V,
+            )
+        except RegionFitError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"桥接曲面失败: {exc}")
+            return {"CANCELLED"}
+
+        collection = _ensure_surface_collection(context.scene)
+        name = f"FitBridge_{surfaces[0].name}_{surfaces[1].name}"
+        identity = surfaces[0].matrix_world.copy()
+        identity.identity()
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(
+            [tuple(map(float, v)) for v in vertices.tolist()],
+            [],
+            [tuple(face) for face in faces],
+        )
+        mesh.update()
+        try:
+            mesh.calc_normals()
+        except Exception:
+            pass
+        obj = bpy.data.objects.new(name, mesh)
+        obj.matrix_world = identity
+        if obj.name not in collection.objects:
+            collection.objects.link(obj)
+        scene_col = context.scene.collection
+        if obj.name in scene_col.objects and collection != scene_col:
+            try:
+                scene_col.objects.unlink(obj)
+            except Exception:
+                pass
+
+        color = _blend_surface_colors(surfaces)
+        _apply_surface_region_color(obj, color)
+        obj["are_fit_kind"] = "region_surface"
+        obj["are_fit_surface_type"] = "BRIDGE"
+        obj["are_fit_bridge_of"] = [surfaces[0].name, surfaces[1].name]
+        try:
+            obj["are_fit_region_id"] = int(
+                surfaces[0].get("are_fit_region_id", -1)
+            )
+        except Exception:
+            obj["are_fit_region_id"] = -1
+        source_name = str(surfaces[0].get("are_fit_source", "") or "")
+        if source_name:
+            obj["are_fit_source"] = source_name
+        # 桥接面也写入四边边界，便于继续桥接
+        try:
+            bridge_sides = extract_mesh_boundary_loop_sides(vertices, faces)
+            flat, counts = pack_boundary_sides(bridge_sides)
+            obj["are_fit_boundary_flat"] = flat
+            obj["are_fit_boundary_counts"] = counts
+        except Exception:
+            pass
+        obj.display_type = "SOLID"
+        obj.show_wire = True
+
+        for item in list(context.selected_objects):
+            try:
+                item.select_set(False)
+            except ReferenceError:
+                pass
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        self.report(
+            {"INFO"},
+            f"已桥接曲面 →「{SURFACE_COLLECTION_NAME}」/{obj.name}",
+        )
+        return {"FINISHED"}
 
 
 class ARE_OT_compose_region_surface(bpy.types.Operator):
@@ -1965,6 +2165,7 @@ __all__ = (
     "ARE_OT_fit_bezier_curve",
     "ARE_OT_confirm_fit_bezier_curve",
     "ARE_OT_compose_region_surface",
+    "ARE_OT_bridge_fit_surfaces",
     "CURVE_COLLECTION_NAME",
     "SURFACE_COLLECTION_NAME",
     "FIT_COLLECTION_NAME",

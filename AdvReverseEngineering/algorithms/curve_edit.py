@@ -541,6 +541,25 @@ def compose_patch_from_boundary_polylines(
 
     返回 (vertices_world, faces, kind) ，kind 为 \"TRI\" 或 \"QUAD\"。
     """
+    vertices, faces, kind, _loop = compose_patch_from_boundary_polylines_ex(
+        polylines,
+        segments_u=segments_u,
+        segments_v=segments_v,
+        max_gap_frac=max_gap_frac,
+    )
+    return vertices, faces, kind
+
+
+def compose_patch_from_boundary_polylines_ex(
+    polylines: Sequence[np.ndarray],
+    *,
+    segments_u: int = 12,
+    segments_v: int = 12,
+    max_gap_frac: float = 0.12,
+) -> tuple[np.ndarray, list[tuple[int, ...]], str, list[np.ndarray]]:
+    """
+    同 ``compose_patch_from_boundary_polylines``，额外返回定向焊接后的边界边列表。
+    """
     curves = [_as_float_array(p) for p in polylines]
     if len(curves) not in (3, 4):
         raise RegionFitError("合成区面需要选中 3 或 4 条曲线")
@@ -558,13 +577,317 @@ def compose_patch_from_boundary_polylines(
     seg_v = max(int(segments_v), 2)
     if len(loop) == 4:
         vertices, faces = build_quad_patch(loop, seg_u, seg_v)
-        return vertices, faces, "QUAD"
+        return vertices, faces, "QUAD", loop
 
     left, right, base = prepare_triangular_sides_from_loop(loop)
     vertices, faces = build_triangular_patch(
         left, right, base, segments_long=seg_v, segments_base=seg_u
     )
-    return vertices, faces, "TRI"
+    return vertices, faces, "TRI", loop
+
+
+def _normalize_vec(vec: np.ndarray) -> np.ndarray:
+    v = np.asarray(vec, dtype=np.float64).reshape(3)
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+    return v / n
+
+
+def _polyline_end_tangent(points: np.ndarray, at_start: bool) -> np.ndarray:
+    pts = _as_float_array(points)
+    if len(pts) < 2:
+        return np.zeros(3, dtype=np.float64)
+    if at_start:
+        return _normalize_vec(pts[1] - pts[0])
+    return _normalize_vec(pts[-1] - pts[-2])
+
+
+def _edge_alignment_cost(a: np.ndarray, b: np.ndarray) -> float:
+    """两端点距离和；越小越同向对齐。"""
+    return float(
+        np.linalg.norm(a[0] - b[0]) + np.linalg.norm(a[-1] - b[-1])
+    )
+
+
+def _orient_edge_to_match(ref: np.ndarray, edge: np.ndarray) -> np.ndarray:
+    pts = _as_float_array(edge).copy()
+    if _edge_alignment_cost(ref, pts) <= _edge_alignment_cost(ref, pts[::-1]):
+        return pts
+    return pts[::-1].copy()
+
+
+def _pick_facing_edge_pair(
+    sides_a: Sequence[np.ndarray],
+    sides_b: Sequence[np.ndarray],
+) -> tuple[int, int, np.ndarray, np.ndarray]:
+    """
+    在两组边界边中选最适合桥接的一对对边。
+
+    评分：中点近、方向近平行、长度接近。
+    """
+    best = None
+    best_score = float("inf")
+    for i, ea in enumerate(sides_a):
+        ea = _as_float_array(ea)
+        if len(ea) < 2:
+            continue
+        mid_a = ea.mean(axis=0)
+        dir_a = _normalize_vec(ea[-1] - ea[0])
+        len_a = max(float(polyline_length(ea)), 1e-9)
+        for j, eb in enumerate(sides_b):
+            eb = _as_float_array(eb)
+            if len(eb) < 2:
+                continue
+            mid_b = eb.mean(axis=0)
+            dir_b = _normalize_vec(eb[-1] - eb[0])
+            len_b = max(float(polyline_length(eb)), 1e-9)
+            gap = float(np.linalg.norm(mid_a - mid_b))
+            parallel = abs(float(np.dot(dir_a, dir_b)))
+            length_ratio = max(len_a, len_b) / min(len_a, len_b)
+            # 距离为主，平行加分，长度比惩罚
+            score = gap * (1.35 - parallel) * (1.0 + 0.25 * (length_ratio - 1.0))
+            if score < best_score:
+                best_score = score
+                best = (i, j, ea, eb)
+    if best is None:
+        raise RegionFitError("无法在两曲面边界上找到可桥接的对边")
+    i, j, ea, eb = best
+    eb = _orient_edge_to_match(ea, eb)
+    return i, j, ea, eb
+
+
+def _bezier_connector(
+    p0: np.ndarray,
+    t0: np.ndarray,
+    p1: np.ndarray,
+    t1: np.ndarray,
+    samples: int,
+) -> np.ndarray:
+    """用端点切向构造三次贝塞尔连接线（沿曲率桥接）。"""
+    p0 = np.asarray(p0, dtype=np.float64).reshape(3)
+    p1 = np.asarray(p1, dtype=np.float64).reshape(3)
+    gap = float(np.linalg.norm(p1 - p0))
+    handle = max(gap * 0.38, 1e-6)
+    t0n = _normalize_vec(t0)
+    t1n = _normalize_vec(t1)
+    gap_dir = _normalize_vec(p1 - p0)
+    if float(np.linalg.norm(t0n)) < 1e-9:
+        t0n = gap_dir
+    if float(np.linalg.norm(t1n)) < 1e-9:
+        t1n = gap_dir
+    # 切向朝向缺口
+    if float(np.dot(t0n, gap_dir)) < 0.0:
+        t0n = -t0n
+    if float(np.dot(t1n, gap_dir)) < 0.0:
+        t1n = -t1n
+    # 与缺口方向混合，避免手柄过度弯曲
+    t0n = _normalize_vec(0.55 * t0n + 0.45 * gap_dir)
+    t1n = _normalize_vec(0.55 * t1n + 0.45 * gap_dir)
+    controls = np.vstack(
+        (
+            p0,
+            p0 + t0n * handle,
+            p1 - t1n * handle,
+            p1,
+        )
+    )
+    return sample_cubic_bezier(controls, max(int(samples), 2))
+
+
+def bridge_fit_surface_boundaries(
+    sides_a: Sequence[np.ndarray],
+    sides_b: Sequence[np.ndarray],
+    *,
+    segments_u: int = 12,
+    segments_v: int = 12,
+) -> tuple[np.ndarray, list[tuple[int, ...]]]:
+    """
+    两张拟合曲面边界之间做 Coons 桥接。
+
+    选取最近对边作为上下轨，两端用贝塞尔连接线（继承邻边切向曲率）。
+    """
+    if len(sides_a) < 3 or len(sides_b) < 3:
+        raise RegionFitError("桥接需要两侧至少各有 3 条边界边")
+    ia, ib, edge_a, edge_b = _pick_facing_edge_pair(sides_a, sides_b)
+    # 邻边：用于端点切向（沿原拟合贝塞尔曲率延续）
+    prev_a = _as_float_array(sides_a[(ia - 1) % len(sides_a)])
+    next_a = _as_float_array(sides_a[(ia + 1) % len(sides_a)])
+    prev_b = _as_float_array(sides_b[(ib - 1) % len(sides_b)])
+    next_b = _as_float_array(sides_b[(ib + 1) % len(sides_b)])
+
+    # edge_b 已与 edge_a 同向；两侧邻边也按端点就近匹配
+    # A 起点邻边应终于 A[0]；若 next 终于起点则对调语义
+    def _tangent_at_corner(
+        edge: np.ndarray,
+        prev_edge: np.ndarray,
+        next_edge: np.ndarray,
+        at_start: bool,
+    ) -> np.ndarray:
+        corner = edge[0] if at_start else edge[-1]
+        # 选端点更靠近 corner 的邻边，取离开曲面进入缺口的切向
+        candidates = []
+        for adj in (prev_edge, next_edge):
+            d0 = float(np.linalg.norm(adj[0] - corner))
+            d1 = float(np.linalg.norm(adj[-1] - corner))
+            if d0 <= d1:
+                tan = _polyline_end_tangent(adj, at_start=True)
+                # 从邻边起点离开：若邻边从 corner 出发，切向指向邻边内部；
+                # 桥接要离开 corner 进入缺口，取反
+                candidates.append((-tan, d0))
+            else:
+                tan = _polyline_end_tangent(adj, at_start=False)
+                candidates.append((tan, d1))
+        candidates.sort(key=lambda item: item[1])
+        return candidates[0][0]
+
+    # 若 B 边相对 A 翻转过，邻边索引仍对应原 ib；端点已随 edge_b 翻转对齐
+    # 重新按端点距离决定 B 侧邻边切向即可
+    t_a0 = _tangent_at_corner(edge_a, prev_a, next_a, at_start=True)
+    t_a1 = _tangent_at_corner(edge_a, prev_a, next_a, at_start=False)
+    t_b0 = _tangent_at_corner(edge_b, prev_b, next_b, at_start=True)
+    t_b1 = _tangent_at_corner(edge_b, prev_b, next_b, at_start=False)
+
+    seg_u = max(int(segments_u), 2)
+    seg_v = max(int(segments_v), 2)
+    # 对边采样点数一致
+    bottom = resample_polyline(edge_a, seg_u + 1)
+    top = resample_polyline(edge_b, seg_u + 1)
+    left = _bezier_connector(bottom[0], t_a0, top[0], t_b0, seg_v + 1)
+    right = _bezier_connector(bottom[-1], t_a1, top[-1], t_b1, seg_v + 1)
+    # build_quad_patch 期望 sides=[bottom, right, top, left]，且会反向 top/left
+    # 这里 top 与 bottom 同向，需传入 top[::-1] 作为 sides[2] 前的原始 top
+    # build_quad_patch: top = resample(sides[2][::-1])，故 sides[2] 应与 bottom 反向
+    sides = [bottom, right, top[::-1].copy(), left[::-1].copy()]
+    return build_quad_patch(sides, seg_u, seg_v)
+
+
+def pack_boundary_sides(sides: Sequence[np.ndarray]) -> tuple[list[float], list[int]]:
+    """把边界边折线打包为扁平 float 列表与每边点数。"""
+    flat: list[float] = []
+    counts: list[int] = []
+    for side in sides:
+        pts = _as_float_array(side)
+        counts.append(int(len(pts)))
+        flat.extend(float(v) for v in pts.reshape(-1))
+    return flat, counts
+
+
+def unpack_boundary_sides(
+    flat,
+    counts,
+) -> list[np.ndarray]:
+    """还原边界边折线列表。"""
+    values = np.asarray(list(flat), dtype=np.float64)
+    counts_list = [int(c) for c in list(counts)]
+    sides: list[np.ndarray] = []
+    offset = 0
+    for count in counts_list:
+        n = max(int(count), 0)
+        need = n * 3
+        chunk = values[offset : offset + need]
+        offset += need
+        if n < 2 or len(chunk) < need:
+            continue
+        sides.append(chunk.reshape(n, 3))
+    return sides
+
+
+def extract_mesh_boundary_loop_sides(
+    vertices: np.ndarray,
+    faces: Sequence[Sequence[int]],
+    *,
+    corner_angle_deg: float = 55.0,
+) -> list[np.ndarray]:
+    """
+    从三角/四边形网格提取开边界环，并按折角拆成多条边。
+
+    用于旧拟合曲面未持久化边界时的回退。
+    """
+    verts = _as_float_array(vertices)
+    edge_faces: dict[tuple[int, int], int] = {}
+    for face in faces:
+        ids = [int(i) for i in face]
+        if len(ids) < 3:
+            continue
+        for i in range(len(ids)):
+            a = ids[i]
+            b = ids[(i + 1) % len(ids)]
+            key = (a, b) if a < b else (b, a)
+            edge_faces[key] = edge_faces.get(key, 0) + 1
+    boundary_adj: dict[int, list[int]] = {}
+    for (a, b), count in edge_faces.items():
+        if count != 1:
+            continue
+        boundary_adj.setdefault(a, []).append(b)
+        boundary_adj.setdefault(b, []).append(a)
+    if not boundary_adj:
+        raise RegionFitError("网格没有可桥接的开放边界")
+
+    # 取最长边界环
+    unused = set(boundary_adj.keys())
+    loops: list[list[int]] = []
+    while unused:
+        start = unused.pop()
+        loop = [start]
+        prev = None
+        cur = start
+        guard = 0
+        while guard < len(boundary_adj) + 2:
+            guard += 1
+            nbrs = boundary_adj.get(cur, [])
+            nxt = None
+            for cand in nbrs:
+                if cand != prev:
+                    nxt = cand
+                    break
+            if nxt is None:
+                break
+            if nxt == start:
+                break
+            loop.append(nxt)
+            unused.discard(nxt)
+            prev, cur = cur, nxt
+        if len(loop) >= 3:
+            loops.append(loop)
+    if not loops:
+        raise RegionFitError("无法提取网格边界环")
+    loops.sort(
+        key=lambda ids: float(
+            sum(
+                np.linalg.norm(verts[ids[i]] - verts[ids[(i + 1) % len(ids)]])
+                for i in range(len(ids))
+            )
+        ),
+        reverse=True,
+    )
+    ring = loops[0]
+    pts = verts[np.asarray(ring, dtype=np.int64)]
+    # 闭环折角拆边
+    angles = turn_angles_deg(pts, cyclic=True)
+    breaks = [
+        i
+        for i, ang in enumerate(angles)
+        if float(ang) >= float(corner_angle_deg)
+    ]
+    if len(breaks) < 3:
+        # 均匀拆成 4 段回退
+        n = len(pts)
+        step = max(n // 4, 1)
+        breaks = sorted({(i * step) % n for i in range(4)})
+    breaks = sorted(set(int(b) % len(pts) for b in breaks))
+    sides: list[np.ndarray] = []
+    for i, b0 in enumerate(breaks):
+        b1 = breaks[(i + 1) % len(breaks)]
+        if b1 > b0:
+            seg = pts[b0 : b1 + 1]
+        else:
+            seg = np.vstack((pts[b0:], pts[: b1 + 1]))
+        if len(seg) >= 2:
+            sides.append(seg.copy())
+    if len(sides) < 3:
+        raise RegionFitError("边界折角不足，无法拆成桥接边")
+    return sides
 
 
 def weld_bezier_loop_endpoints(
@@ -763,10 +1086,13 @@ __all__ = (
     "apply_similarity",
     "best_closed_alignment",
     "best_open_alignment",
+    "bridge_fit_surface_boundaries",
     "closest_points_on_rays",
     "compose_patch_from_boundary_polylines",
+    "compose_patch_from_boundary_polylines_ex",
     "estimate_open_directed_similarity",
     "estimate_similarity_transform",
+    "extract_mesh_boundary_loop_sides",
     "extract_subpolyline_by_arc",
     "find_break_indices",
     "fit_bezier_n_controls",
@@ -774,6 +1100,7 @@ __all__ = (
     "opposite_pair_colors",
     "order_open_curves_as_closed_loop",
     "orient_loop_polylines",
+    "pack_boundary_sides",
     "point_at_arc_length",
     "prepare_triangular_sides_from_loop",
     "sample_bezier_anchor_chain",
@@ -784,5 +1111,6 @@ __all__ = (
     "stitch_oriented_loop_polylines",
     "transform_bezier_points",
     "turn_angles_deg",
+    "unpack_boundary_sides",
     "weld_bezier_loop_endpoints",
 )
